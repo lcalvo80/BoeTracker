@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ✅ AÑADIR el path del proyecto al principio (antes de los imports locales)
+# ✅ AÑADIR el path del proyecto al principio (antes de los imports locales)1
 sys.path.append(str(Path(__file__).resolve().parent))
 
 # ✅ Importaciones de servicios después de añadir el path
