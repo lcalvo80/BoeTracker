@@ -1,20 +1,12 @@
 from flask import Blueprint, jsonify, request
 from app.controllers.items_controller import (
-    get_item_by_id,
-    like_item,
-    dislike_item,
-    get_item_resumen,
-    get_item_impacto,
-    list_clase_items,
-    list_departamentos,
-    list_epigrafes,
-    list_secciones,
-    get_filtered_items,
+    get_item_by_id, get_item_resumen, get_item_impacto,
+    like_item, dislike_item, get_filtered_items,
+    list_departamentos, list_epigrafes, list_secciones
 )
 
 bp = Blueprint("items", __name__)
 
-# ✅ Nuevo endpoint con filtros dinámicos y paginación
 @bp.route("/items", methods=["GET"])
 def list_items():
     filters = {
@@ -49,11 +41,6 @@ def like(item_id):
 def dislike(item_id):
     return jsonify(dislike_item(item_id))
 
-@bp.route("/items/clases", methods=["GET"])
-def clases_items():
-    return jsonify(list_clase_items())
-
-# ✅ Nuevas rutas para filtros dinámicos del frontend
 @bp.route("/departamentos", methods=["GET"])
 def get_departamentos():
     return jsonify(list_departamentos())

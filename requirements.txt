@@ -1,5 +1,6 @@
 flask
 flask-cors
+Flask
+psycopg2-binary
 requests
-openai
 python-dotenv

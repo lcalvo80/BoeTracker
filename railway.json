@@ -1,0 +1,10 @@
+{
+  "services": {
+    "web": {
+      "limits": {
+        "cpu": "500m",
+        "memory": "512Mi"
+      }
+    }
+  }
+}
