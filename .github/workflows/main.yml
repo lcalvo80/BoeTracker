@@ -1,29 +1,31 @@
-name: Run main.py daily
+name: Run update_boe.py daily
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Runs every day at 06:00 UTC
-  workflow_dispatch:      # Allows manual run via GitHub UI
+    - cron: '0 6 * * *'  # Todos los días a las 06:00 UTC
+  workflow_dispatch:      # Permite ejecución manual desde GitHub UI
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: 🧾 Checkout código
         uses: actions/checkout@v3
 
-      - name: Set up Python
+      - name: 🐍 Configurar Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: 📦 Instalar dependencias
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run main.py
+      - name: 🚀 Ejecutar actualización del BOE
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          python main.py
+          python app/main.py
+
