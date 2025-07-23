@@ -4,18 +4,18 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ✅ AÑADIR el path del proyecto al principio (antes de los imports locales)1
-sys.path.append(str(Path(__file__).resolve().parent))
+# 🧠 Asegura que se pueda importar desde app/
+sys.path.append(str(Path(__file__).resolve().parent / "app"))
 
-# ✅ Importaciones de servicios después de añadir el path
+# ✅ Imports locales
 from app.services.postgres import get_db
 from app.services.boe_fetcher import fetch_boe_xml
 from app.services.parser import parse_and_insert
 
-# 🔧 Logging básico
+# 🪵 Logging
 logging.basicConfig(level=logging.INFO)
 
-# ✅ Cargar .env solo si no estamos en GitHub Actions
+# ✅ Cargar .env solo en desarrollo local
 if os.getenv("GITHUB_ACTIONS") != "true":
     env_path = Path(__file__).resolve().parent / ".env"
     if env_path.exists():
@@ -24,31 +24,38 @@ if os.getenv("GITHUB_ACTIONS") != "true":
     else:
         logging.warning("⚠️ No .env file found.")
 
-# 🔐 Verifica OPENAI_API_KEY
+# 🔐 Verificar API Key
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    logging.error("❌ OPENAI_API_KEY not found. Check GitHub secret or .env file.")
+    logging.error("❌ OPENAI_API_KEY not found. Check .env or GitHub secret.")
     exit(1)
 
-# 📦 Obtener número total de ítems
+# 📦 Contar ítems
 def get_item_count():
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM items")
         return cur.fetchone()[0]
 
-# 🚀 Ejecutar el proceso completo
+# 🚀 Ejecutar proceso completo
 if __name__ == "__main__":
     logging.info("🚀 Iniciando actualización del BOE...")
-    initial_count = get_item_count()
 
-    root = fetch_boe_xml()
-    if root is None:
-        logging.warning("⚠️ No se pudo obtener el XML del BOE.")
+    try:
+        initial_count = get_item_count()
+        logging.info(f"📦 Ítems antes: {initial_count}")
+
+        root = fetch_boe_xml()
+        if root is None:
+            logging.warning("⚠️ No se pudo obtener el XML del BOE.")
+            exit(1)
+
+        inserted = parse_and_insert(root)
+        final_count = get_item_count()
+
+        logging.info(f"🆕 Ítems nuevos insertados: {inserted}")
+        logging.info(f"📦 Total actual en BD: {final_count}")
+
+    except Exception as e:
+        logging.error(f"❌ Error general: {e}")
         exit(1)
-
-    inserted_count = parse_and_insert(root)
-    final_count = get_item_count()
-
-    logging.info(f"🆕 Ítems nuevos insertados: {inserted_count}")
-    logging.info(f"📦 Ítems totales en base de datos: {final_count}")
