@@ -11,7 +11,7 @@ from services.parser import parse_and_insert
 logging.basicConfig(level=logging.INFO)
 
 # 🔐 Only load .env if not running inside GitHub Actions
-if not os.getenv("GITHUB_ACTIONS"):
+if os.getenv("GITHUB_ACTIONS") != "true":
     env_path = Path(__file__).resolve().parent / ".env"
     if env_path.exists():
         load_dotenv(dotenv_path=env_path)
