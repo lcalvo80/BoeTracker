@@ -2,24 +2,30 @@ import os
 import logging
 import sqlite3
 from pathlib import Path
+
 from dotenv import load_dotenv
 from services.database import create_databases, DB_ITEMS
 from services.boe_fetcher import fetch_boe_xml
 from services.parser import parse_and_insert
 
-# Cargar .env desde la ubicación del archivo actual
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path)
+logging.basicConfig(level=logging.INFO)
 
-# Verificar si la clave fue cargada
+# 🔐 Only load .env if not running inside GitHub Actions
+if not os.getenv("GITHUB_ACTIONS"):
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+        logging.info("🟢 .env file loaded for local development.")
+    else:
+        logging.warning("⚠️ No .env file found for local use.")
+
+# Get the OpenAI API key from environment
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    logging.error("❌ La variable OPENAI_API_KEY no se ha cargado. Verifica tu archivo .env")
+    logging.error("❌ OPENAI_API_KEY not found. Check GitHub secret or .env file.")
     exit(1)
 else:
-    logging.info("✅ OPENAI_API_KEY cargada correctamente.")
-
-logging.basicConfig(level=logging.INFO)
+    logging.info("✅ OPENAI_API_KEY loaded successfully.")
 
 def get_db_item_count():
     with sqlite3.connect(DB_ITEMS) as conn:
