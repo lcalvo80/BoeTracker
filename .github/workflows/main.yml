@@ -2,12 +2,16 @@ name: Run update_boe.py daily
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Todos los días a las 06:00 UTC
-  workflow_dispatch:      # Permite ejecución manual desde GitHub UI
+    - cron: '0 6 * * *'
+  workflow_dispatch:
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
+
+    # ✅ AÑADE ESTE BLOQUE ENV AQUÍ
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
       - name: 🧾 Checkout código
@@ -24,8 +28,4 @@ jobs:
           pip install -r requirements.txt
 
       - name: 🚀 Ejecutar actualización del BOE
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          python app/main.py
-
+        run: python app/main.py
