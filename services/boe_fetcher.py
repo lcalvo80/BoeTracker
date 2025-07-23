@@ -5,14 +5,29 @@ import logging
 
 headers = {"Accept": "application/xml"}
 
-def fetch_boe_xml():
-    date_str = datetime.now().strftime('%Y%m%d')
-    url = f"https://boe.es/datosabiertos/api/boe/sumario/20250714"
-    #url=fhttps://boe.es/datosabiertos/api/boe/sumario/date_str"
+def fetch_boe_xml(date_obj=None):
+    if date_obj is None:
+        date_obj = datetime.now()
+    date_str = date_obj.strftime('%Y%m%d')
+    url = f"https://boe.es/datosabiertos/api/boe/sumario/{date_str}"
+
+    logging.info(f"🌐 Fetching BOE for {date_str} → {url}")
+
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=30)
+
+        if response.status_code == 404:
+            logging.warning(f"📭 No BOE sumario available for {date_str}")
+            return None
+
         response.raise_for_status()
-        return ET.fromstring(response.text)
+        return ET.fromstring(response.content)
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ HTTP error while fetching BOE: {e}")
+    except ET.ParseError as e:
+        logging.error(f"❌ XML parsing error: {e}")
     except Exception as e:
-        logging.error(f"❌ Error al obtener el BOE: {e}")
-        return None
+        logging.error(f"❌ Unexpected error: {e}")
+    
+    return None
