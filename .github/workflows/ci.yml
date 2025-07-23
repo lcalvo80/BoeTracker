@@ -26,6 +26,7 @@ jobs:
 
     env:
       DATABASE_URL: postgres://test_user:test_password@localhost:5432/test_db
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}  # ✅ IMPORTANTE
 
     steps:
       - name: Checkout repo
@@ -42,7 +43,7 @@ jobs:
       - name: Esperar a que PostgreSQL esté listo
         run: |
           echo "Esperando a que PostgreSQL esté listo..."
-          sleep 10  # opcional, normalmente no necesario por `healthcheck`
+          sleep 10
 
       - name: Ejecutar actualización del BOE
         run: python update_boe.py
