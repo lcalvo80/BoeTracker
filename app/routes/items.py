@@ -1,54 +1,53 @@
 from flask import Blueprint, jsonify, request
 from app.controllers.items_controller import (
-    get_item_by_id, get_item_resumen, get_item_impacto,
-    like_item, dislike_item, get_filtered_items,
-    list_departamentos, list_epigrafes, list_secciones
+    get_filtered_items,
+    get_item_by_id,
+    get_item_resumen,
+    get_item_impacto,
+    like_item,
+    dislike_item,
+    list_departamentos,
+    list_epigrafes,
+    list_secciones
 )
 
 bp = Blueprint("items", __name__)
 
 @bp.route("/items", methods=["GET"])
-def list_items():
-    filters = {
-        "identificador": request.args.get("identificador"),
-        "control": request.args.get("control"),
-        "departamento_codigo": request.args.get("departamento_codigo"),
-        "epigrafe": request.args.get("epigrafe"),
-        "seccion_codigo": request.args.get("seccion_codigo"),
-        "fecha": request.args.get("fecha"),
-    }
-    page = int(request.args.get("page", 1))
-    limit = int(request.args.get("limit", 12))
+def api_items():
+    filters = request.args
+    page = int(filters.get("page", 1))
+    limit = int(filters.get("limit", 10))
     return jsonify(get_filtered_items(filters, page, limit))
 
-@bp.route("/items/<string:item_id>", methods=["GET"])
-def get_item(item_id):
-    return jsonify(get_item_by_id(item_id))
+@bp.route("/items/<identificador>", methods=["GET"])
+def api_get_item(identificador):
+    return jsonify(get_item_by_id(identificador))
 
-@bp.route("/items/<string:item_id>/resumen", methods=["GET"])
-def item_resumen(item_id):
-    return jsonify(get_item_resumen(item_id))
+@bp.route("/items/<identificador>/resumen", methods=["GET"])
+def api_get_resumen(identificador):
+    return jsonify(get_item_resumen(identificador))
 
-@bp.route("/items/<string:item_id>/impacto", methods=["GET"])
-def item_impacto(item_id):
-    return jsonify(get_item_impacto(item_id))
+@bp.route("/items/<identificador>/impacto", methods=["GET"])
+def api_get_impacto(identificador):
+    return jsonify(get_item_impacto(identificador))
 
-@bp.route("/items/<string:item_id>/like", methods=["PUT"])
-def like(item_id):
-    return jsonify(like_item(item_id))
+@bp.route("/items/<identificador>/like", methods=["POST"])
+def api_like(identificador):
+    return jsonify(like_item(identificador))
 
-@bp.route("/items/<string:item_id>/dislike", methods=["PUT"])
-def dislike(item_id):
-    return jsonify(dislike_item(item_id))
+@bp.route("/items/<identificador>/dislike", methods=["POST"])
+def api_dislike(identificador):
+    return jsonify(dislike_item(identificador))
 
-@bp.route("/departamentos", methods=["GET"])
-def get_departamentos():
+@bp.route("/items/departamentos", methods=["GET"])
+def api_departamentos():
     return jsonify(list_departamentos())
 
-@bp.route("/epigrafes", methods=["GET"])
-def get_epigrafes():
-    return jsonify(list_epigrafes())
-
-@bp.route("/secciones", methods=["GET"])
-def get_secciones():
+@bp.route("/items/secciones", methods=["GET"])
+def api_secciones():
     return jsonify(list_secciones())
+
+@bp.route("/items/epigrafes", methods=["GET"])
+def api_epigrafes():
+    return jsonify(list_epigrafes())
