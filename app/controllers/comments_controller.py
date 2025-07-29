@@ -1,4 +1,4 @@
-from services.postgres import get_db
+from app.services.postgres import get_db
 
 def get_comments_by_item(item_identificador):
     with get_db() as conn:
