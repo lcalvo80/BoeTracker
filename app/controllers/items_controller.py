@@ -1,4 +1,4 @@
-from services.postgres import get_db
+from app.services.postgres import get_db
 import json
 import base64
 import gzip
