@@ -4,9 +4,9 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
+from app.utils.compression import compress_json
 
 logger = logging.getLogger(__name__)
-
 
 def clasificar_item(nombre_seccion: str) -> str:
     nombre = nombre_seccion.lower()
@@ -25,13 +25,11 @@ def clasificar_item(nombre_seccion: str) -> str:
     else:
         return "Disposición"  # fallback
 
-
 def safe_date(text: str) -> Optional[date]:
     try:
         return datetime.strptime(text.strip(), "%Y-%m-%d").date()
     except Exception:
         return None
-
 
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     identificador = item.findtext("identificador", "").strip()
@@ -58,35 +56,31 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     fecha_publicacion = safe_date(item.findtext("fecha_publicacion", "").strip())
 
     cur.execute("""
-        INSERT INTO items (
-            identificador, titulo, titulo_resumen, resumen, informe_impacto,
-            url_pdf, url_html, url_xml,
-            seccion_codigo, seccion_nombre,
-            departamento_codigo, departamento_nombre,
-            epigrafe, control, fecha_publicacion, clase_item
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        identificador,
-        titulo,
-        titulo_resumen.rstrip("."),
-        resumen_json,
-        impacto_json,
-        item.findtext("url_pdf", "").strip(),
-        item.findtext("url_html", "").strip(),
-        item.findtext("url_xml", "").strip(),
-        seccion.get("codigo", "") if seccion is not None else "",
-        seccion.get("nombre", "") if seccion is not None else "",
-        dept.get("codigo", "") if dept is not None else "",
-        dept.get("nombre", "") if dept is not None else "",
-        epigrafe.get("nombre", "") if epigrafe is not None else "",
-        item.findtext("control", "").strip(),
-        fecha_publicacion,
-        clase_item
-    ))
+    INSERT INTO items (
+        identificador, titulo, titulo_resumen, resumen, informe_impacto,
+        url_pdf, url_html, url_xml,
+        seccion_codigo, departamento_codigo,
+        epigrafe, control, fecha_publicacion, clase_item
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+""", (
+    identificador,
+    titulo,
+    titulo_resumen.rstrip("."),
+    compress_json(resumen_json),             # ✅ comprimido
+    compress_json(impacto_json),             # ✅ también comprimido ahora
+    item.findtext("url_pdf", "").strip(),
+    item.findtext("url_html", "").strip(),
+    item.findtext("url_xml", "").strip(),
+    seccion.get("codigo", "") if seccion else "",
+    dept.get("codigo", "") if dept else "",
+    epigrafe.get("nombre", "") if epigrafe else "",
+    item.findtext("control", "").strip(),
+    fecha_publicacion,
+    clase_item
+))
 
     logger.info(f"✅ Insertado: {identificador}")
     counters["insertados"] += 1
-
 
 def parse_and_insert(root: ET.Element) -> int:
     counters = {
