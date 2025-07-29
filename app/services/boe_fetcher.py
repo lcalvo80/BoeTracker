@@ -9,7 +9,8 @@ def fetch_boe_xml(date_obj=None):
     if date_obj is None:
         date_obj = datetime.now()
     date_str = date_obj.strftime('%Y%m%d')
-    url = f"https://boe.es/datosabiertos/api/boe/sumario/{date_str}"
+    #url = f"https://boe.es/datosabiertos/api/boe/sumario/{date_str}"
+    url = f"https://boe.es/datosabiertos/api/boe/sumario/20250724"
 
     logging.info(f"🌐 Fetching BOE for {date_str} → {url}")
 
