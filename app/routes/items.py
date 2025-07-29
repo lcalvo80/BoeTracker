@@ -1,3 +1,12 @@
+from flask import Blueprint, request, jsonify
+from app.controllers.items_controller import (
+    get_item_by_id, get_item_resumen, get_item_impacto,
+    like_item, dislike_item, get_filtered_items,
+    list_departamentos, list_epigrafes, list_secciones
+)
+
+bp = Blueprint("items", __name__)
+
 @bp.route("/items", methods=["GET"])
 def list_items():
     filters = {
