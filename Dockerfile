@@ -9,4 +9,8 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "app/update_boe.py"]
+# Railway usará esta variable automáticamente
+ENV PORT=5000
+
+# Ejecutar el backend Flask
+CMD ["python", "run.py"]
