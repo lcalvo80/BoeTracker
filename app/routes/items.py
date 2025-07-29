@@ -32,11 +32,11 @@ def api_get_resumen(identificador):
 def api_get_impacto(identificador):
     return jsonify(get_item_impacto(identificador))
 
-@bp.route("/items/<identificador>/like", methods=["POST"])
+@bp.route("/items/<identificador>/like", methods=["PUT"])
 def api_like(identificador):
     return jsonify(like_item(identificador))
 
-@bp.route("/items/<identificador>/dislike", methods=["POST"])
+@bp.route("/items/<identificador>/dislike", methods=["PUT"])
 def api_dislike(identificador):
     return jsonify(dislike_item(identificador))
 
