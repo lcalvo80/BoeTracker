@@ -1,8 +1,8 @@
-from app.services.postgres import get_db
 import json
 import base64
 import gzip
 import io
+from app.services.postgres import get_db
 
 def dict_rows(cursor):
     cols = [col.name for col in cursor.description]
@@ -10,11 +10,11 @@ def dict_rows(cursor):
 
 def decompress_field(data: str):
     try:
-        if not data:
-            return {}
+        if not data or data == "⚠️ Error al descomprimir":
+            return data
         compressed = base64.b64decode(data)
         with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as f:
-            return json.loads(f.read().decode('utf-8'))
+            return json.loads(f.read().decode("utf-8"))
     except Exception:
         return "⚠️ Error al descomprimir"
 
@@ -61,11 +61,8 @@ def get_item_by_id(identificador):
             return {}
         cols = [desc.name for desc in cur.description]
         item = dict(zip(cols, row))
-
-        # Descomprimir campos
         item["resumen"] = decompress_field(item.get("resumen"))
         item["informe_impacto"] = decompress_field(item.get("informe_impacto"))
-
         return item
 
 def get_item_resumen(identificador):
@@ -79,7 +76,10 @@ def get_item_impacto(identificador):
 def like_item(identificador):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE items SET likes = likes + 1 WHERE identificador = %s RETURNING likes", (identificador,))
+        cur.execute(
+            "UPDATE items SET likes = likes + 1 WHERE identificador = %s RETURNING likes",
+            (identificador,),
+        )
         result = cur.fetchone()
         conn.commit()
         return {"likes": result[0]} if result else {}
@@ -87,7 +87,10 @@ def like_item(identificador):
 def dislike_item(identificador):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE items SET dislikes = dislikes + 1 WHERE identificador = %s RETURNING dislikes", (identificador,))
+        cur.execute(
+            "UPDATE items SET dislikes = dislikes + 1 WHERE identificador = %s RETURNING dislikes",
+            (identificador,),
+        )
         result = cur.fetchone()
         conn.commit()
         return {"dislikes": result[0]} if result else {}
@@ -95,17 +98,38 @@ def dislike_item(identificador):
 def list_departamentos():
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT departamento_nombre FROM items WHERE departamento_nombre IS NOT NULL AND departamento_nombre != '' ORDER BY departamento_nombre")
+        cur.execute(
+            """
+            SELECT DISTINCT departamento_nombre 
+            FROM items 
+            WHERE departamento_nombre IS NOT NULL AND departamento_nombre != '' 
+            ORDER BY departamento_nombre
+            """
+        )
         return [row[0] for row in cur.fetchall()]
 
 def list_epigrafes():
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT epigrafe FROM items WHERE epigrafe IS NOT NULL AND epigrafe != '' ORDER BY epigrafe")
+        cur.execute(
+            """
+            SELECT DISTINCT epigrafe 
+            FROM items 
+            WHERE epigrafe IS NOT NULL AND epigrafe != '' 
+            ORDER BY epigrafe
+            """
+        )
         return [row[0] for row in cur.fetchall()]
 
 def list_secciones():
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT seccion_nombre FROM items WHERE seccion_nombre IS NOT NULL AND seccion_nombre != '' ORDER BY seccion_nombre")
+        cur.execute(
+            """
+            SELECT DISTINCT seccion_nombre 
+            FROM items 
+            WHERE seccion_nombre IS NOT NULL AND seccion_nombre != '' 
+            ORDER BY seccion_nombre
+            """
+        )
         return [row[0] for row in cur.fetchall()]
