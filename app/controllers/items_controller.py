@@ -26,8 +26,9 @@ def get_filtered_items(filters, page, limit):
     def append(condition, value, exact=True):
         if value:
             cond = f"{condition} = %s" if exact else f"{condition} ILIKE %s"
-            query_params.append(value if exact else f"%{value}%")
-            count_params.append(value if exact else f"%{value}%")
+            val = value if exact else f"%{value}%"
+            query_params.append(val)
+            count_params.append(val)
             nonlocal query, count_query
             query += f" AND {cond}"
             count_query += f" AND {cond}"
@@ -62,10 +63,8 @@ def get_item_by_id(identificador):
         cols = [desc.name for desc in cur.description]
         item = dict(zip(cols, row))
 
-        # Descomprimir campos
         item["resumen"] = decompress_field(item.get("resumen"))
         item["informe_impacto"] = decompress_field(item.get("informe_impacto"))
-
         return item
 
 def get_item_resumen(identificador):
@@ -79,7 +78,10 @@ def get_item_impacto(identificador):
 def like_item(identificador):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE items SET likes = likes + 1 WHERE identificador = %s RETURNING likes", (identificador,))
+        cur.execute(
+            "UPDATE items SET likes = likes + 1 WHERE identificador = %s RETURNING likes",
+            (identificador,),
+        )
         result = cur.fetchone()
         conn.commit()
         return {"likes": result[0]} if result else {}
@@ -87,7 +89,10 @@ def like_item(identificador):
 def dislike_item(identificador):
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE items SET dislikes = dislikes + 1 WHERE identificador = %s RETURNING dislikes", (identificador,))
+        cur.execute(
+            "UPDATE items SET dislikes = dislikes + 1 WHERE identificador = %s RETURNING dislikes",
+            (identificador,),
+        )
         result = cur.fetchone()
         conn.commit()
         return {"dislikes": result[0]} if result else {}
