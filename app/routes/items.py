@@ -1,3 +1,4 @@
+# items.py
 from flask import Blueprint, jsonify, request
 from app.controllers.items_controller import (
     get_filtered_items,
@@ -15,6 +16,7 @@ bp = Blueprint("items", __name__)
 
 @bp.route("/", methods=["GET"])
 def api_items():
+    # Pasamos todos los query params tal cual; la lógica de filtrado está en el controller
     filters = request.args
     page = int(filters.get("page", 1))
     limit = int(filters.get("limit", 10))
