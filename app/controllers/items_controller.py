@@ -28,17 +28,10 @@ def _parse_date(val):
         return None
 
 def _norm(val):
-    """
-    Normaliza un parámetro de filtro:
-    - quita espacios
-    - descarta '', 'todos', 'all', 'null', 'none' (case-insensitive)
-    """
     if val is None:
         return None
     s = str(val).strip()
-    if s == "":
-        return None
-    if s.lower() in {"todos", "all", "null", "none"}:
+    if s == "" or s.lower() in {"todos", "all", "null", "none"}:
         return None
     return s
 
@@ -46,22 +39,25 @@ def _norm(val):
 def get_filtered_items(filters, page, limit):
     """
     Filtros soportados (query params):
-      - identificador: str (ILIKE %texto%)
-      - control: str (ILIKE %texto%)
-      - epigrafe: str (ILIKE %texto%)
+      - identificador (ILIKE)
+      - control (ILIKE)
+      - epigrafe (ILIKE)
       - seccion / seccion_codigo / seccion_nombre
       - departamento / departamento_codigo / departamento_nombre
-      - fecha (YYYY-MM-DD)  -> prioridad sobre rango
-      - fecha_desde, fecha_hasta (YYYY-MM-DD)
+      - fecha         (YYYY-MM-DD)  -> exacta sobre created_at::date (PRIORIDAD)
+      - fecha_desde   (YYYY-MM-DD)  -> rango sobre created_at::date
+      - fecha_hasta   (YYYY-MM-DD)
 
     Orden/paginación:
-      - sort_by in {fecha_publicacion, identificador, control, epigrafe, departamento, seccion}
+      - sort_by in {created_at, identificador, control, epigrafe, departamento, seccion}
       - sort_dir in {asc, desc}
       - page, limit (limit máx 100)
     """
+    # Seleccionamos created_at y también lo exponemos como created_at_date para el FE
     base_select = """
         SELECT
             i.*,
+            i.created_at::date AS created_at_date,
             d.nombre AS departamento_nombre,
             s.nombre AS seccion_nombre
         FROM items i
@@ -77,100 +73,77 @@ def get_filtered_items(filters, page, limit):
         WHERE 1=1
     """
 
-    where = []
-    params = []
-    count_params = []
+    where, params, count_params = [], [], []
 
-    def add(clause: str, *vals):
+    def add(clause, *vals):
         where.append(clause)
         params.extend(vals)
         count_params.extend(vals)
 
-    # --- Texto parcial ---
-    identificador = _norm(filters.get("identificador"))
-    if identificador:
-        add("i.identificador ILIKE %s", f"%{identificador}%")
+    # Texto parcial
+    v = _norm(filters.get("identificador"))
+    if v: add("i.identificador ILIKE %s", f"%{v}%")
+    v = _norm(filters.get("control"))
+    if v: add("i.control ILIKE %s", f"%{v}%")
+    v = _norm(filters.get("epigrafe"))
+    if v: add("i.epigrafe ILIKE %s", f"%{v}%")
 
-    control = _norm(filters.get("control"))
-    if control:
-        add("i.control ILIKE %s", f"%{control}%")
-
-    epigrafe = _norm(filters.get("epigrafe"))
-    if epigrafe:
-        add("i.epigrafe ILIKE %s", f"%{epigrafe}%")
-
-    # --- Sección (código/nombre) ---
-    # Aceptamos: seccion (genérico), seccion_codigo, seccion_nombre
+    # Sección (código o nombre)
     seccion = _norm(filters.get("seccion"))
-    seccion_codigo = _norm(filters.get("seccion_codigo"))
-    seccion_nombre = _norm(filters.get("seccion_nombre"))
-
-    if seccion:  # código o nombre
-        # ILIKE sin % para igualdad case-insensitive de código + nombre parcial
-        add("(i.seccion_codigo ILIKE %s OR s.nombre ILIKE %s)", seccion, f"%{seccion}%")
+    if seccion:
+        add("(i.seccion_codigo = %s OR s.nombre ILIKE %s)", seccion, f"%{seccion}%")
     else:
-        if seccion_codigo:
-            add("i.seccion_codigo ILIKE %s", seccion_codigo)  # igualdad case-insensitive
-        if seccion_nombre:
-            add("s.nombre ILIKE %s", f"%{seccion_nombre}%")
+        v = _norm(filters.get("seccion_codigo"))
+        if v: add("i.seccion_codigo = %s", v)
+        v = _norm(filters.get("seccion_nombre"))
+        if v: add("s.nombre ILIKE %s", f"%{v}%")
 
-    # --- Departamento (código/nombre) ---
-    # Aceptamos: departamento (genérico), departamento_codigo, departamento_nombre
+    # Departamento (código o nombre)
     departamento = _norm(filters.get("departamento"))
-    departamento_codigo = _norm(filters.get("departamento_codigo"))
-    departamento_nombre = _norm(filters.get("departamento_nombre"))
-
     if departamento:
-        add("(i.departamento_codigo ILIKE %s OR d.nombre ILIKE %s)", departamento, f"%{departamento}%")
+        add("(i.departamento_codigo = %s OR d.nombre ILIKE %s)", departamento, f"%{departamento}%")
     else:
-        if departamento_codigo:
-            add("i.departamento_codigo ILIKE %s", departamento_codigo)
-        if departamento_nombre:
-            add("d.nombre ILIKE %s", f"%{departamento_nombre}%")
+        v = _norm(filters.get("departamento_codigo"))
+        if v: add("i.departamento_codigo = %s", v)
+        v = _norm(filters.get("departamento_nombre"))
+        if v: add("d.nombre ILIKE %s", f"%{v}%")
 
-    # --- Fecha exacta o rango ---
-    fecha = _norm(filters.get("fecha"))
-    if fecha:
-        f = _parse_date(fecha)
-        if f:
-            add("i.fecha_publicacion = %s", f)
+    # --------- Fecha sobre created_at::date ---------
+    # Exacta tiene prioridad; si no hay exacta, evaluamos rango
+    f = _parse_date(_norm(filters.get("fecha")))
+    if f:
+        add("i.created_at::date = %s", f)
     else:
         fd = _parse_date(_norm(filters.get("fecha_desde")))
         fh = _parse_date(_norm(filters.get("fecha_hasta")))
         if fd and fh:
-            add("i.fecha_publicacion BETWEEN %s AND %s", fd, fh)
+            add("i.created_at::date BETWEEN %s AND %s", fd, fh)
         elif fd:
-            add("i.fecha_publicacion >= %s", fd)
+            add("i.created_at::date >= %s", fd)
         elif fh:
-            add("i.fecha_publicacion <= %s", fh)
+            add("i.created_at::date <= %s", fh)
 
-    # WHERE final
     where_sql = (" AND " + " AND ".join(where)) if where else ""
 
     # Orden y paginación
     sortable = {
-        "fecha_publicacion": "i.fecha_publicacion",
+        "created_at": "i.created_at",
         "identificador": "i.identificador",
         "control": "i.control",
         "epigrafe": "i.epigrafe",
         "departamento": "d.nombre",
         "seccion": "s.nombre",
     }
-    sort_by = str(filters.get("sort_by", "fecha_publicacion"))
-    sort_by_sql = sortable.get(sort_by, "i.fecha_publicacion")
+    sort_by = sortable.get(str(filters.get("sort_by", "created_at")), "i.created_at")
     sort_dir = "ASC" if str(filters.get("sort_dir", "desc")).lower() == "asc" else "DESC"
 
-    try:
-        page = max(int(filters.get("page", page)), 1)
-    except Exception:
-        page = 1
-    try:
-        limit = max(min(int(filters.get("limit", limit)), 100), 1)
-    except Exception:
-        limit = 10
+    try: page = max(int(filters.get("page", page)), 1)
+    except: page = 1
+    try: limit = max(min(int(filters.get("limit", limit)), 100), 1)
+    except: limit = 10
     offset = (page - 1) * limit
 
-    query = f"""{base_select}{where_sql} ORDER BY {sort_by_sql} {sort_dir} NULLS LAST LIMIT %s OFFSET %s"""
+    query = f"""{base_select}{where_sql} ORDER BY {sort_by} {sort_dir} NULLS LAST LIMIT %s OFFSET %s"""
     count_query = f"""{base_count}{where_sql}"""
 
     with get_db() as conn:
@@ -187,7 +160,11 @@ def get_item_by_id(identificador):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT i.*, d.nombre AS departamento_nombre, s.nombre AS seccion_nombre
+            SELECT
+                i.*,
+                i.created_at::date AS created_at_date,
+                d.nombre AS departamento_nombre,
+                s.nombre AS seccion_nombre
             FROM items i
             LEFT JOIN departamentos d ON d.codigo = i.departamento_codigo
             LEFT JOIN secciones s     ON s.codigo = i.seccion_codigo
@@ -259,9 +236,6 @@ def list_secciones():
         return [{"codigo": row[0], "nombre": row[1]} for row in cur.fetchall()]
 
 def list_epigrafes():
-    """
-    Devuelve epígrafes distintos, ya recortados (sin blancos) y no vacíos.
-    """
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute("""
