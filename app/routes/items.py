@@ -1,3 +1,4 @@
+# app/routes/items.py
 from flask import Blueprint, jsonify, request
 from app.controllers.items_controller import (
     get_filtered_items,
@@ -8,7 +9,7 @@ from app.controllers.items_controller import (
     dislike_item,
     list_departamentos,
     list_epigrafes,
-    list_secciones
+    list_secciones,
 )
 
 bp = Blueprint("items", __name__)
@@ -42,12 +43,12 @@ def api_dislike(identificador):
 
 @bp.route("/departamentos", methods=["GET"])
 def api_departamentos():
-    return jsonify(list_departamentos()))
+    return jsonify(list_departamentos())
 
 @bp.route("/secciones", methods=["GET"])
 def api_secciones():
-    return jsonify(list_secciones()))
+    return jsonify(list_secciones())
 
 @bp.route("/epigrafes", methods=["GET"])
 def api_epigrafes():
-    return jsonify(list_epigrafes()))
+    return jsonify(list_epigrafes())
