@@ -7,12 +7,16 @@ import gzip
 import io
 import re
 
-# ----------------- Utilidades -----------------
+# =========================
+# Utilidades generales
+# =========================
+
 def _dict_rows(cursor):
     cols = [col.name for col in cursor.description]
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 def _decompress_field(data: str):
+    """Campos JSON comprimidos en base64+gzip (resumen / informe_impacto)."""
     try:
         if not data:
             return {}
@@ -36,28 +40,88 @@ def _norm(val):
         return None
     return s
 
-# ----------------- Búsqueda avanzada -----------------
-ADV_FIELDS = {
-    "epigrafe": "i.epigrafe",
-    "identificador": "i.identificador",
-    "control": "i.control",
-    "titulo": "i.titulo",
-    "resumen": "i.titulo_resumen",
-    # seccion/departamento se tratan especial (código o nombre)
-}
+def _csv_list(filters, key):
+    """
+    Lee listas desde querystring: soporta valores repetidos (?k=a&k=b) y CSV (?k=a,b).
+    Devuelve lista limpia y deduplicada.
+    """
+    out = []
+    try:
+        if hasattr(filters, "getlist"):
+            for v in filters.getlist(key):
+                if v is not None:
+                    out.extend(str(v).split(","))
+    except Exception:
+        pass
+    # También admite .get único con CSV
+    v = filters.get(key) if hasattr(filters, "get") else None
+    if v:
+        out.extend(str(v).split(","))
+    # limpiar/deduplicar
+    seen, clean = set(), []
+    for x in out:
+        s = x.strip()
+        if s and s not in seen:
+            seen.add(s)
+            clean.append(s)
+    return clean
+
+def _in_clause(column: str, values: list):
+    """column IN (%s,...%s) y params (limpia/dedup)."""
+    clean = []
+    for v in values or []:
+        s = (v or "").strip()
+        if s and s not in clean:
+            clean.append(s)
+    if not clean:
+        return "", []
+    placeholders = ", ".join(["%s"] * len(clean))
+    return f"{column} IN ({placeholders})", clean
+
+def _like_any_clause(column: str, values: list):
+    """(col ILIKE %s OR col ILIKE %s ...) y params con %valor% (limpia/dedup)."""
+    clean = []
+    for v in values or []:
+        s = (v or "").strip()
+        if s and f"%{s}%" not in clean:
+            clean.append(f"%{s}%")
+    if not clean:
+        return "", []
+    group = " OR ".join([f"{column} ILIKE %s"] * len(clean))
+    return f"({group})", clean
+
+# =========================
+# Búsqueda avanzada (q_adv)
+# =========================
+
+# Importante: por petición del usuario, la búsqueda libre NO incluye epígrafe/departamento/sección.
 DEFAULT_SEARCH_COLUMNS = [
     "i.titulo_resumen",
     "i.titulo",
     "i.identificador",
     "i.control",
-    "i.epigrafe",
-    "s.nombre",
-    "d.nombre",
 ]
+
+ADV_FIELDS = {
+    # Qualifiers soportados (además de seccion/departamento con tratamiento especial):
+    "epigrafe": "i.epigrafe",
+    "identificador": "i.identificador",
+    "control": "i.control",
+    "titulo": "i.titulo",
+    "resumen": "i.titulo_resumen",
+}
+
 TOKEN_RE = re.compile(r'"([^"]+)"|(\S+)')
 
 def _build_advanced_search(q_adv: str):
-    """Devuelve (sql_fragment, params) o ("", []) si no hay términos válidos."""
+    """
+    Devuelve (sql_fragment, params) para inyectar en WHERE.
+    Soporta:
+      - "frase exacta"
+      - -excluir
+      - campo:valor  (epigrafe, identificador, control, titulo, resumen, seccion*, departamento*)
+    Para seccion/departamento: código exacto (i.x_codigo = %s) o nombre ILIKE en join (s/d).
+    """
     if not q_adv:
         return "", []
 
@@ -88,17 +152,22 @@ def _build_advanced_search(q_adv: str):
                 clause = f"(i.{field}_codigo = %s OR {tbl}.nombre ILIKE %s)"
                 (negative if is_neg else positive).append(("NOT " + clause) if is_neg else clause)
                 params.extend([value, f"%{value}%"])
+
             elif field in ADV_FIELDS:
                 col = ADV_FIELDS[field]
                 clause = f"({col} ILIKE %s)"
                 (negative if is_neg else positive).append(("NOT " + clause) if is_neg else clause)
                 params.append(f"%{value}%")
+
             else:
+                # Campo desconocido -> trata como libre (solo DEFAULT_SEARCH_COLUMNS)
                 group = " OR ".join([f"{c} ILIKE %s" for c in DEFAULT_SEARCH_COLUMNS])
                 clause = f"({group})"
                 (negative if is_neg else positive).append(("NOT " + clause) if is_neg else clause)
                 params.extend([f"%{t}%"] * len(DEFAULT_SEARCH_COLUMNS))
+
         else:
+            # Token libre
             group = " OR ".join([f"{c} ILIKE %s" for c in DEFAULT_SEARCH_COLUMNS])
             clause = f"({group})"
             (negative if is_neg else positive).append(("NOT " + clause) if is_neg else clause)
@@ -110,17 +179,23 @@ def _build_advanced_search(q_adv: str):
 
     return "(" + " AND ".join(clauses) + ")", params
 
-# ----------------- Listado con filtros -----------------
+# =========================
+# Listado con filtros
+# =========================
+
 def get_filtered_items(filters, page, limit):
     """
-    Filtros (query params):
-      - q_adv: búsqueda avanzada
-      - identificador, control, epigrafe (ILIKE)
-      - seccion / seccion_codigo / seccion_nombre
-      - departamento / departamento_codigo / departamento_nombre
-      - fecha | fecha_desde | fecha_hasta  (sobre i.created_at::date)
-      - sort_by [created_at|identificador|control|epigrafe|departamento|seccion], sort_dir [asc|desc]
-      - page, limit
+    Filtros soportados (query params):
+      - q_adv (búsqueda avanzada; libre NO toca epígrafe/departamento/sección)
+      - identificador (ILIKE), control (ILIKE)
+      - seccion / secciones (CSV / repetidos)  -> código exacto o nombre ILIKE
+      - departamento / departamentos           -> código exacto o nombre ILIKE
+      - epigrafe / epigrafes                   -> ILIKE (tolerante)
+      - fecha (YYYY-MM-DD) sobre i.created_at::date (exacta)
+      - fecha_desde / fecha_hasta              sobre i.created_at::date (rango)
+      - sort_by in {created_at, identificador, control, epigrafe, departamento, seccion}
+      - sort_dir in {asc, desc}
+      - page, limit (limit máx 100)
     """
     base_select = """
         SELECT
@@ -142,47 +217,65 @@ def get_filtered_items(filters, page, limit):
     """
 
     where, params, count_params = [], [], []
+
     def add(clause, *vals):
         where.append(clause)
         params.extend(vals)
         count_params.extend(vals)
 
-    # búsqueda avanzada
+    # ---- Búsqueda avanzada
     q_adv = _norm(filters.get("q_adv"))
     if q_adv:
         adv_sql, adv_params = _build_advanced_search(q_adv)
         if adv_sql:
             add(adv_sql, *adv_params)
 
-    # textuales simples
+    # ---- Filtros textuales simples
     v = _norm(filters.get("identificador"))
-    if v: add("i.identificador ILIKE %s", f"%{v}%")
+    if v:
+        add("i.identificador ILIKE %s", f"%{v}%")
+
     v = _norm(filters.get("control"))
-    if v: add("i.control ILIKE %s", f"%{v}%")
-    v = _norm(filters.get("epigrafe"))
-    if v: add("i.epigrafe ILIKE %s", f"%{v}%")
+    if v:
+        add("i.control ILIKE %s", f"%{v}%")
 
-    # sección (código o nombre)
-    seccion = _norm(filters.get("seccion"))
-    if seccion:
-        add("(i.seccion_codigo = %s OR s.nombre ILIKE %s)", seccion, f"%{seccion}%")
+    # ---- MULTI: SECCIÓN (por código exacto o nombre aproximado)
+    secciones = _csv_list(filters, "seccion") or _csv_list(filters, "secciones")
+    if secciones:
+        by_code_sql, by_code_params = _in_clause("i.seccion_codigo", secciones)
+        by_name_sql, by_name_params = _like_any_clause("TRIM(s.nombre)", secciones)
+        if by_code_sql and by_name_sql:
+            add(f"(({by_code_sql}) OR ({by_name_sql}))", *(by_code_params + by_name_params))
+        elif by_code_sql:
+            add(by_code_sql, *by_code_params)
+        elif by_name_sql:
+            add(by_name_sql, *by_name_params)
+
+    # ---- MULTI: DEPARTAMENTO (por código exacto o nombre aproximado)
+    departamentos = _csv_list(filters, "departamento") or _csv_list(filters, "departamentos")
+    if departamentos:
+        by_code_sql, by_code_params = _in_clause("i.departamento_codigo", departamentos)
+        by_name_sql, by_name_params = _like_any_clause("TRIM(d.nombre)", departamentos)
+        if by_code_sql and by_name_sql:
+            add(f"(({by_code_sql}) OR ({by_name_sql}))", *(by_code_params + by_name_params))
+        elif by_code_sql:
+            add(by_code_sql, *by_code_params)
+        elif by_name_sql:
+            add(by_name_sql, *by_name_params)
+
+    # ---- MULTI: EPÍGRAFE (ILIKE tolerante)
+    epigrafes = _csv_list(filters, "epigrafe") or _csv_list(filters, "epigrafes")
+    if epigrafes:
+        like_sql, like_params = _like_any_clause("TRIM(i.epigrafe)", epigrafes)
+        if like_sql:
+            add(like_sql, *like_params)
     else:
-        v = _norm(filters.get("seccion_codigo"))
-        if v: add("i.seccion_codigo = %s", v)
-        v = _norm(filters.get("seccion_nombre"))
-        if v: add("s.nombre ILIKE %s", f"%{v}%")
+        # fallback para un único epígrafe textual (si alguien lo envía así)
+        v = _norm(filters.get("epigrafe"))
+        if v:
+            add("TRIM(i.epigrafe) ILIKE %s", f"%{v}%")
 
-    # departamento (código o nombre)
-    departamento = _norm(filters.get("departamento"))
-    if departamento:
-        add("(i.departamento_codigo = %s OR d.nombre ILIKE %s)", departamento, f"%{departamento}%")
-    else:
-        v = _norm(filters.get("departamento_codigo"))
-        if v: add("i.departamento_codigo = %s", v)
-        v = _norm(filters.get("departamento_nombre"))
-        if v: add("d.nombre ILIKE %s", f"%{v}%")
-
-    # fecha (sobre created_at::date)
+    # ---- Fechas sobre created_at::date
     f = _parse_date(_norm(filters.get("fecha")))
     if f:
         add("i.created_at::date = %s", f)
@@ -196,8 +289,10 @@ def get_filtered_items(filters, page, limit):
         elif fh:
             add("i.created_at::date <= %s", fh)
 
+    # ---- WHERE final
     where_sql = (" AND " + " AND ".join(where)) if where else ""
 
+    # ---- Orden y paginación
     sortable = {
         "created_at": "i.created_at",
         "identificador": "i.identificador",
@@ -219,7 +314,9 @@ def get_filtered_items(filters, page, limit):
         limit = 10
     offset = (page - 1) * limit
 
-    query = f"""{base_select}{where_sql} ORDER BY {sort_by} {sort_dir} NULLS LAST LIMIT %s OFFSET %s"""
+    query = f"""{base_select}{where_sql}
+                 ORDER BY {sort_by} {sort_dir} NULLS LAST
+                 LIMIT %s OFFSET %s"""
     count_query = f"""{base_count}{where_sql}"""
 
     with get_db() as conn:
@@ -231,7 +328,10 @@ def get_filtered_items(filters, page, limit):
 
     return {"items": items, "total": total, "page": page, "limit": limit}
 
-# ----------------- Detalle -----------------
+# =========================
+# Detalle / Resumen / Impacto
+# =========================
+
 def get_item_by_id(identificador):
     with get_db() as conn:
         cur = conn.cursor()
@@ -263,7 +363,10 @@ def get_item_impacto(identificador):
     item = get_item_by_id(identificador)
     return item.get("informe_impacto") or {}
 
-# ----------------- Likes -----------------
+# =========================
+# Likes / Dislikes
+# =========================
+
 def like_item(identificador):
     with get_db() as conn:
         cur = conn.cursor()
@@ -286,7 +389,10 @@ def dislike_item(identificador):
         conn.commit()
         return {"dislikes": row[0]} if row else {}
 
-# ----------------- Lookups -----------------
+# =========================
+# Lookups auxiliares
+# =========================
+
 def list_departamentos():
     with get_db() as conn:
         cur = conn.cursor()
