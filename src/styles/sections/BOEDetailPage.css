@@ -1,0 +1,97 @@
+.boe-detail-container {
+  background: white;
+  max-width: 960px;
+  margin: auto;
+  padding: 2rem;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+  font-family: 'Roboto', sans-serif;
+}
+
+.back-link {
+  display: flex;
+  align-items: center;
+  color: #1e3a8a;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-weight: 500;
+  margin-bottom: 1rem;
+}
+
+.boe-title {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: #111827;
+}
+
+.boe-subtitle {
+  color: #6b7280;
+  margin-bottom: 1rem;
+}
+
+.boe-meta p {
+  margin: 0.2rem 0;
+  font-size: 0.9rem;
+  color: #374151;
+}
+
+.pdf-button {
+  margin: 1rem 0;
+}
+
+.pdf-button a {
+  background-color: #dc2626;
+  color: white;
+  padding: 0.5rem 1rem;
+  text-decoration: none;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 600;
+}
+
+.pdf-button a:hover {
+  background-color: #b91c1c;
+}
+
+.reaction-buttons {
+  display: flex;
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.reaction-buttons button {
+  border: none;
+  padding: 0.4rem 1rem;
+  background: #f3f4f6;
+  color: #1f2937;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  transition: all 0.2s;
+}
+
+.reaction-buttons button:hover {
+  background-color: #e5e7eb;
+}
+
+.boe-section {
+  margin-top: 2rem;
+  padding: 1.5rem;
+  border-radius: 10px;
+  background-color: #f9fafb;
+  border-left: 4px solid #2563eb;
+}
+
+.boe-section.impacto {
+  border-left-color: #a855f7;
+}
+
+.boe-block {
+  /* Add your styles here if needed */
+}

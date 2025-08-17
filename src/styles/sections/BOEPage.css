@@ -1,0 +1,85 @@
+/* In BOEPage.css */
+
+.boe-page {
+  display: flex;
+  justify-content: space-between;
+  padding: 20px;
+  gap: 20px;
+}
+
+.filters {
+  width: 25%;
+  background-color: #f4f4f4;
+  padding: 15px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.filter-group {
+  margin-bottom: 15px;
+}
+
+.filter-group label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 14px;
+}
+
+.filter-group input,
+.filter-group select {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.content {
+  width: 70%;
+}
+
+.notifications {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); /* Responsive design */
+  gap: 20px;
+}
+
+.notification-card {
+  border: 1px solid #ddd;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 320px; /* Fixed card height */
+}
+
+.notification-card h3 {
+  font-size: 16px;
+  color: #333;
+  margin-bottom: 10px;
+}
+
+.notification-card p {
+  font-size: 14px;
+  color: #555;
+  margin: 10px 0;
+}
+
+.notification-card a {
+  display: flex;
+  align-items: center;
+  margin-top: auto;
+  color: #1e90ff;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.notification-card a img {
+  width: 20px;
+  margin-right: 8px;
+}
+
+.notification-card a:hover {
+  text-decoration: underline;
+}
