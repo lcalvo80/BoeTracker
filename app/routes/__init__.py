@@ -1,2 +1,4 @@
 # app/routes/__init__.py
-from . import items, comments  # exporta los módulos para que __init__ pueda importarlos
+# Intencionadamente vacío para evitar imports recursivos/tempranos.
+# Puedes mantener __all__ si quieres autocompletado, pero sin importar submódulos.
+__all__ = ["items", "comments"]

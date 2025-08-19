@@ -1,7 +1,6 @@
 # app/__init__.py
 from flask import Flask, jsonify
 from flask_cors import CORS
-from app.routes import items, comments  # blueprints
 
 def create_app():
     app = Flask(__name__)
@@ -15,12 +14,15 @@ def create_app():
         ],
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization"],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     }})
 
-    # Registrar Blueprints (url_prefix SOLO aquí)
-    app.register_blueprint(items.bp, url_prefix="/api/items")
-    app.register_blueprint(comments.bp, url_prefix="/api/comments")
+    # Importa y registra blueprints SOLO aquí (runtime del servidor)
+    from app.routes.items import bp as items_bp
+    from app.routes.comments import bp as comments_bp
+
+    app.register_blueprint(items_bp,    url_prefix="/api/items")
+    app.register_blueprint(comments_bp, url_prefix="/api/comments")
 
     # Ruta de salud
     @app.get("/api/health")
