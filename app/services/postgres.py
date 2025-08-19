@@ -1,11 +1,9 @@
 # app/services/postgres.py
 import os
 import psycopg2
-import urllib.parse as up
 from contextlib import contextmanager
 
 def _normalize_db_url(url: str) -> str:
-    # Railway suele dar una URL estándar; añadimos sslmode si no está.
     if "sslmode=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}sslmode=require"
