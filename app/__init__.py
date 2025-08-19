@@ -18,7 +18,7 @@ def create_app():
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }})
 
-    # Registrar Blueprints
+    # Registrar Blueprints (url_prefix SOLO aquí)
     app.register_blueprint(items.bp, url_prefix="/api/items")
     app.register_blueprint(comments.bp, url_prefix="/api/comments")
 
