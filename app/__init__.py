@@ -17,8 +17,8 @@ def create_app():
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }})
 
-    app.register_blueprint(items.bp,    url_prefix="/api")
-    app.register_blueprint(comments.bp, url_prefix="/api")
+    app.register_blueprint(items.bp,    url_prefix="/api/items")  # ⬅️ antes: "/api"
+    app.register_blueprint(comments.bp, url_prefix="/api")        # o el que toque para comments
 
     @app.get("/api/health")
     def health():
