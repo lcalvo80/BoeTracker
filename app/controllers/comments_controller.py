@@ -1,31 +1,76 @@
+# app/controllers/comments_controller.py
 from app.services.postgres import get_db
+from datetime import datetime
 
-def get_comments_by_item(item_identificador):
+# Crea la tabla si no existe (id, item_identificador, content, user_id, author, created_at)
+def _ensure_table():
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, item_identificador, user_name, comment, created_at FROM comments WHERE item_identificador = %s ORDER BY created_at DESC", (item_identificador,))
-        rows = cursor.fetchall()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                item_identificador TEXT NOT NULL,
+                content TEXT NOT NULL,
+                user_id TEXT NULL,
+                author TEXT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        """)
+        conn.commit()
+
+_ensure_table()
+
+def list_comments_by_item(identificador: str):
+    if not identificador:
+        return []
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, item_identificador, content, user_id, author, created_at
+            FROM comments
+            WHERE item_identificador = %s
+            ORDER BY created_at DESC, id DESC
+        """, (identificador,))
+        rows = cur.fetchall()
         return [
             {
-                "id": row[0],
-                "item_identificador": row[1],
-                "user_name": row[2],
-                "comment": row[3],
-                "created_at": row[4].isoformat()
+                "id": r[0],
+                "identificador": r[1],
+                "content": r[2],
+                "user_id": r[3],
+                "author": r[4],
+                "created_at": r[5].isoformat() if isinstance(r[5], datetime) else r[5],
             }
-            for row in rows
+            for r in rows
         ]
 
-def add_comment(item_identificador, user_name, comment):
+def create_comment(payload: dict):
+    identificador = (payload.get("identificador") or "").strip()
+    content = (payload.get("content") or "").strip()
+    user_id = (payload.get("user_id") or None)
+    author = (payload.get("author") or None)
+
+    if not identificador or not content:
+        # respuesta coherente con API simple
+        return {"error": "identificador y content son obligatorios"}
+
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO comments (item_identificador, user_name, comment) VALUES (%s, %s, %s) RETURNING id, created_at", (item_identificador, user_name, comment))
-        result = cursor.fetchone()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO comments (item_identificador, content, user_id, author)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, item_identificador, content, user_id, author, created_at
+            """,
+            (identificador, content, user_id, author),
+        )
+        r = cur.fetchone()
         conn.commit()
         return {
-            "id": result[0],
-            "item_identificador": item_identificador,
-            "user_name": user_name,
-            "comment": comment,
-            "created_at": result[1].isoformat()
+            "id": r[0],
+            "identificador": r[1],
+            "content": r[2],
+            "user_id": r[3],
+            "author": r[4],
+            "created_at": r[5].isoformat() if isinstance(r[5], datetime) else r[5],
         }
