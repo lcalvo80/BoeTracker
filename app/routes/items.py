@@ -12,25 +12,26 @@ from app.controllers.items_controller import (
     list_secciones,
 )
 
-bp = Blueprint("items", __name__)  # sin url_prefix aquí
+bp = Blueprint("items", __name__)
 
-@bp.route("/", methods=["GET"])
+@bp.route("", methods=["GET"])
 def api_items():
-    filters = request.args
-    page = int(filters.get("page", 1))
-    limit = int(filters.get("limit", 10))
-    return jsonify(get_filtered_items(filters, page, limit)), 200
+    data = get_filtered_items(request.args.to_dict())
+    return jsonify(data), 200
 
 @bp.route("/<identificador>", methods=["GET"])
-def api_get_item(identificador):
-    return jsonify(get_item_by_id(identificador)), 200
+def api_item_by_id(identificador):
+    data = get_item_by_id(identificador)
+    if not data:
+        return jsonify({"detail": "Not found"}), 404
+    return jsonify(data), 200
 
 @bp.route("/<identificador>/resumen", methods=["GET"])
-def api_get_resumen(identificador):
+def api_resumen(identificador):
     return jsonify(get_item_resumen(identificador)), 200
 
 @bp.route("/<identificador>/impacto", methods=["GET"])
-def api_get_impacto(identificador):
+def api_impacto(identificador):
     return jsonify(get_item_impacto(identificador)), 200
 
 @bp.route("/<identificador>/like", methods=["POST"])

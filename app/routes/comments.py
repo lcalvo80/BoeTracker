@@ -1,107 +1,54 @@
-# app/controllers/comments_controller.py
-from __future__ import annotations
-
-from typing import Any, Dict, List
+# app/routes/comments.py
+from flask import Blueprint, jsonify, request
+from app.services.postgres import get_db
 from datetime import datetime
 
-from app.services.postgres import get_db
+bp = Blueprint("comments", __name__)
 
-
-def _iso(dt: Any) -> Any:
-    """Convierte a ISO 8601 si es datetime; deja pasar el resto."""
-    if isinstance(dt, datetime):
-        return dt.isoformat()
-    return dt
-
-
-def get_comments_by_item(item_id: int) -> List[Dict[str, Any]]:
-    """
-    Devuelve la lista de comentarios de un item ordenados por fecha de creación (ASC).
-    No levanta error si no hay comentarios; retorna lista vacía.
-    """
-    # Seguridad: fuerza tipo int para prevenir inyección vía bindings posicionales
-    item_id = int(item_id)
-
+@bp.route("", methods=["GET"])
+def list_by_item():
+    ident = request.args.get("identificador")
+    if not ident:
+        return jsonify([]), 200
     sql = """
-        SELECT id, item_id, text, created_at
-        FROM comments
-        WHERE item_id = %s
-        ORDER BY created_at ASC, id ASC
+      SELECT id, item_identificador, content, user_id, author, created_at
+      FROM comments
+      WHERE item_identificador = %s
+      ORDER BY created_at DESC
     """
-
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (item_id,))
-            rows = cur.fetchall() or []
+            cur.execute(sql, (ident,))
+            rows = cur.fetchall()
+            cols = [c.name for c in cur.description]
+            data = [dict(zip(cols, r)) for r in rows]
+    # ISO
+    for r in data:
+        if isinstance(r.get("created_at"), datetime):
+            r["created_at"] = r["created_at"].isoformat()
+    return jsonify(data), 200
 
-    # Map explícito para ser compatible con psycopg/psycopg2
-    result = [
-        {
-            "id": r[0],
-            "item_id": r[1],
-            "text": r[2],
-            "created_at": _iso(r[3]),
-        }
-        for r in rows
-    ]
-    return result
-
-
-def add_comment(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Crea un comentario y devuelve el registro insertado.
-    Espera: payload = {"item_id": int, "text": str}
-    Lanza ValueError en validaciones de dominio.
-    """
-    if not isinstance(payload, dict):
-        raise ValueError("Payload inválido")
-
-    item_id = payload.get("item_id")
-    text = (payload.get("text") or "").strip()
-
-    # Validaciones mínimas (las rutas ya validan, pero reforzamos aquí)
-    try:
-        item_id = int(item_id)
-    except (TypeError, ValueError):
-        raise ValueError("item_id debe ser numérico")
-
-    if not text:
-        raise ValueError("text es requerido")
-
-    # Si necesitas validar que el item exista en DB, descomenta:
-    # _ensure_item_exists(item_id)
-
+@bp.route("", methods=["POST"])
+def add():
+    body = request.get_json(force=True) or {}
+    ident = body.get("identificador")
+    content = (body.get("content") or "").strip()
+    user_id = body.get("user_id")
+    author  = body.get("author")
+    if not ident or not content:
+        return jsonify({"detail": "identificador y content requeridos"}), 400
     sql = """
-        INSERT INTO comments (item_id, text)
-        VALUES (%s, %s)
-        RETURNING id, item_id, text, created_at
+      INSERT INTO comments (item_identificador, content, user_id, author)
+      VALUES (%s, %s, %s, %s)
+      RETURNING id, item_identificador, content, user_id, author, created_at
     """
-
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (item_id, text))
+            cur.execute(sql, (ident, content, user_id, author))
             row = cur.fetchone()
         conn.commit()
-
-    created = {
-        "id": row[0],
-        "item_id": row[1],
-        "text": row[2],
-        "created_at": _iso(row[3]),
-    }
-    return created
-
-
-# --- Opcional: valida existencia del item (útil si hay FK o quieres 400 si no existe) ---
-def _ensure_item_exists(item_id: int) -> None:
-    """
-    Lanza ValueError si el item no existe. Úsalo desde add_comment
-    si quieres forzar la existencia del item en BD.
-    """
-    sql = "SELECT 1 FROM items WHERE id = %s LIMIT 1"
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (item_id,))
-            ok = cur.fetchone()
-    if not ok:
-        raise ValueError(f"El item {item_id} no existe")
+    cols = [c.name for c in cur.description]
+    data = dict(zip(cols, row))
+    if isinstance(data.get("created_at"), datetime):
+        data["created_at"] = data["created_at"].isoformat()
+    return jsonify(data), 201
