@@ -1,17 +1,24 @@
-from flask import Flask
+from flask import Flask, jsonify
 from flask_cors import CORS
+from app.routes import items, comments
 
 def create_app():
     app = Flask(__name__)
-    CORS(app)
 
-    # 📦 Importamos y registramos los blueprints de rutas
-    from app.routes import items, comments
+    # CORS: ajusta con tu dominio de frontend en prod
+    CORS(app, resources={r"/api/*": {
+        "origins": [
+            "http://localhost:3000",
+            "https://<TU-FRONTEND-DOMINIO>"
+        ]
+    }})
 
-    # ✅ Las rutas del blueprint 'items' empiezan por /api/items/
-    app.register_blueprint(items.bp, url_prefix="/api/items")
+    # REGISTRO DE RUTAS: variante A (prefijo /api y rutas con /items dentro del blueprint)
+    app.register_blueprint(items.bp,    url_prefix="/api")
+    app.register_blueprint(comments.bp, url_prefix="/api")
 
-    # ✅ Las rutas del blueprint 'comments' empiezan por /api/comments/
-    app.register_blueprint(comments.bp_comments, url_prefix="/api/comments")
+    @app.get("/api/health")
+    def health():
+        return jsonify(ok=True)
 
     return app
