@@ -1,19 +1,22 @@
+# app/__init__.py
 from flask import Flask, jsonify
 from flask_cors import CORS
-from app.routes import items, comments
+from app.routes import items, comments  # tus blueprints
 
 def create_app():
     app = Flask(__name__)
+    app.url_map.strict_slashes = False  # evita 404 por barra final
 
-    # CORS: ajusta con tu dominio de frontend en prod
     CORS(app, resources={r"/api/*": {
         "origins": [
-            "http://localhost:3000",
-            "https://<TU-FRONTEND-DOMINIO>"
-        ]
+            "http://localhost:3000",                 # dev
+            "https://<TU-FRONTEND-PROD>"             # prod (Netlify/Vercel/etc)
+        ],
+        "supports_credentials": True,
+        "allow_headers": ["Content-Type", "Authorization"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }})
 
-    # REGISTRO DE RUTAS: variante A (prefijo /api y rutas con /items dentro del blueprint)
     app.register_blueprint(items.bp,    url_prefix="/api")
     app.register_blueprint(comments.bp, url_prefix="/api")
 
