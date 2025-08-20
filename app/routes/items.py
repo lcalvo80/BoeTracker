@@ -17,17 +17,31 @@ bp = Blueprint("items", __name__)
 
 @bp.before_request
 def handle_options():
-    # Respuesta rápida a preflight CORS; evita tocar BD en OPTIONS
     if request.method == "OPTIONS":
         return ("", 204)
 
-# ----------------------------- Listado -----------------------------
+# Listado
 @bp.route("", methods=["GET"])
 def api_items():
-    data = get_filtered_items(request.args.to_dict())
-    return jsonify(data), 200
+    try:
+        data = get_filtered_items(request.args.to_dict())
+        return jsonify(data), 200
+    except Exception as e:
+        current_app.logger.exception("items list failed")
+        # Respuesta consistente para no romper la UI
+        page  = int(request.args.get("page", 1))
+        limit = int(request.args.get("limit", 12))
+        return jsonify({
+            "items": [],
+            "page": page,
+            "limit": limit,
+            "total": 0,
+            "pages": 0,
+            "sort_by": request.args.get("sort_by", "created_at"),
+            "sort_dir": request.args.get("sort_dir", "desc"),
+        }), 200
 
-# ----------------------------- Detalle -----------------------------
+# Detalle
 @bp.route("/<identificador>", methods=["GET"])
 def api_item_by_id(identificador):
     data = get_item_by_id(identificador)
@@ -43,7 +57,7 @@ def api_resumen(identificador):
 def api_impacto(identificador):
     return jsonify(get_item_impacto(identificador)), 200
 
-# ----------------------------- Reacciones -----------------------------
+# Reacciones
 @bp.route("/<identificador>/like", methods=["POST"])
 def api_like(identificador):
     return jsonify(like_item(identificador)), 200
@@ -52,21 +66,20 @@ def api_like(identificador):
 def api_dislike(identificador):
     return jsonify(dislike_item(identificador)), 200
 
-# ----------------------------- Filtros (catálogos) -----------------------------
+# Catálogos
 @bp.route("/departamentos", methods=["GET"])
 def api_departamentos():
     try:
         return jsonify(list_departamentos()), 200
-    except Exception as e:
+    except Exception:
         current_app.logger.exception("departamentos failed")
-        # Evita 500 visibles en frontend si el catálogo aún no existe
         return jsonify([]), 200
 
 @bp.route("/secciones", methods=["GET"])
 def api_secciones():
     try:
         return jsonify(list_secciones()), 200
-    except Exception as e:
+    except Exception:
         current_app.logger.exception("secciones failed")
         return jsonify([]), 200
 
@@ -74,6 +87,6 @@ def api_secciones():
 def api_epigrafes():
     try:
         return jsonify(list_epigrafes()), 200
-    except Exception as e:
+    except Exception:
         current_app.logger.exception("epigrafes failed")
         return jsonify([]), 200

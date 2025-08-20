@@ -4,13 +4,12 @@ from typing import Optional, List, Dict
 from psycopg2 import sql
 from app.services.postgres import get_db
 
-# Nombres de tablas y columnas por ENV (opcional, así no cambias código si renombraste tablas)
-ENV_DEP_TABLE = os.getenv("LOOKUP_DEPARTAMENTOS_TABLE")  # p.ej. "departamentos"
-ENV_SEC_TABLE = os.getenv("LOOKUP_SECCIONES_TABLE")      # p.ej. "secciones"
+# ENV opcionales
+ENV_DEP_TABLE = os.getenv("LOOKUP_DEPARTAMENTOS_TABLE")  # p.ej., "departamentos"
+ENV_SEC_TABLE = os.getenv("LOOKUP_SECCIONES_TABLE")      # p.ej., "secciones"
 ENV_CODE_COL  = os.getenv("LOOKUP_CODE_COLUMN", "codigo")
 ENV_NAME_COL  = os.getenv("LOOKUP_NAME_COLUMN", "nombre")
 
-# Candidatos habituales si no defines ENV
 DEP_TABLE_CANDIDATES = [t for t in [ENV_DEP_TABLE, "departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"] if t]
 SEC_TABLE_CANDIDATES = [t for t in [ENV_SEC_TABLE, "secciones", "lookup_secciones", "cat_secciones", "dim_secciones"] if t]
 
@@ -42,11 +41,9 @@ def list_lookup(table_candidates: List[str], code_col: str = ENV_CODE_COL, name_
     with get_db() as conn:
         table = _first_existing_table(conn, table_candidates)
         if not table:
-            return []  # ninguna tabla encontrada, devolvemos vacío para no romper frontend
-
+            return []
         has_code = _column_exists(conn, table, code_col)
         has_name = _column_exists(conn, table, name_col)
-
         if not has_code and not has_name:
             return []
 
