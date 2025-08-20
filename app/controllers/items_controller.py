@@ -5,15 +5,14 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 from app.services.postgres import get_db
-
-# ✅ Nuevo: usamos el catálogo (tablas separadas) para departamentos/secciones
+# Catálogos en tablas separadas (departamentos y secciones)
 from app.services.lookup import (
     list_departamentos_lookup,
     list_secciones_lookup,
 )
 
 # --------------------------------------------------------------------
-# Helpers comunes
+# Helpers
 # --------------------------------------------------------------------
 def _norm(s: Optional[str]) -> Optional[str]:
     if s is None:
@@ -38,7 +37,7 @@ def _rows(cur) -> List[Dict[str, Any]]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 # --------------------------------------------------------------------
-# Listado y filtros de items (sin tocar catálogos)
+# Listado con filtros y paginación
 # --------------------------------------------------------------------
 def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
     """
@@ -46,7 +45,7 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
       - page, limit (paginación)
       - sort_by, sort_dir (created_at por defecto; asc/desc)
       - fecha (exacta) o fecha_desde (>=)
-      - filtros opcionales: departamento_codigo, seccion_codigo, epigrafe
+      - filtros: departamento_codigo, seccion_codigo, epigrafe
     """
     page  = max(int(params.get("page", 1)), 1)
     limit = min(max(int(params.get("limit", 12)), 1), 100)
@@ -86,10 +85,12 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     offset = (page - 1) * limit
 
+    # Nota: mantenemos nombres por código; si quieres nombres,
+    # luego te doy un JOIN opcional con los catálogos.
     base_select = f"""
         SELECT id, identificador, titulo, resumen, impacto,
-               departamento_codigo,  -- nombre se resuelve en el frontend o con JOIN opcional
-               seccion_codigo,        -- nombre se resuelve en el frontend o con JOIN opcional
+               departamento_codigo,
+               seccion_codigo,
                epigrafe, created_at, likes, dislikes
         FROM items
         {where_sql}
@@ -117,7 +118,7 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
     }
 
 # --------------------------------------------------------------------
-# Detalle de item y campos derivados
+# Detalle y campos derivados
 # --------------------------------------------------------------------
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
     sql = """
@@ -173,26 +174,20 @@ def dislike_item(identificador: str) -> Dict[str, Any]:
     return {"identificador": identificador, "dislikes": row[0] if row else 0}
 
 # --------------------------------------------------------------------
-# Listados para filtros (catálogos separados) ✅
+# Listados para filtros (catálogos separados)
 # --------------------------------------------------------------------
 def list_departamentos() -> List[Dict[str, Any]]:
-    """
-    Lee SIEMPRE del catálogo (tabla separada), nunca de `items`.
-    Requiere app/services/lookup.py con list_departamentos_lookup()
-    """
+    """Lee SIEMPRE del catálogo (tabla separada)."""
     return list_departamentos_lookup()
 
 def list_secciones() -> List[Dict[str, Any]]:
-    """
-    Lee SIEMPRE del catálogo (tabla separada), nunca de `items`.
-    Requiere app/services/lookup.py con list_secciones_lookup()
-    """
+    """Lee SIEMPRE del catálogo (tabla separada)."""
     return list_secciones_lookup()
 
 def list_epigrafes() -> List[str]:
     """
-    Epígrafes se mantienen en `items` (no se movieron a catálogo).
-    Si más adelante los mueves, puedes crear un lookup análogo.
+    Epígrafes siguen en `items`. Si en el futuro se mueven a catálogo,
+    replica el enfoque de lookup y cámbialo aquí.
     """
     sql = """
         SELECT DISTINCT TRIM(epigrafe) AS epigrafe
