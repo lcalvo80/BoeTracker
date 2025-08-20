@@ -1,10 +1,20 @@
 # app/controllers/items_controller.py
-from app.services.postgres import get_db
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
-# ---- Helpers ----
+from app.services.postgres import get_db
 
+# ✅ Nuevo: usamos el catálogo (tablas separadas) para departamentos/secciones
+from app.services.lookup import (
+    list_departamentos_lookup,
+    list_secciones_lookup,
+)
+
+# --------------------------------------------------------------------
+# Helpers comunes
+# --------------------------------------------------------------------
 def _norm(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
@@ -27,15 +37,16 @@ def _rows(cur) -> List[Dict[str, Any]]:
     cols = [c.name for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-# ---- Queries ----
-
+# --------------------------------------------------------------------
+# Listado y filtros de items (sin tocar catálogos)
+# --------------------------------------------------------------------
 def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
     """
     Soporta:
-    - page, limit (paginación)
-    - sort_by, sort_dir (created_at por defecto; asc/desc)
-    - fecha (exacta) o fecha_desde (>=)
-    - filtros (opcionales): departamento_codigo, seccion_codigo, epigrafe
+      - page, limit (paginación)
+      - sort_by, sort_dir (created_at por defecto; asc/desc)
+      - fecha (exacta) o fecha_desde (>=)
+      - filtros opcionales: departamento_codigo, seccion_codigo, epigrafe
     """
     page  = max(int(params.get("page", 1)), 1)
     limit = min(max(int(params.get("limit", 12)), 1), 100)
@@ -77,8 +88,8 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
 
     base_select = f"""
         SELECT id, identificador, titulo, resumen, impacto,
-               departamento_codigo, departamento_nombre,
-               seccion_codigo, seccion_nombre,
+               departamento_codigo,  -- nombre se resuelve en el frontend o con JOIN opcional
+               seccion_codigo,        -- nombre se resuelve en el frontend o con JOIN opcional
                epigrafe, created_at, likes, dislikes
         FROM items
         {where_sql}
@@ -105,11 +116,14 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
         "sort_dir": sort_dir,
     }
 
+# --------------------------------------------------------------------
+# Detalle de item y campos derivados
+# --------------------------------------------------------------------
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
     sql = """
       SELECT id, identificador, titulo, contenido, resumen, impacto,
-             departamento_codigo, departamento_nombre,
-             seccion_codigo, seccion_nombre,
+             departamento_codigo,
+             seccion_codigo,
              epigrafe, created_at, likes, dislikes
       FROM items
       WHERE identificador = %s
@@ -158,31 +172,28 @@ def dislike_item(identificador: str) -> Dict[str, Any]:
         conn.commit()
     return {"identificador": identificador, "dislikes": row[0] if row else 0}
 
+# --------------------------------------------------------------------
+# Listados para filtros (catálogos separados) ✅
+# --------------------------------------------------------------------
 def list_departamentos() -> List[Dict[str, Any]]:
-    sql = """
-        SELECT DISTINCT departamento_codigo AS codigo, departamento_nombre AS nombre
-        FROM items
-        WHERE TRIM(COALESCE(departamento_codigo,'')) <> ''
-        ORDER BY nombre
     """
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return [{"codigo": r[0], "nombre": r[1]} for r in cur.fetchall()]
+    Lee SIEMPRE del catálogo (tabla separada), nunca de `items`.
+    Requiere app/services/lookup.py con list_departamentos_lookup()
+    """
+    return list_departamentos_lookup()
 
 def list_secciones() -> List[Dict[str, Any]]:
-    sql = """
-        SELECT DISTINCT seccion_codigo AS codigo, seccion_nombre AS nombre
-        FROM items
-        WHERE TRIM(COALESCE(seccion_codigo,'')) <> ''
-        ORDER BY nombre
     """
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return [{"codigo": r[0], "nombre": r[1]} for r in cur.fetchall()]
+    Lee SIEMPRE del catálogo (tabla separada), nunca de `items`.
+    Requiere app/services/lookup.py con list_secciones_lookup()
+    """
+    return list_secciones_lookup()
 
 def list_epigrafes() -> List[str]:
+    """
+    Epígrafes se mantienen en `items` (no se movieron a catálogo).
+    Si más adelante los mueves, puedes crear un lookup análogo.
+    """
     sql = """
         SELECT DISTINCT TRIM(epigrafe) AS epigrafe
         FROM items
