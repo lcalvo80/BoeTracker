@@ -1,4 +1,3 @@
-# app/routes/comments.py
 from flask import Blueprint, jsonify, request
 from app.services.postgres import get_db
 from math import ceil
@@ -6,156 +5,116 @@ from datetime import datetime
 
 bp = Blueprint("comments", __name__)
 
-def _row_to_dict(row, cols):
+# --- bootstrap tabla (evita 500 por tabla inexistente) ---
+def _ensure_table():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS comments (
+                    id SERIAL PRIMARY KEY,
+                    item_identificador TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    user_id TEXT NULL,
+                    author TEXT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+            """)
+        conn.commit()
+
+_ensure_table()
+
+def _safe_int(v, d, mi=1, ma=100):
+    try:
+        n = int(v)
+        if n < mi: n = mi
+        if n > ma: n = ma
+        return n
+    except Exception:
+        return d
+
+def _row_dict(row, cols):
+    # cols viene de cur.description, garantizamos alias y formateo
     d = dict(zip(cols, row))
-    # Normalizamos claves para el front: text en vez de content
     if "content" in d and "text" not in d:
         d["text"] = d["content"]
+    if "item_identificador" in d and "identificador" not in d:
+        d["identificador"] = d["item_identificador"]
     if isinstance(d.get("created_at"), datetime):
         d["created_at"] = d["created_at"].isoformat()
     return d
 
-def _safe_int(val, default, min_value=1, max_value=1000):
-    try:
-        n = int(val)
-        if n < min_value: n = min_value
-        if n > max_value: n = max_value
-        return n
-    except Exception:
-        return default
-
-# ----------------------------
-# Rutas NUEVAS que usa el front
-# ----------------------------
-
+# =========================
+# GET /api/items/<ident>/comments
+# =========================
 @bp.route("/items/<ident>/comments", methods=["GET"])
-def list_by_item_nested(ident):
-    page = _safe_int(request.args.get("page", 1), 1, 1, 1000000)
+def list_item_comments(ident):
+    page  = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
     limit = _safe_int(request.args.get("limit", 20), 20, 1, 100)
     offset = (page - 1) * limit
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            # total
-            cur.execute("SELECT COUNT(*) FROM comments WHERE item_identificador = %s", (ident,))
-            total = cur.fetchone()[0] or 0
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM comments WHERE item_identificador = %s", (ident,))
+                total = cur.fetchone()[0] or 0
 
-            # page data (orden estable)
-            cur.execute("""
-                SELECT id,
-                       item_identificador AS identificador,
-                       content,
-                       user_id,
-                       author,
-                       created_at
-                FROM comments
-                WHERE item_identificador = %s
-                ORDER BY created_at DESC, id DESC
-                LIMIT %s OFFSET %s
-            """, (ident, limit, offset))
-            rows = cur.fetchall()
-            cols = [c.name for c in cur.description]
-            items = [_row_to_dict(r, cols) for r in rows]
+                cur.execute("""
+                    SELECT id,
+                           item_identificador,
+                           content,
+                           user_id,
+                           author,
+                           created_at
+                    FROM comments
+                    WHERE item_identificador = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s OFFSET %s
+                """, (ident, limit, offset))
+                rows = cur.fetchall()
+                cols = [c.name for c in cur.description]
+                items = [_row_dict(r, cols) for r in rows]
 
-    pages = ceil(total / limit) if limit > 0 else 0
-    # Respuesta que espera el front
-    return jsonify({
-        "items": items,
-        "page": page if total else 1,
-        "pages": pages if total else 0,
-        "total": total
-    }), 200
+        pages = ceil(total / limit) if limit else 0
+        return jsonify({
+            "items": items,
+            "page": page if total else 1,
+            "pages": pages if total else 0,
+            "total": total
+        }), 200
 
-@bp.route("/items/<ident>/comments", methods=["POST"])
-def add_nested(ident):
-    body = request.get_json(force=True) or {}
-    # El front manda { author, text }; admitimos también { content } por compatibilidad
-    author = (body.get("author") or None)
-    text = (body.get("text") or body.get("content") or "").strip()
-    user_id = (body.get("user_id") or None)
-
-    if not text:
-        return jsonify({"detail": "content/text requerido"}), 400
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO comments (item_identificador, content, user_id, author)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id, item_identificador AS identificador, content, user_id, author, created_at
-            """, (ident, text, user_id, author))
-            row = cur.fetchone()
-        conn.commit()
-
-    cols = [c.name for c in cur.description]
-    data = _row_to_dict(row, cols)
-    # Añadimos alias text para el front
-    data["text"] = data.get("content", "")
-    return jsonify(data), 201
-
-# ---------------------------------
-# Rutas ORIGINALES (compatibilidad)
-# ---------------------------------
-
-@bp.route("/comments", methods=["GET"])
-def list_by_item_queryparam():
-    ident = request.args.get("identificador")
-    if not ident:
-        # Alineamos respuesta con el front aunque no la use
+    except Exception as e:
+        # LOG real: logger.exception(e)
+        # Para UX, devolvemos lista vacía (el front ya maneja)
         return jsonify({"items": [], "page": 1, "pages": 0, "total": 0}), 200
 
-    # opcionalmente soportar paginación aquí también
-    page = _safe_int(request.args.get("page", 1), 1, 1, 1000000)
-    limit = _safe_int(request.args.get("limit", 100), 100, 1, 100)
-    offset = (page - 1) * limit
+# =========================
+# POST /api/items/<ident>/comments
+# =========================
+@bp.route("/items/<ident>/comments", methods=["POST"])
+def add_item_comment(ident):
+    try:
+        body = request.get_json(force=True) or {}
+        text   = (body.get("text") or body.get("content") or "").strip()
+        author = (body.get("author") or None)
+        user_id = (body.get("user_id") or None)
 
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM comments WHERE item_identificador = %s", (ident,))
-            total = cur.fetchone()[0] or 0
+        if not text:
+            return jsonify({"detail": "content/text requerido"}), 400
 
-            cur.execute("""
-                SELECT id,
-                       item_identificador AS identificador,
-                       content,
-                       user_id,
-                       author,
-                       created_at
-                FROM comments
-                WHERE item_identificador = %s
-                ORDER BY created_at DESC, id DESC
-                LIMIT %s OFFSET %s
-            """, (ident, limit, offset))
-            rows = cur.fetchall()
-            cols = [c.name for c in cur.description]
-            items = [_row_to_dict(r, cols) for r in rows]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO comments (item_identificador, content, user_id, author)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, item_identificador, content, user_id, author, created_at
+                """, (ident, text, user_id, author))
+                row = cur.fetchone()
+            conn.commit()
 
-    pages = ceil(total / limit) if limit > 0 else 0
-    return jsonify({"items": items, "page": page, "pages": pages, "total": total}), 200
+        cols = ["id", "item_identificador", "content", "user_id", "author", "created_at"]
+        data = _row_dict(row, cols)
+        return jsonify(data), 201
 
-
-@bp.route("/comments", methods=["POST"])
-def add_queryparam():
-    body = request.get_json(force=True) or {}
-    ident = (body.get("identificador") or "").strip()
-    author = (body.get("author") or None)
-    text = (body.get("text") or body.get("content") or "").strip()
-    user_id = (body.get("user_id") or None)
-
-    if not ident or not text:
-        return jsonify({"detail": "identificador y content/text requeridos"}), 400
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO comments (item_identificador, content, user_id, author)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id, item_identificador AS identificador, content, user_id, author, created_at
-            """, (ident, text, user_id, author))
-            row = cur.fetchone()
-        conn.commit()
-
-    cols = [c.name for c in cur.description]
-    data = _row_to_dict(row, cols)
-    data["text"] = data.get("content", "")
-    return jsonify(data), 201
+    except Exception as e:
+        # LOG real: logger.exception(e)
+        return jsonify({"detail": "No se pudo crear el comentario"}), 400

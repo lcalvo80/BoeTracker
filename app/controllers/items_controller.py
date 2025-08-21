@@ -44,6 +44,7 @@ def _split_csv(s: Optional[str]) -> List[str]:
     return [p for p in parts if p]
 
 def _col_exists(conn, table: str, col: str) -> bool:
+    # Nota: llamado pocas veces por request; si quieres, cachea en g/LocalProxy.
     with conn.cursor() as cur:
         cur.execute("""
             SELECT 1 FROM information_schema.columns
@@ -62,9 +63,9 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
       - departamento_codigo: coma separada (IN)
       - seccion_codigo: coma separada (IN)
       - epigrafe: coma separada (IN)
-      - q_adv: ILIKE sobre titulo/resumen/contenido (si existen columnas)
+      - q_adv: ILIKE sobre titulo/resumen/contenido(/informe_impacto::text si existe)
       - identificador: ILIKE
-      - control: ILIKE (si existe columna)
+      - control: ILIKE (si existe)
     """
     page  = max(int(params.get("page", 1)), 1)
     limit = min(max(int(params.get("limit", 12)), 1), 100)
@@ -91,10 +92,15 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
     with get_db() as conn:
         # columnas disponibles
         has_created_at_date = _col_exists(conn, "items", "created_at_date")
+        has_created_at      = _col_exists(conn, "items", "created_at")
         has_control         = _col_exists(conn, "items", "control")
         has_contenido       = _col_exists(conn, "items", "contenido")
         has_resumen         = _col_exists(conn, "items", "resumen")
         has_titulo          = _col_exists(conn, "items", "titulo")
+        has_likes           = _col_exists(conn, "items", "likes")
+        has_dislikes        = _col_exists(conn, "items", "dislikes")
+        has_informe_imp     = _col_exists(conn, "items", "informe_impacto")
+        has_impacto         = _col_exists(conn, "items", "impacto")
 
         # catálogos disponibles
         dep_table = None
@@ -114,7 +120,7 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
         args: List[Any] = []
 
         # fechas (usa created_at si existe, si no created_at_date)
-        date_expr = sql.SQL("DATE(i.created_at)") if _col_exists(conn, "items", "created_at") else sql.SQL("DATE(i.created_at_date)")
+        date_expr = sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)")
 
         if fecha_eq:
             where_sql_parts.append(sql.SQL("{} = %s").format(date_expr))
@@ -156,6 +162,9 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
                 text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
             if has_contenido:
                 text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
+            # incluir informe_impacto::text sólo si existe y la query tiene al menos 3 chars (para no matar el índice)
+            if has_informe_imp and len(q_adv) >= 3:
+                text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s")); args.append(like_val)
             if text_clauses:
                 where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
 
@@ -175,13 +184,17 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
             sql.SQL("i.identificador"),
             sql.SQL("i.titulo") if has_titulo else sql.SQL("NULL AS titulo"),
             sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
-            sql.SQL("i.impacto") if _col_exists(conn, "items", "impacto") else sql.SQL("NULL AS impacto"),
+            # impacto normalizado: prioriza informe_impacto
+            sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
+                else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
             sql.SQL("i.departamento_codigo"),
             sql.SQL("i.seccion_codigo"),
             sql.SQL("i.epigrafe"),
-            sql.SQL("i.created_at") if _col_exists(conn, "items", "created_at") else sql.SQL("i.created_at_date AS created_at"),
-            sql.SQL("i.likes") if _col_exists(conn, "items", "likes") else sql.SQL("NULL AS likes"),
-            sql.SQL("i.dislikes") if _col_exists(conn, "items", "dislikes") else sql.SQL("NULL AS dislikes"),
+            sql.SQL("i.created_at") if has_created_at else (
+                sql.SQL("i.created_at_date AS created_at") if has_created_at_date else sql.SQL("NULL AS created_at")
+            ),
+            sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
+            sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
             sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
         ]
         joins: List[sql.SQL] = []
@@ -240,43 +253,82 @@ def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
 # ----------------------- detalle & derivados -----------------------
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
     with get_db() as conn, conn.cursor() as cur:
-        # columnas opcionales
-        cols = [
+        # columnas opcionales; para alias usa "informe_impacto AS impacto" si la base lo permite
+        base_cols = [
             "id", "identificador",
-            "titulo", "contenido", "resumen", "impacto",
+            "titulo", "contenido", "resumen",
             "departamento_codigo", "seccion_codigo",
             "epigrafe", "created_at", "likes", "dislikes", "control"
         ]
-        sel = ", ".join([f"i.{c}" for c in cols if _col_exists(conn, "items", c)]) or "i.identificador"
+        existing_cols = [c for c in base_cols if _col_exists(conn, "items", c)]
+
+        sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
+        # impacto normalizado
+        if _col_exists(conn, "items", "informe_impacto"):
+            sel_parts.append("i.informe_impacto AS impacto")
+        elif _col_exists(conn, "items", "impacto"):
+            sel_parts.append("i.impacto")
+
+        sel = ", ".join(sel_parts) or "i.identificador"
         cur.execute(f"SELECT {sel} FROM items i WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
         if not row:
             return None
         names = [desc.name for desc in cur.description]
-        return dict(zip(names, row))
+        data = dict(zip(names, row))
+
+    # Por si no pudimos hacer el alias en SQL (p.ej. no había soporte), aliásalo en Python
+    if "impacto" not in data and "informe_impacto" in data:
+        data["impacto"] = data.get("informe_impacto")
+
+    # Garantiza claves mínimas (evita KeyError aguas arriba)
+    for k in ("titulo", "resumen", "impacto", "likes", "dislikes", "control",
+              "departamento_codigo", "seccion_codigo", "epigrafe", "created_at"):
+        data.setdefault(k, None)
+
+    return data
 
 def get_item_resumen(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
+        # si no existe la columna, devolvemos None
+        if not _col_exists(conn, "items", "resumen"):
+            return {"identificador": identificador, "resumen": None}
         cur.execute("SELECT resumen FROM items WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
     return {"identificador": identificador, "resumen": row[0] if row else None}
 
 def get_item_impacto(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+        # usa el campo real de la BD
+        if not _col_exists(conn, "items", "informe_impacto"):
+            # fallback si existiese antigua columna impacto
+            if _col_exists(conn, "items", "impacto"):
+                cur.execute("SELECT impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+                row = cur.fetchone()
+                return {"identificador": identificador, "impacto": row[0] if row else None}
+            return {"identificador": identificador, "impacto": None}
+        cur.execute("SELECT informe_impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
     return {"identificador": identificador, "impacto": row[0] if row else None}
 
 def like_item(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE items SET likes = COALESCE(likes,0) + 1 WHERE identificador = %s RETURNING likes", (identificador,))
+        if not _col_exists(conn, "items", "likes"):
+            return {"identificador": identificador, "likes": None}
+        cur.execute(
+            "UPDATE items SET likes = COALESCE(likes,0) + 1 WHERE identificador = %s RETURNING likes",
+            (identificador,))
         row = cur.fetchone()
         conn.commit()
     return {"identificador": identificador, "likes": row[0] if row else 0}
 
 def dislike_item(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE items SET dislikes = COALESCE(dislikes,0) + 1 WHERE identificador = %s RETURNING dislikes", (identificador,))
+        if not _col_exists(conn, "items", "dislikes"):
+            return {"identificador": identificador, "dislikes": None}
+        cur.execute(
+            "UPDATE items SET dislikes = COALESCE(dislikes,0) + 1 WHERE identificador = %s RETURNING dislikes",
+            (identificador,))
         row = cur.fetchone()
         conn.commit()
     return {"identificador": identificador, "dislikes": row[0] if row else 0}
@@ -296,5 +348,8 @@ def list_epigrafes() -> List[str]:
         ORDER BY epigrafe
     """
     with get_db() as conn, conn.cursor() as cur:
+        # si no existe la columna epigrafe, devolvemos []
+        if not _col_exists(conn, "items", "epigrafe"):
+            return []
         cur.execute(sql_text)
         return [r[0] for r in cur.fetchall()]
