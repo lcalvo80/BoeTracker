@@ -15,11 +15,6 @@ from app.controllers.items_controller import (
 
 bp = Blueprint("items", __name__)
 
-@bp.before_request
-def handle_options():
-    if request.method == "OPTIONS":
-        return ("", 204)
-
 # Listado
 @bp.route("", methods=["GET"])
 def api_items():
