@@ -6,6 +6,7 @@ from datetime import datetime
 
 bp = Blueprint("comments", __name__)
 
+# ---------- helpers ----------
 def _col_exists(conn, table, col) -> bool:
     with conn.cursor() as cur:
         cur.execute("""
@@ -14,24 +15,6 @@ def _col_exists(conn, table, col) -> bool:
             LIMIT 1
         """, (table, col))
         return cur.fetchone() is not None
-
-# --- bootstrap: crea tabla si no existe; no rompe prod si ya existe ---
-def _ensure_table():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS comments (
-                    id SERIAL PRIMARY KEY,
-                    item_identificador TEXT NOT NULL,
-                    -- Ojo: intentamos usar la columna nueva; si no existe, luego tratamos fallback
-                    content TEXT,
-                    user_id TEXT NULL,
-                    author TEXT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-                );
-            """)
-        conn.commit()
-_ensure_table()
 
 def _safe_int(v, d, mi=1, ma=100):
     try:
@@ -44,7 +27,7 @@ def _safe_int(v, d, mi=1, ma=100):
 
 def _row_dict(row, cols):
     d = dict(zip(cols, row))
-    # alias normalizado para el front
+    # normalización para front
     if "content" in d and "text" not in d and d.get("content") is not None:
         d["text"] = d["content"]
     if "item_identificador" in d and "identificador" not in d:
@@ -52,6 +35,22 @@ def _row_dict(row, cols):
     if isinstance(d.get("created_at"), datetime):
         d["created_at"] = d["created_at"].isoformat()
     return d
+
+# ---------- bootstrap suave (no rompe prod) ----------
+def _ensure_table():
+    # Crea tabla mínima si no existe; NO fuerza columnas que ya tienes
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS comments (
+                    id SERIAL PRIMARY KEY,
+                    item_identificador TEXT NOT NULL,
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+        conn.commit()
+_ensure_table()
 
 # =========================
 # GET /api/items/<ident>/comments
@@ -66,25 +65,28 @@ def list_item_comments(ident):
         with get_db() as conn:
             has_content    = _col_exists(conn, "comments", "content")
             has_comentario = _col_exists(conn, "comments", "comentario")
+            has_author     = _col_exists(conn, "comments", "author")
+            has_user_name  = _col_exists(conn, "comments", "user_name")
+
+            text_expr = "COALESCE(content, comentario)" if (has_content and has_comentario) \
+                        else ("content" if has_content else ("comentario" if has_comentario else "NULL"))
+            # Devolvemos siempre 'author' normalizado
+            author_expr = "COALESCE(author, user_name)" if (has_author and has_user_name) \
+                          else ("author" if has_author else ("user_name" if has_user_name else "NULL"))
 
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM comments WHERE item_identificador = %s", (ident,))
                 total = cur.fetchone()[0] or 0
 
-                # Selecciona texto de comment desde la columna que exista
-                text_expr = "COALESCE(content, comentario)" if (has_content and has_comentario) else \
-                            ("content" if has_content else ("comentario" if has_comentario else "NULL"))
-
                 cur.execute(f"""
                     SELECT id,
                            item_identificador,
-                           {text_expr} AS content,
-                           user_id,
-                           author,
+                           {text_expr}   AS content,
+                           {author_expr} AS author,
                            created_at
                     FROM comments
                     WHERE item_identificador = %s
-                    ORDER BY created_at DESC, id DESC
+                    ORDER BY created_at DESC NULLS LAST, id DESC
                     LIMIT %s OFFSET %s
                 """, (ident, limit, offset))
                 rows = cur.fetchall()
@@ -92,15 +94,11 @@ def list_item_comments(ident):
                 items = [_row_dict(r, cols) for r in rows]
 
         pages = ceil(total / limit) if limit else 0
-        return jsonify({
-            "items": items,
-            "page": page if total else 1,
-            "pages": pages if total else 0,
-            "total": total
-        }), 200
+        return jsonify({"items": items, "page": page if total else 1, "pages": pages if total else 0, "total": total}), 200
 
     except Exception:
         current_app.logger.exception("list_item_comments failed")
+        # Respuesta estable para la UI
         return jsonify({"items": [], "page": 1, "pages": 0, "total": 0}), 200
 
 # =========================
@@ -110,36 +108,55 @@ def list_item_comments(ident):
 def add_item_comment(ident):
     try:
         body = request.get_json(force=True) or {}
-        text    = (body.get("text") or body.get("content") or "").strip()
-        author  = (body.get("author") or None)
-        user_id = (body.get("user_id") or None)
+        text_input   = (body.get("text") or body.get("content") or "").strip()
+        author_input = (body.get("author") or "").strip() or None
 
-        if not text:
+        if not text_input:
             return jsonify({"detail": "content/text requerido"}), 400
 
         with get_db() as conn:
             has_content    = _col_exists(conn, "comments", "content")
             has_comentario = _col_exists(conn, "comments", "comentario")
+            has_author     = _col_exists(conn, "comments", "author")
+            has_user_name  = _col_exists(conn, "comments", "user_name")
 
-            # Si no existe ninguna, crea 'content' y úsala
+            # Asegura columna de texto
             if not has_content and not has_comentario:
                 with conn.cursor() as cur:
                     cur.execute('ALTER TABLE comments ADD COLUMN content TEXT;')
                 conn.commit()
                 has_content = True
 
-            target_col = "content" if has_content else "comentario"
+            text_col   = "content" if has_content else "comentario"
+            # En tu esquema actual existe user_name (no author)
+            author_col = "author" if has_author else ("user_name" if has_user_name else None)
+
+            cols = ["item_identificador", text_col]
+            args = [ident, text_input]
+
+            if author_col:
+                cols.append(author_col)
+                args.append(author_input)
+
+            placeholders = ", ".join(["%s"] * len(cols))
+            col_list = ", ".join(cols)
+
+            return_text_expr   = f"{text_col} AS content"
+            # Siempre devolver 'author' normalizado
+            return_author_expr = ("COALESCE(author, user_name) AS author"
+                                  if (has_author and has_user_name)
+                                  else (f"{author_col} AS author" if author_col else "NULL AS author"))
 
             with conn.cursor() as cur:
                 cur.execute(f"""
-                    INSERT INTO comments (item_identificador, {target_col}, user_id, author)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING id, item_identificador, {target_col} AS content, user_id, author, created_at
-                """, (ident, text, user_id, author))
+                    INSERT INTO comments ({col_list})
+                    VALUES ({placeholders})
+                    RETURNING id, item_identificador, {return_text_expr}, {return_author_expr}, created_at
+                """, args)
                 row = cur.fetchone()
             conn.commit()
 
-        cols = ["id", "item_identificador", "content", "user_id", "author", "created_at"]
+        cols = ["id", "item_identificador", "content", "author", "created_at"]
         data = _row_dict(row, cols)
         return jsonify(data), 201
 
