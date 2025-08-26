@@ -85,7 +85,7 @@ const Skeleton = ({ className = "" }) => (
 
 const titleCaseFromKey = (key) =>
   String(key)
-    .replace(/[_\-]+/g, " ")
+    .replace(/[_-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .replace(/\b\w/g, (m) => m.toUpperCase());
@@ -150,9 +150,8 @@ const renderResumen = (resumenStr) => {
   }
 
   const ctx = parsed.context || parsed.Context || parsed.CONTEXTO;
-  const keyChanges = parsed.key_changes || parsed["key_changes"] || parsed["key\\_changes"] || [];
-  const keyDates =
-    parsed.key_dates_events || parsed["key_dates_events"] || parsed["key\\_dates\\_events"] || [];
+  const keyChanges = parsed.key_changes || parsed["key_changes"] || [];
+  const keyDates = parsed.key_dates_events || parsed["key_dates_events"] || [];
   const conclusion = parsed.conclusion || parsed.Conclusion || parsed.CONCLUSION;
 
   return (

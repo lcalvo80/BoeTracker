@@ -8,12 +8,7 @@ import {
   ChatBubbleLeftRightIcon,
   CheckCircleIcon,
 } from "@heroicons/react/24/outline";
-import {
-  SignedIn,
-  SignedOut,
-  SignInButton,
-  SignUpButton,
-} from "@clerk/clerk-react";
+import { SignedIn, SignedOut, SignUpButton } from "@clerk/clerk-react";
 
 const Home = () => {
   // Toggle de facturación
