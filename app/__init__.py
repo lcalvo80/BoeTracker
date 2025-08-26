@@ -4,7 +4,7 @@ from flask_cors import CORS
 import os
 
 DEFAULT_ORIGINS = {"http://localhost:3000"}
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN")  # https://boefrontend-production.up.railway.app/
 if FRONTEND_ORIGIN:
     DEFAULT_ORIGINS.add(FRONTEND_ORIGIN)
 ALLOWED_ORIGINS = DEFAULT_ORIGINS
@@ -13,23 +13,26 @@ def create_app():
     app = Flask(__name__)
     app.url_map.strict_slashes = False
 
+    # CORS para /api/*
     CORS(
         app,
-        resources={r"/api/*": {
-            "origins": list(ALLOWED_ORIGINS),
-            "supports_credentials": True,
-            "allow_headers": ["Content-Type", "Authorization"],
-            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        }},
+        resources={
+            r"/api/*": {
+                "origins": list(ALLOWED_ORIGINS),
+                "supports_credentials": True,
+                "allow_headers": ["Content-Type", "Authorization"],
+                "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            }
+        },
     )
 
     @app.after_request
     def add_cors_headers(resp):
+        # Añade CORS incluso en errores (500/404) y preflights
         origin = request.headers.get("Origin")
         if origin in ALLOWED_ORIGINS:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Vary"] = "Origin"
-            # 🔧 añade SIEMPRE estos (incluye preflights, errores, etc.)
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"

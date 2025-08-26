@@ -1,7 +1,7 @@
 flask
-flask-cors
-Flask
+Flask-Cors
 psycopg2-binary
 requests
 python-dotenv
 openai>=1.0.0
+gunicorn
