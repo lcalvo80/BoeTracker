@@ -1,5 +1,5 @@
 // src/pages/BOEPage.jsx
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Calendar from "react-calendar";
 import "react-calendar/dist/Calendar.css";
 import { useNavigate } from "react-router-dom";
@@ -12,7 +12,7 @@ const ITEMS_PER_PAGE = 12;
 
 const toIsoDate = (d) =>
   d instanceof Date && !isNaN(d)
-    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" })
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // YYYY-MM-DD
     : null;
 
 const formatDateEsLong = (dateObj) =>
@@ -64,22 +64,25 @@ const BOEPage = () => {
     useRange: false,
   });
 
-  const [typing, setTyping] = useState(null); // debounce
+  // debounce + IME
+  const [typing, setTyping] = useState(null);
+  const [isComposing, setIsComposing] = useState(false);
+
   const [options, setOptions] = useState({
     departamentos: [],
     epigrafes: [],
     secciones: [],
   });
 
-  // Cargar opciones de filtros (arrays simples desde el servicio)
+  // Cargar opciones de filtros
   useEffect(() => {
     const load = async () => {
       try {
-        const res = await getFilterOptions();
+        const res = await getFilterOptions?.();
         setOptions({
-          departamentos: Array.isArray(res.departamentos) ? res.departamentos : [],
-          secciones: Array.isArray(res.secciones) ? res.secciones : [],
-          epigrafes: Array.isArray(res.epigrafes) ? res.epigrafes : [],
+          departamentos: Array.isArray(res?.departamentos) ? res.departamentos : [],
+          secciones: Array.isArray(res?.secciones) ? res.secciones : [],
+          epigrafes: Array.isArray(res?.epigrafes) ? res.epigrafes : [],
         });
       } catch (e) {
         console.error("Error loading filter options", e);
@@ -89,7 +92,7 @@ const BOEPage = () => {
     load();
   }, []);
 
-  // params → backend (boeService serializa correctamente)
+  // params → backend (fechas en ISO; q = q_adv)
   const queryParams = useMemo(() => {
     const {
       q_adv, identificador, control,
@@ -97,22 +100,26 @@ const BOEPage = () => {
       fecha, fecha_desde, fecha_hasta, useRange,
     } = filters;
 
+    const fecha_iso = fecha ? toIsoDate(fecha) : undefined;
+    const fecha_desde_iso = fecha_desde ? toIsoDate(fecha_desde) : undefined;
+    const fecha_hasta_iso = fecha_hasta ? toIsoDate(fecha_hasta) : undefined;
+
     return {
       // texto
-      q: q_adv?.trim() || undefined, // el backend espera 'q'
+      q: q_adv?.trim() || undefined,
       identificador: identificador?.trim() || undefined,
       control: control?.trim() || undefined,
 
-      // arrays (se serializan como claves repetidas)
+      // arrays
       secciones,
       departamentos,
       epigrafes,
 
-      // fechas
+      // fechas como string ISO (no Date)
       useRange,
-      fecha,
-      fecha_desde,
-      fecha_hasta,
+      fecha: !useRange ? fecha_iso : undefined,
+      fecha_desde: useRange ? fecha_desde_iso : undefined,
+      fecha_hasta: useRange ? fecha_hasta_iso : undefined,
 
       // paginación/orden
       page: currentPage,
@@ -122,16 +129,25 @@ const BOEPage = () => {
     };
   }, [filters, currentPage]);
 
-  // Carga de items
+  // AbortController para cancelar la petición anterior
+  const controllerRef = useRef(null);
+
+  // Carga de items (con cancelación)
   useEffect(() => {
+    if (controllerRef.current) controllerRef.current.abort();
+    controllerRef.current = new AbortController();
+    const { signal } = controllerRef.current;
+
     const fetchItems = async () => {
       try {
         setError("");
         setLoading(true);
-        const data = await getItems(queryParams);
+        const data = await getItems(queryParams, { signal }); // <- pasa signal a axios
         setItems(Array.isArray(data?.items) ? data.items : []);
         setTotalItems(Number.isFinite(data?.total) ? data.total : 0);
       } catch (err) {
+        // Ignora cancelaciones para no ensuciar UX
+        if (err?.name === "AbortError" || err?.name === "CanceledError") return;
         console.error("Error fetching items", err);
         setItems([]);
         setTotalItems(0);
@@ -145,10 +161,12 @@ const BOEPage = () => {
         setLoading(false);
       }
     };
+
     fetchItems();
+    return () => controllerRef.current?.abort();
   }, [queryParams]);
 
-  // Handlers
+  // Handlers texto (debounce + IME)
   const debouncedTextChange = (name, value) => {
     if (typing) clearTimeout(typing);
     const t = setTimeout(() => {
@@ -160,6 +178,7 @@ const BOEPage = () => {
 
   const handleTextChange = (e) => {
     const { name, value } = e.target;
+    if (isComposing) return; // no dispares mientras se compone
     debouncedTextChange(name, value);
   };
 
@@ -275,6 +294,11 @@ const BOEPage = () => {
                     name="q_adv"
                     value={filters.q_adv}
                     onChange={handleTextChange}
+                    onCompositionStart={() => setIsComposing(true)}
+                    onCompositionEnd={(e) => {
+                      setIsComposing(false);
+                      debouncedTextChange("q_adv", e.target.value);
+                    }}
                     className={inputBase}
                     placeholder='Escribe lo que buscas. Ej.: ayudas vivienda, "contrato menor"'
                   />
@@ -295,6 +319,11 @@ const BOEPage = () => {
                     type="text"
                     name="identificador"
                     onChange={handleTextChange}
+                    onCompositionStart={() => setIsComposing(true)}
+                    onCompositionEnd={(e) => {
+                      setIsComposing(false);
+                      debouncedTextChange("identificador", e.target.value);
+                    }}
                     value={filters.identificador}
                     className={inputBase}
                     placeholder="Buscar por identificador"
@@ -309,6 +338,11 @@ const BOEPage = () => {
                     type="text"
                     name="control"
                     onChange={handleTextChange}
+                    onCompositionStart={() => setIsComposing(true)}
+                    onCompositionEnd={(e) => {
+                      setIsComposing(false);
+                      debouncedTextChange("control", e.target.value);
+                    }}
                     value={filters.control}
                     className={inputBase}
                     placeholder="Buscar por control"
