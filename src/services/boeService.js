@@ -1,182 +1,138 @@
 // src/services/boeService.js
-import api from "./http"; // permite tanto `import api from` como `{ api }` (exportamos ambos en http.js)
+import { get } from "./http";
+
+const DEV_DEBUG = process.env.NODE_ENV === "development";
+
+/** Util: fecha a YYYY-MM-DD (zona Europe/Madrid) */
+const toISO = (d) =>
+  d instanceof Date && !isNaN(d)
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" })
+    : null;
 
 /**
- * ============================
- * LISTADO CON FILTROS
- * ============================
- * @param {Object} params
- * @param {number} [params.page]
- * @param {number} [params.limit]
- * @param {string} [params.q_adv]
- * @param {string} [params.identificador]
- * @param {string} [params.control]
- * @param {string} [params.seccion]        CSV de códigos
- * @param {string} [params.departamento]   CSV de códigos
- * @param {string} [params.epigrafe]       CSV de códigos
- * @param {string} [params.fecha]          YYYY-MM-DD
- * @param {string} [params.fecha_desde]    YYYY-MM-DD
- * @param {string} [params.fecha_hasta]    YYYY-MM-DD
- * @param {string} [params.sort_by]
- * @param {('asc'|'desc')} [params.sort_dir]
- * @returns {Promise<any>} data del backend
+ * Construye URLSearchParams cumpliendo el contrato del backend:
+ *  - Arrays -> claves repetidas (?secciones=I&secciones=II)
+ *  - Texto -> 'q' (no 'q_adv')
+ *  - Fecha exacta -> duplica en fecha_desde/fecha_hasta
  */
-export const getItems = async (params = {}) => {
-  const { data } = await api.get("/items", { params });
-  return data;
-};
+export function buildSearchParams(filters = {}) {
+  const p = new URLSearchParams();
 
-/**
- * ============================
- * OPCIONES DE FILTRADO
- * ============================
- * Devuelve SIEMPRE un objeto:
- * {
- *   departamentos: { data: [{codigo, nombre}, ...] },
- *   secciones:     { data: [{codigo, nombre}, ...] },
- *   epigrafes:     { data: ["...", "..."] }
- * }
- */
-export const getFilterOptions = async () => {
-  const [deps, secs, epis] = await Promise.allSettled([
-    api.get("/items/departamentos"),
-    api.get("/items/secciones"),
-    api.get("/items/epigrafes"),
-  ]);
-
-  const ok = (e) => e.status === "fulfilled";
-  const toData = (e) => (ok(e) ? e.value?.data : undefined);
-
-  // Normalizamos para garantizar { data: [] } en cada bloque
-  const departamentos = toData(deps);
-  const secciones = toData(secs);
-  const epigrafes = toData(epis);
-
-  return {
-    departamentos: Array.isArray(departamentos)
-      ? { data: departamentos }
-      : departamentos && typeof departamentos === "object" && Array.isArray(departamentos.data)
-      ? departamentos
-      : { data: [] },
-
-    secciones: Array.isArray(secciones)
-      ? { data: secciones }
-      : secciones && typeof secciones === "object" && Array.isArray(secciones.data)
-      ? secciones
-      : { data: [] },
-
-    epigrafes: Array.isArray(epigrafes)
-      ? { data: epigrafes }
-      : epigrafes && typeof epigrafes === "object" && Array.isArray(epigrafes.data)
-      ? epigrafes
-      : { data: [] },
+  const appendMulti = (key, arr) => {
+    (arr || []).forEach((v) => {
+      const s = `${v ?? ""}`.trim();
+      if (s) p.append(key, s);
+    });
   };
-};
 
-/**
- * Compat: devuelve [departamentos, epigrafes, secciones] en ese orden.
- * Cada elemento con shape { data: [...] }
- */
-export const getFilterOptionsArray = async () => {
-  const { departamentos, secciones, epigrafes } = await getFilterOptions();
-  return [departamentos, epigrafes, secciones];
-};
+  // Texto
+  if (filters.q?.trim()) p.set("q", filters.q.trim());
+  if (filters.identificador?.trim()) p.set("identificador", filters.identificador.trim());
+  if (filters.control?.trim()) p.set("control", filters.control.trim());
 
-/**
- * ============================
- * DETALLE
- * ============================
- */
-export const getItemById = async (identificador) => {
-  const { data } = await api.get(`/items/${encodeURIComponent(identificador)}`);
-  return data;
-};
+  // Arrays (claves repetidas)
+  appendMulti("secciones", filters.secciones);
+  appendMulti("departamentos", filters.departamentos);
+  appendMulti("epigrafes", filters.epigrafes);
+  appendMulti("tags", filters.tags);
+  appendMulti("ids", filters.ids);
 
-export const getResumen = async (identificador) => {
-  const { data } = await api.get(
-    `/items/${encodeURIComponent(identificador)}/resumen`
-  );
-  return data;
-};
+  // Fechas
+  if (filters.useRange) {
+    const fd = toISO(filters.fecha_desde);
+    const fh = toISO(filters.fecha_hasta);
+    if (fd) p.set("fecha_desde", fd);
+    if (fh) p.set("fecha_hasta", fh);
+  } else {
+    const f = toISO(filters.fecha);
+    if (f) {
+      // Fecha exacta -> mismo día en desde/hasta
+      p.set("fecha_desde", f);
+      p.set("fecha_hasta", f);
+    }
+  }
 
-export const getImpacto = async (identificador) => {
-  const { data } = await api.get(
-    `/items/${encodeURIComponent(identificador)}/impacto`
-  );
-  return data;
-};
+  // Paginación / orden
+  p.set("page", String(filters.page ?? 1));
+  p.set("limit", String(filters.limit ?? 12));
+  p.set("sort_by", filters.sort_by || "created_at");
+  p.set("sort_dir", filters.sort_dir || "desc");
 
-/**
- * ============================
- * REACCIONES
- * ============================
- */
-export const likeItem = async (identificador) => {
-  const { data } = await api.post(
-    `/items/${encodeURIComponent(identificador)}/like`
-  );
-  return data;
-};
+  return p;
+}
 
-export const dislikeItem = async (identificador) => {
-  const { data } = await api.post(
-    `/items/${encodeURIComponent(identificador)}/dislike`
-  );
-  return data;
-};
+/** Listado con filtros */
+export async function getItems(filters = {}) {
+  const params = buildSearchParams(filters);
+  const headers = DEV_DEBUG ? { "X-Debug-Filters": "1" } : undefined;
+  // Usamos get(path + query) para controlar la serialización exacta
+  return get(`/items?${params.toString()}`, { headers });
+}
 
-/**
- * ============================
- * COMENTARIOS
- * ============================
- * Tolerante a backends sin /comments:
- * - Si falla, devuelve { items: [], total: 0, page: 1, pages: 0 }
- * - Si backend devuelve un array simple, normaliza a ese shape.
- * @returns {Promise<{items: any[], total: number, page: number, pages: number}>}
- */
-export const getComments = async (
-  identificador,
-  params = { page: 1, limit: 20 }
-) => {
+/** Catálogos: devolvemos arrays simples */
+export async function getFilterOptions() {
+  const [departamentos, secciones, epigrafes] = await Promise.all([
+    get(`/items/departamentos`).catch(() => []),
+    get(`/items/secciones`).catch(() => []),
+    get(`/items/epigrafes`).catch(() => []),
+  ]);
+  return {
+    departamentos: Array.isArray(departamentos) ? departamentos : [],
+    secciones: Array.isArray(secciones) ? secciones : [],
+    epigrafes: Array.isArray(epigrafes) ? epigrafes : [],
+  };
+}
+
+/** Detalle */
+export async function getItemById(identificador) {
+  return get(`/items/${encodeURIComponent(identificador)}`);
+}
+export async function getResumen(identificador) {
+  return get(`/items/${encodeURIComponent(identificador)}/resumen`);
+}
+export async function getImpacto(identificador) {
+  return get(`/items/${encodeURIComponent(identificador)}/impacto`);
+}
+
+/** Reacciones */
+export async function likeItem(identificador) {
+  // si prefieres usar post de http.js, impórtalo también
+  return get(`/items/${encodeURIComponent(identificador)}/like`, { method: "POST" });
+}
+export async function dislikeItem(identificador) {
+  return get(`/items/${encodeURIComponent(identificador)}/dislike`, { method: "POST" });
+}
+
+/** Comentarios con fallback tolerante */
+export async function getComments(identificador, params = { page: 1, limit: 20 }) {
   try {
-    const res = await api.get(
-      `/items/${encodeURIComponent(identificador)}/comments`,
-      { params }
-    );
-    const data = res?.data;
+    const search = new URLSearchParams({ page: String(params.page || 1), limit: String(params.limit || 20) });
+    const data = await get(`/items/${encodeURIComponent(identificador)}/comments?${search.toString()}`);
 
     if (Array.isArray(data)) {
       return { items: data, total: data.length, page: 1, pages: 1 };
     }
-    // Si viene { items, total, page, pages }
-    if (
-      data &&
-      typeof data === "object" &&
-      Array.isArray(data.items) &&
-      typeof data.total === "number"
-    ) {
+    if (data && typeof data === "object" && Array.isArray(data.items) && typeof data.total === "number") {
       return data;
     }
-    // Fallback suave si el shape no es el esperado
     return { items: [], total: 0, page: 1, pages: 0 };
   } catch (err) {
     console.warn("getComments fallback:", err?.response?.status || err?.message);
     return { items: [], total: 0, page: 1, pages: 0 };
   }
-};
+}
 
-export const postComment = async (identificador, payload) => {
+export async function postComment(identificador, payload) {
   try {
-    // payload sugerido: { author, text }
-    const { data } = await api.post(
-      `/items/${encodeURIComponent(identificador)}/comments`,
-      payload
-    );
-    return data;
+    // fetch con POST simple usando http.js sería mejor; aquí usamos fetch directo por simplicidad
+    const res = await fetch(`/api/items/${encodeURIComponent(identificador)}/comments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    if (!res.ok) throw await res.json().catch(() => ({}));
+    return res.json();
   } catch (err) {
-    // Rechaza con un objeto "amigable" para UI
-    return Promise.reject(
-      err?.response?.data || { error: "No se pudo enviar el comentario" }
-    );
+    return Promise.reject(err || { error: "No se pudo enviar el comentario" });
   }
-};
+}

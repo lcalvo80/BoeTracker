@@ -1,17 +1,18 @@
+
+// src/services/http.js
 import axios from "axios";
 
-// Base URL de la API, configurable vía variable de entorno.
-// Ejemplo: https://boetracker-production-7205.up.railway.app/api
-const API = (process.env.REACT_APP_API_BASE_URL || "").replace(/\/$/, "");
+// Si NO hay REACT_APP_API_BASE_URL, usamos '/api' (same-origin detrás de reverse proxy)
+const API = (process.env.REACT_APP_API_BASE_URL || "/api").replace(/\/$/, "");
 
-// Creamos la instancia principal de axios
 export const api = axios.create({
   baseURL: API,
   timeout: 15000,
   headers: { "Content-Type": "application/json" },
+  // Si usas cookies/sesión cross-site, descomenta:
+  // withCredentials: true,
 });
 
-// Interceptor de respuestas para logging y errores
 api.interceptors.response.use(
   (response) => response,
   (err) => {
@@ -22,12 +23,6 @@ api.interceptors.response.use(
   }
 );
 
-// Helpers para simplificar llamadas
-export const get = (path, config) =>
-  api.get(path, config).then((r) => r.data);
-
-export const post = (path, data, config) =>
-  api.post(path, data, config).then((r) => r.data);
-
-// Export default también, para permitir `import api from './http'`
+export const get = (path, config) => api.get(path, config).then((r) => r.data);
+export const post = (path, data, config) => api.post(path, data, config).then((r) => r.data);
 export default api;

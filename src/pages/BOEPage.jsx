@@ -28,7 +28,7 @@ const getPublishedDate = (item) => {
     const d = new Date(item.created_at);
     if (!isNaN(d)) return formatDateEsLong(d);
   }
-  const day = item?.created_at_date || item?.fecha_publicacion;
+  const day = item?.created_at_date || item?.fecha_publicacion || item?.fecha;
   if (day && /^\d{4}-\d{2}-\d{2}$/.test(day)) {
     const [y, m, d] = day.split("-").map(Number);
     return formatDateEsLong(new Date(Date.UTC(y, m - 1, d)));
@@ -71,15 +71,15 @@ const BOEPage = () => {
     secciones: [],
   });
 
-  // cargar opciones
+  // Cargar opciones de filtros (arrays simples desde el servicio)
   useEffect(() => {
     const load = async () => {
       try {
         const res = await getFilterOptions();
         setOptions({
-          departamentos: Array.isArray(res?.departamentos?.data) ? res.departamentos.data : [],
-          secciones: Array.isArray(res?.secciones?.data) ? res.secciones.data : [],
-          epigrafes: Array.isArray(res?.epigrafes?.data) ? res.epigrafes.data : [],
+          departamentos: Array.isArray(res.departamentos) ? res.departamentos : [],
+          secciones: Array.isArray(res.secciones) ? res.secciones : [],
+          epigrafes: Array.isArray(res.epigrafes) ? res.epigrafes : [],
         });
       } catch (e) {
         console.error("Error loading filter options", e);
@@ -89,7 +89,7 @@ const BOEPage = () => {
     load();
   }, []);
 
-  // params → backend
+  // params → backend (boeService serializa correctamente)
   const queryParams = useMemo(() => {
     const {
       q_adv, identificador, control,
@@ -97,46 +97,37 @@ const BOEPage = () => {
       fecha, fecha_desde, fecha_hasta, useRange,
     } = filters;
 
-    const params = { page: currentPage, limit: ITEMS_PER_PAGE };
+    return {
+      // texto
+      q: q_adv?.trim() || undefined, // el backend espera 'q'
+      identificador: identificador?.trim() || undefined,
+      control: control?.trim() || undefined,
 
-    if (q_adv?.trim()) params.q_adv = q_adv.trim();
-    if (identificador?.trim()) params.identificador = identificador.trim();
-    if (control?.trim()) params.control = control.trim();
+      // arrays (se serializan como claves repetidas)
+      secciones,
+      departamentos,
+      epigrafes,
 
-    // 👇 nombres que espera el backend
-    if (Array.isArray(secciones) && secciones.length > 0) {
-      params.seccion = secciones.join(",");
-    }
-    if (Array.isArray(departamentos) && departamentos.length > 0) {
-      params.departamento = departamentos.join(",");
-    }
-    if (Array.isArray(epigrafes) && epigrafes.length > 0) {
-      params.epigrafe = epigrafes.join(",");
-    }
+      // fechas
+      useRange,
+      fecha,
+      fecha_desde,
+      fecha_hasta,
 
-    if (useRange) {
-      const fd = toIsoDate(fecha_desde);
-      const fh = toIsoDate(fecha_hasta);
-      if (fd) params.fecha_desde = fd;
-      if (fh) params.fecha_hasta = fh;
-    } else {
-      const f = toIsoDate(fecha);
-      if (f) params.fecha = f;
-    }
-
-    params.sort_by = "created_at";
-    params.sort_dir = "desc";
-
-    return params;
+      // paginación/orden
+      page: currentPage,
+      limit: ITEMS_PER_PAGE,
+      sort_by: "created_at",
+      sort_dir: "desc",
+    };
   }, [filters, currentPage]);
 
-  // carga items
+  // Carga de items
   useEffect(() => {
     const fetchItems = async () => {
       try {
         setError("");
         setLoading(true);
-        // getItems devuelve `data` directamente
         const data = await getItems(queryParams);
         setItems(Array.isArray(data?.items) ? data.items : []);
         setTotalItems(Number.isFinite(data?.total) ? data.total : 0);
@@ -157,7 +148,7 @@ const BOEPage = () => {
     fetchItems();
   }, [queryParams]);
 
-  // handlers
+  // Handlers
   const debouncedTextChange = (name, value) => {
     if (typing) clearTimeout(typing);
     const t = setTimeout(() => {
@@ -172,9 +163,18 @@ const BOEPage = () => {
     debouncedTextChange(name, value);
   };
 
-  const setSecciones = (arr) => { setFilters((p) => ({ ...p, secciones: Array.isArray(arr) ? arr : [] })); setCurrentPage(1); };
-  const setDepartamentos = (arr) => { setFilters((p) => ({ ...p, departamentos: Array.isArray(arr) ? arr : [] })); setCurrentPage(1); };
-  const setEpigrafes = (arr) => { setFilters((p) => ({ ...p, epigrafes: Array.isArray(arr) ? arr : [] })); setCurrentPage(1); };
+  const setSecciones = (arr) => {
+    setFilters((p) => ({ ...p, secciones: Array.isArray(arr) ? arr : [] }));
+    setCurrentPage(1);
+  };
+  const setDepartamentos = (arr) => {
+    setFilters((p) => ({ ...p, departamentos: Array.isArray(arr) ? arr : [] }));
+    setCurrentPage(1);
+  };
+  const setEpigrafes = (arr) => {
+    setFilters((p) => ({ ...p, epigrafes: Array.isArray(arr) ? arr : [] }));
+    setCurrentPage(1);
+  };
 
   const toggleExpanded = (e, id) => {
     e.stopPropagation();
@@ -371,15 +371,11 @@ const BOEPage = () => {
                       <input
                         type="date"
                         className={inputBase}
-                        value={
-                          filters.fecha_desde ? toIsoDate(filters.fecha_desde) : ""
-                        }
+                        value={filters.fecha_desde ? toIsoDate(filters.fecha_desde) : ""}
                         onChange={(e) =>
                           setFilters((prev) => ({
                             ...prev,
-                            fecha_desde: e.target.value
-                              ? new Date(e.target.value)
-                              : null,
+                            fecha_desde: e.target.value ? new Date(e.target.value) : null,
                           }))
                         }
                       />
@@ -391,15 +387,11 @@ const BOEPage = () => {
                       <input
                         type="date"
                         className={inputBase}
-                        value={
-                          filters.fecha_hasta ? toIsoDate(filters.fecha_hasta) : ""
-                        }
+                        value={filters.fecha_hasta ? toIsoDate(filters.fecha_hasta) : ""}
                         onChange={(e) =>
                           setFilters((prev) => ({
                             ...prev,
-                            fecha_hasta: e.target.value
-                              ? new Date(e.target.value)
-                              : null,
+                            fecha_hasta: e.target.value ? new Date(e.target.value) : null,
                           }))
                         }
                       />
