@@ -1,15 +1,19 @@
-// src/services/http.js
 import axios from "axios";
 
+// Base URL de la API, configurable vía variable de entorno.
+// Ejemplo: https://boetracker-production-7205.up.railway.app/api
 const API = (process.env.REACT_APP_API_BASE_URL || "").replace(/\/$/, "");
 
-export const http = axios.create({
-  baseURL: API, // ej: https://boetracker-production-7205.up.railway.app/api
+// Creamos la instancia principal de axios
+export const api = axios.create({
+  baseURL: API,
   timeout: 15000,
+  headers: { "Content-Type": "application/json" },
 });
 
-http.interceptors.response.use(
-  (r) => r,
+// Interceptor de respuestas para logging y errores
+api.interceptors.response.use(
+  (response) => response,
   (err) => {
     const url = err?.config?.url || "";
     const status = err?.response?.status;
@@ -18,6 +22,12 @@ http.interceptors.response.use(
   }
 );
 
-// helpers
-export const get = (path, config) => http.get(path, config).then(r => r.data);
-export const post = (path, data, config) => http.post(path, data, config).then(r => r.data);
+// Helpers para simplificar llamadas
+export const get = (path, config) =>
+  api.get(path, config).then((r) => r.data);
+
+export const post = (path, data, config) =>
+  api.post(path, data, config).then((r) => r.data);
+
+// Export default también, para permitir `import api from './http'`
+export default api;

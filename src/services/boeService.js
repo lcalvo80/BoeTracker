@@ -1,18 +1,30 @@
 // src/services/boeService.js
-import { api } from "./http";
+import api from "./http"; // permite tanto `import api from` como `{ api }` (exportamos ambos en http.js)
 
 /**
  * ============================
  * LISTADO CON FILTROS
  * ============================
- * params esperados (todos opcionales):
- * - page, limit
- * - q_adv, identificador, control
- * - seccion (CSV de códigos), departamento (CSV), epigrafe (CSV)
- * - fecha (YYYY-MM-DD)  |  fecha_desde, fecha_hasta (rango)
- * - sort_by, sort_dir
+ * @param {Object} params
+ * @param {number} [params.page]
+ * @param {number} [params.limit]
+ * @param {string} [params.q_adv]
+ * @param {string} [params.identificador]
+ * @param {string} [params.control]
+ * @param {string} [params.seccion]        CSV de códigos
+ * @param {string} [params.departamento]   CSV de códigos
+ * @param {string} [params.epigrafe]       CSV de códigos
+ * @param {string} [params.fecha]          YYYY-MM-DD
+ * @param {string} [params.fecha_desde]    YYYY-MM-DD
+ * @param {string} [params.fecha_hasta]    YYYY-MM-DD
+ * @param {string} [params.sort_by]
+ * @param {('asc'|'desc')} [params.sort_dir]
+ * @returns {Promise<any>} data del backend
  */
-export const getItems = (params) => api.get("/items", { params });
+export const getItems = async (params = {}) => {
+  const { data } = await api.get("/items", { params });
+  return data;
+};
 
 /**
  * ============================
@@ -24,13 +36,6 @@ export const getItems = (params) => api.get("/items", { params });
  *   secciones:     { data: [{codigo, nombre}, ...] },
  *   epigrafes:     { data: ["...", "..."] }
  * }
- * Uso en UI:
- *   const { departamentos, secciones, epigrafes } = await getFilterOptions();
- *   setOptions({
- *     departamentos: departamentos.data ?? [],
- *     secciones: secciones.data ?? [],
- *     epigrafes: epigrafes.data ?? [],
- *   })
  */
 export const getFilterOptions = async () => {
   const [deps, secs, epis] = await Promise.allSettled([
@@ -40,20 +45,37 @@ export const getFilterOptions = async () => {
   ]);
 
   const ok = (e) => e.status === "fulfilled";
-  const safe = (e, fallback) => (ok(e) ? e.value : fallback);
+  const toData = (e) => (ok(e) ? e.value?.data : undefined);
+
+  // Normalizamos para garantizar { data: [] } en cada bloque
+  const departamentos = toData(deps);
+  const secciones = toData(secs);
+  const epigrafes = toData(epis);
 
   return {
-    departamentos: safe(deps, { data: [] }),
-    secciones: safe(secs, { data: [] }),
-    epigrafes: safe(epis, { data: [] }),
+    departamentos: Array.isArray(departamentos)
+      ? { data: departamentos }
+      : departamentos && typeof departamentos === "object" && Array.isArray(departamentos.data)
+      ? departamentos
+      : { data: [] },
+
+    secciones: Array.isArray(secciones)
+      ? { data: secciones }
+      : secciones && typeof secciones === "object" && Array.isArray(secciones.data)
+      ? secciones
+      : { data: [] },
+
+    epigrafes: Array.isArray(epigrafes)
+      ? { data: epigrafes }
+      : epigrafes && typeof epigrafes === "object" && Array.isArray(epigrafes.data)
+      ? epigrafes
+      : { data: [] },
   };
 };
 
 /**
- * (Compat) Si en alguna parte aún esperas array:
- *   const { departamentos, epigrafes, secciones } = await getFilterOptions();
- *   // O bien:
- *   const [d, e, s] = await getFilterOptionsArray();
+ * Compat: devuelve [departamentos, epigrafes, secciones] en ese orden.
+ * Cada elemento con shape { data: [...] }
  */
 export const getFilterOptionsArray = async () => {
   const { departamentos, secciones, epigrafes } = await getFilterOptions();
@@ -65,33 +87,52 @@ export const getFilterOptionsArray = async () => {
  * DETALLE
  * ============================
  */
-export const getItemById = (identificador) =>
-  api.get(`/items/${encodeURIComponent(identificador)}`);
+export const getItemById = async (identificador) => {
+  const { data } = await api.get(`/items/${encodeURIComponent(identificador)}`);
+  return data;
+};
 
-export const getResumen = (identificador) =>
-  api.get(`/items/${encodeURIComponent(identificador)}/resumen`);
+export const getResumen = async (identificador) => {
+  const { data } = await api.get(
+    `/items/${encodeURIComponent(identificador)}/resumen`
+  );
+  return data;
+};
 
-export const getImpacto = (identificador) =>
-  api.get(`/items/${encodeURIComponent(identificador)}/impacto`);
+export const getImpacto = async (identificador) => {
+  const { data } = await api.get(
+    `/items/${encodeURIComponent(identificador)}/impacto`
+  );
+  return data;
+};
 
 /**
  * ============================
  * REACCIONES
  * ============================
  */
-export const likeItem = (identificador) =>
-  api.post(`/items/${encodeURIComponent(identificador)}/like`);
+export const likeItem = async (identificador) => {
+  const { data } = await api.post(
+    `/items/${encodeURIComponent(identificador)}/like`
+  );
+  return data;
+};
 
-export const dislikeItem = (identificador) =>
-  api.post(`/items/${encodeURIComponent(identificador)}/dislike`);
+export const dislikeItem = async (identificador) => {
+  const { data } = await api.post(
+    `/items/${encodeURIComponent(identificador)}/dislike`
+  );
+  return data;
+};
 
 /**
  * ============================
  * COMENTARIOS
  * ============================
  * Tolerante a backends sin /comments:
- * - Si falla, devuelve { data: { items: [], total: 0, page: 1, pages: 0 } }
+ * - Si falla, devuelve { items: [], total: 0, page: 1, pages: 0 }
  * - Si backend devuelve un array simple, normaliza a ese shape.
+ * @returns {Promise<{items: any[], total: number, page: number, pages: number}>}
  */
 export const getComments = async (
   identificador,
@@ -103,24 +144,35 @@ export const getComments = async (
       { params }
     );
     const data = res?.data;
+
     if (Array.isArray(data)) {
-      return { data: { items: data, total: data.length, page: 1, pages: 1 } };
+      return { items: data, total: data.length, page: 1, pages: 1 };
     }
-    // Se espera { items, total, page, pages }
-    return res;
+    // Si viene { items, total, page, pages }
+    if (
+      data &&
+      typeof data === "object" &&
+      Array.isArray(data.items) &&
+      typeof data.total === "number"
+    ) {
+      return data;
+    }
+    // Fallback suave si el shape no es el esperado
+    return { items: [], total: 0, page: 1, pages: 0 };
   } catch (err) {
     console.warn("getComments fallback:", err?.response?.status || err?.message);
-    return { data: { items: [], total: 0, page: 1, pages: 0 } };
+    return { items: [], total: 0, page: 1, pages: 0 };
   }
 };
 
 export const postComment = async (identificador, payload) => {
   try {
     // payload sugerido: { author, text }
-    return await api.post(
+    const { data } = await api.post(
       `/items/${encodeURIComponent(identificador)}/comments`,
       payload
     );
+    return data;
   } catch (err) {
     // Rechaza con un objeto "amigable" para UI
     return Promise.reject(
