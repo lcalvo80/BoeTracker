@@ -52,8 +52,6 @@ export async function getItemById(id) {
  * Resumen de un item por ID.
  * Intenta /items/:id/resumen; si no existe, usa /items/:id y
  * devuelve data.resumen || data.summary si están presentes.
- * @param {string|number} id
- * @returns {Promise<any>}
  */
 export async function getResumen(id) {
   if (id === undefined || id === null || `${id}`.trim() === "") {
@@ -79,8 +77,6 @@ export async function getResumen(id) {
  * Impacto de un item por ID.
  * Intenta /items/:id/impacto; si no existe, usa /items/:id y
  * devuelve data.impacto || data.impact si están presentes.
- * @param {string|number} id
- * @returns {Promise<any>}
  */
 export async function getImpacto(id) {
   if (id === undefined || id === null || `${id}`.trim() === "") {
@@ -102,13 +98,47 @@ export async function getImpacto(id) {
   return { impacto: null };
 }
 
-/* ===== Export organizado para satisfacer ESLint (no anonymous default) ===== */
+/**
+ * Comentarios de un item por ID.
+ * Intenta /items/:id/comments o /items/:id/comentarios;
+ * si no existe, usa /items/:id y devuelve data.comments || data.comentarios.
+ */
+export async function getComments(id, params = {}) {
+  if (id === undefined || id === null || `${id}`.trim() === "") {
+    throw new Error("getComments requiere un id válido.");
+  }
+
+  try {
+    const { data } = await api.get(`/items/${id}/comments`, { params });
+    return data;
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status && status !== 404) throw err;
+  }
+
+  try {
+    const { data } = await api.get(`/items/${id}/comentarios`, { params });
+    return data;
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status && status !== 404) throw err;
+  }
+
+  const detalle = await getItemById(id);
+  if (detalle && (detalle.comments ?? detalle.comentarios)) {
+    return detalle.comments ?? detalle.comentarios;
+  }
+  return [];
+}
+
+/* ===== Export organizado (cumple ESLint: no anonymous default export) ===== */
 
 export const boeService = {
   getItems,
   getItemById,
   getResumen,
   getImpacto,
+  getComments,
 };
 
 export default boeService;
