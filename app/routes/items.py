@@ -1,5 +1,6 @@
 # app/routes/items.py
 from flask import Blueprint, jsonify, request, current_app, make_response
+from datetime import datetime
 
 from app.controllers.items_controller import (
     get_filtered_items,
@@ -15,126 +16,173 @@ from app.controllers.items_controller import (
 
 bp = Blueprint("items", __name__)
 
-# -------- helpers ----------
+# ===== Helpers =====
 
 def _safe_int(v, d, mi=1, ma=100):
-    """Convierte a int dentro de [mi, ma]; si falla retorna d."""
     try:
         n = int(v)
-        if n < mi:
-            n = mi
-        if n > ma:
-            n = ma
+        if n < mi: n = mi
+        if n > ma: n = ma
         return n
     except Exception:
         return d
 
+def _safe_bool(v, default=None):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:  return True
+    if s in {"0", "false", "f", "no", "n", "off"}: return False
+    return default
 
-# Claves que deben interpretarse SIEMPRE como listas
-MULTI_KEYS_PLURALS = {"departamentos", "secciones", "epigrafes", "tags"}
-# Mapa para normalizar claves equivalentes (aceptamos singular, plural y [] )
-NORMALIZE_KEYS = {
-    "departamento": "departamentos",
-    "departamentos": "departamentos",
-    "seccion": "secciones",
-    "secciones": "secciones",
-    "epigrafe": "epigrafes",
-    "epigrafes": "epigrafes",
-    "tag": "tags",
-    "tags": "tags",
-}
+def _safe_date(v, default=None):
+    if not v:
+        return default
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return default
 
-# Campos de ordenación permitidos (ajusta según tu dominio/controlador)
-ALLOWED_SORT_BY = {
-    # nombre_entrada -> nombre_normalizado_que_espera_el_controller
-    "created_at": "created_at",
-    "fecha": "fecha",
-    "relevancia": "relevancia",
-    "relevance": "relevancia",
-    "updated_at": "updated_at",
-}
-ALLOWED_SORT_DIR = {"asc", "desc"}
-
-
-def _dedupe_preserve_order(items):
+def _dedupe_preserve_order(seq):
     seen, out = set(), []
-    for x in items:
+    for x in seq:
         if x not in seen:
             seen.add(x)
             out.append(x)
     return out
 
+# claves multi-valor
+MULTI_KEYS_PLURALS = {"departamentos", "secciones", "epigrafes", "tags", "ids"}
+# normalización de nombres
+NORMALIZE_KEYS = {
+    "departamento": "departamentos", "departamentos": "departamentos",
+    "seccion": "secciones", "secciones": "secciones",
+    "epigrafe": "epigrafes", "epigrafes": "epigrafes",
+    "tag": "tags", "tags": "tags",
+    "id": "ids", "ids": "ids",
+    "q": "q", "query": "q", "search": "q",
+    "fecha_desde": "fecha_desde", "desde": "fecha_desde", "from": "fecha_desde", "date_from": "fecha_desde",
+    "fecha_hasta": "fecha_hasta", "hasta": "fecha_hasta", "to": "fecha_hasta", "date_to": "fecha_hasta",
+    "has_resumen": "has_resumen",
+    "has_impacto": "has_impacto",
+    "has_comments": "has_comments",
+    "favoritos": "favoritos",
+    "destacado": "destacado",
+    "page": "page", "limit": "limit",
+    "sort_by": "sort_by", "sort_dir": "sort_dir",
+}
+
+ALLOWED_SORT_BY = {
+    "created_at": "created_at",
+    "fecha": "fecha",
+    "updated_at": "updated_at",
+    "relevancia": "relevancia",
+    "relevance": "relevancia",
+    "titulo": "titulo",
+}
+ALLOWED_SORT_DIR = {"asc", "desc"}
+
 
 def _parse_query_args(args):
     """
-    Convierte query params en un dict listo para el controller:
+    Parser robusto:
+    - Recorre args en orden con items(multi=True): k=a&k=b preserva el orden.
     - Soporta k[]=a&k[]=b, k=a&k=b y k=a,b
-    - Para claves multi, devuelve SIEMPRE lista (aunque sea de 1)
-    - Normaliza nombres a plural coherente con el controller
-    - Sanea paginación y ordenación
+    - Para claves multi, agrega y deduplica preservando orden.
+    - Normaliza fechas, booleanos, paginación y ordenación.
     """
     data = {}
 
-    # 1) parseo base
-    for raw_key in args.keys():
-        values = args.getlist(raw_key)  # conserva repetidos
+    # 1) recolecta y agrega
+    for raw_key, raw_val in args.items(multi=True):
         key = raw_key[:-2] if raw_key.endswith("[]") else raw_key
         norm = NORMALIZE_KEYS.get(key, key)
 
-        # Unificamos tratamiento multi
         if norm in MULTI_KEYS_PLURALS:
-            # Unimos repetidos y permitimos coma-separado
-            joined = ",".join(values)
-            parts = [x.strip() for x in joined.split(",")]
-            parts = [x for x in parts if x != ""]
-            data[norm] = _dedupe_preserve_order(parts)
+            # split por comas para soportar k=a,b
+            parts = [p.strip() for p in str(raw_val).split(",") if p.strip() != ""]
+            prev = data.get(norm, [])
+            data[norm] = prev + parts
         else:
-            # último valor para claves escalares
-            data[norm] = values[-1] if values else None
+            data[norm] = raw_val
 
-    # 2) saneo de page/limit
-    data["page"] = _safe_int(args.get("page", data.get("page", 1)), 1, 1, 1_000_000)
-    data["limit"] = _safe_int(args.get("limit", data.get("limit", 12)), 12, 1, 100)
+    # 2) dedupe para multi
+    for m in list(MULTI_KEYS_PLURALS):
+        if m in data:
+            data[m] = _dedupe_preserve_order(data[m])
 
-    # 3) saneo de ordenación
-    raw_sort_by = (args.get("sort_by") or data.get("sort_by") or "created_at").strip().lower()
-    data["sort_by"] = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
+    # 3) q string
+    if "q" in data and data["q"] is not None:
+        data["q"] = (str(data["q"]).strip() or None)
 
-    raw_sort_dir = (args.get("sort_dir") or data.get("sort_dir") or "desc").strip().lower()
+    # 4) fechas
+    data["fecha_desde"] = _safe_date(data.get("fecha_desde"))
+    data["fecha_hasta"] = _safe_date(data.get("fecha_hasta"))
+
+    # 5) flags bool
+    for flag in ("has_resumen", "has_impacto", "has_comments", "favoritos", "destacado"):
+        if flag in data:
+            data[flag] = _safe_bool(data[flag])
+
+    # 6) paginación
+    data["page"]  = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
+    data["limit"] = _safe_int(data.get("limit", 12), 12, 1, 100)
+
+    # 7) ordenación
+    raw_sort_by  = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
+    raw_sort_dir = str(data.get("sort_dir", "desc") or "desc").strip().lower()
+    data["sort_by"]  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
     data["sort_dir"] = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
 
     return data
 
 
 def _json_with_cache(payload, status=200, max_age=3600):
-    """
-    Respuesta JSON con Cache-Control opcional (útil para catálogos).
-    """
     resp = make_response(jsonify(payload), status)
     if max_age and status == 200:
         resp.headers["Cache-Control"] = f"public, max-age={max_age}"
     return resp
 
-
-# -------- Rutas ----------
+# ===== Rutas =====
 
 # Listado
 @bp.route("", methods=["GET"])
 def api_items():
     try:
         parsed = _parse_query_args(request.args)
+
+        # Llamamos SIEMPRE al controller (para que los tests puedan monkeypatchear)
         result = get_filtered_items(parsed)
-        # Se asume que el controller ya devuelve page/limit/total/pages/items coherentes
+
+        # Si está activado el modo debug por cabecera + config, enriquecemos la respuesta
+        if request.headers.get("X-Debug-Filters") == "1" and current_app.config.get("DEBUG_FILTERS_ENABLED", False):
+            debug = {
+                "_debug": True,
+                "raw_query": request.query_string.decode("utf-8", errors="ignore"),
+                "parsed_filters": parsed,
+            }
+            # fusiona manteniendo campos del resultado
+            if isinstance(result, dict):
+                result = {**result, **debug}
+            else:
+                result = {"data": result, **debug}
+
         return jsonify(result), 200
+
     except Exception:
         current_app.logger.exception("items list failed")
-        # Respuesta consistente para no romper la UI
-        page = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
+        page  = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
         limit = _safe_int(request.args.get("limit", 12), 12, 1, 100)
-        sort_by = (request.args.get("sort_by") or "created_at").strip().lower()
-        sort_dir = (request.args.get("sort_dir") or "desc").strip().lower()
-        sort_by = ALLOWED_SORT_BY.get(sort_by, "created_at")
-        sort_dir = sort_dir if sort_dir in ALLOWED_SORT_DIR else "desc"
+        raw_sort_by  = (request.args.get("sort_by") or "created_at").strip().lower()
+        raw_sort_dir = (request.args.get("sort_dir") or "desc").strip().lower()
+        sort_by  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
+        sort_dir = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
 
         return jsonify({
             "items": [],
@@ -155,29 +203,24 @@ def api_item_by_id(identificador):
         return jsonify({"detail": "Not found"}), 404
     return jsonify(data), 200
 
-
 @bp.route("/<identificador>/resumen", methods=["GET"])
 def api_resumen(identificador):
     return jsonify(get_item_resumen(identificador)), 200
 
-
 @bp.route("/<identificador>/impacto", methods=["GET"])
 def api_impacto(identificador):
     return jsonify(get_item_impacto(identificador)), 200
-
 
 # Reacciones
 @bp.route("/<identificador>/like", methods=["POST"])
 def api_like(identificador):
     return jsonify(like_item(identificador)), 200
 
-
 @bp.route("/<identificador>/dislike", methods=["POST"])
 def api_dislike(identificador):
     return jsonify(dislike_item(identificador)), 200
 
-
-# Catálogos (con cache-control para mejorar rendimiento de la UI)
+# Catálogos (cache)
 @bp.route("/departamentos", methods=["GET"])
 def api_departamentos():
     try:
@@ -185,8 +228,7 @@ def api_departamentos():
         return _json_with_cache(data, 200, max_age=3600)
     except Exception:
         current_app.logger.exception("departamentos failed")
-        return _json_with_cache([], 200, max_age=60)  # fallback con cache corta
-
+        return _json_with_cache([], 200, max_age=60)
 
 @bp.route("/secciones", methods=["GET"])
 def api_secciones():
@@ -197,7 +239,6 @@ def api_secciones():
         current_app.logger.exception("secciones failed")
         return _json_with_cache([], 200, max_age=60)
 
-
 @bp.route("/epigrafes", methods=["GET"])
 def api_epigrafes():
     try:
@@ -206,3 +247,21 @@ def api_epigrafes():
     except Exception:
         current_app.logger.exception("epigrafes failed")
         return _json_with_cache([], 200, max_age=60)
+    
+# ===== Endpoint de eco/diagnóstico explícito (solo DEV) =====
+@bp.route("/_debug/echo", methods=["GET"])
+def api_items_echo():
+    """
+    /api/items/_debug/echo?departamentos=a&departamentos=b&secciones=I,II...
+    Devuelve cómo interpreta el backend los filtros.
+    Requiere DEBUG_FILTERS_ENABLED=True.
+    """
+    if not current_app.config.get("DEBUG_FILTERS_ENABLED", False):
+        return jsonify({"detail": "Debug endpoint disabled"}), 404
+
+    parsed = _parse_query_args(request.args)
+    return jsonify({
+        "_debug": True,
+        "raw_query": request.query_string.decode("utf-8", errors="ignore"),
+        "parsed_filters": parsed,
+    }), 200

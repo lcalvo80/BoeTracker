@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request, current_app
 from app.services.postgres import get_db
 from math import ceil
 from datetime import datetime
+import os
 
 bp = Blueprint("comments", __name__)
 
@@ -36,20 +37,44 @@ def _row_dict(row, cols):
         d["created_at"] = d["created_at"].isoformat()
     return d
 
-# ---------- bootstrap suave (no rompe prod) ----------
+# ---------- bootstrap suave y seguro ----------
 def _ensure_table():
-    # Crea tabla mínima si no existe; NO fuerza columnas que ya tienes
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS comments (
-                    id SERIAL PRIMARY KEY,
-                    item_identificador TEXT NOT NULL,
-                    content TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-        conn.commit()
+    """
+    Crea la tabla mínima si existe DATABASE_URL y no estamos en TESTING.
+    Nunca rompe en import-time (tests/entornos sin BD).
+    """
+    # Si no hay BD configurada, salimos
+    if not os.getenv("DATABASE_URL"):
+        return
+
+    # Si estamos en TESTING, no tocar BD
+    try:
+        if current_app and current_app.config.get("TESTING"):
+            return
+    except Exception:
+        # current_app puede no estar disponible en import-time
+        pass
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS comments (
+                        id SERIAL PRIMARY KEY,
+                        item_identificador TEXT NOT NULL,
+                        content TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                """)
+            conn.commit()
+    except Exception:
+        # Log y seguir; no queremos que falle el import
+        try:
+            current_app.logger.exception("comments bootstrap failed")
+        except Exception:
+            pass
+
+# Ejecuta el bootstrap solo si procede (según reglas anteriores)
 _ensure_table()
 
 # =========================
@@ -94,18 +119,17 @@ def list_item_comments(ident):
                 items = [_row_dict(r, cols) for r in rows]
 
         pages = ceil(total / limit) if limit else 0
-        # Añadimos 'limit' para facilitar la UI (opcional recomendado)
         return jsonify({
             "items": items,
             "page": page if total else 1,
             "pages": pages if total else 0,
             "total": total,
-            "limit": limit,
+            "limit": limit,  # para que la UI pueda mostrar "x de y"
         }), 200
 
     except Exception:
         current_app.logger.exception("list_item_comments failed")
-        # Respuesta estable para la UI
+        # Respuesta estable para la UI aunque falle la BD
         return jsonify({"items": [], "page": 1, "pages": 0, "total": 0, "limit": limit}), 200
 
 # =========================
@@ -127,7 +151,7 @@ def add_item_comment(ident):
             has_author     = _col_exists(conn, "comments", "author")
             has_user_name  = _col_exists(conn, "comments", "user_name")
 
-            # Asegura columna de texto
+            # Asegura columna de texto si hace falta
             if not has_content and not has_comentario:
                 with conn.cursor() as cur:
                     cur.execute('ALTER TABLE comments ADD COLUMN content TEXT;')
@@ -135,7 +159,6 @@ def add_item_comment(ident):
                 has_content = True
 
             text_col   = "content" if has_content else "comentario"
-            # En tu esquema actual puede existir user_name (o author)
             author_col = "author" if has_author else ("user_name" if has_user_name else None)
 
             cols = ["item_identificador", text_col]
