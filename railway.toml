@@ -1,0 +1,4 @@
+[phases.install]
+cmds = [
+  'npm ci --omit=optional'
+]

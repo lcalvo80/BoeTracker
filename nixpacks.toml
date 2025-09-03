@@ -1,0 +1,29 @@
+# Fuerza Node 22 (coincide con el log) y define fases sin repetir npm ci
+[phases.setup]
+# Puedes omitir esto si ya lo pone Railway; lo dejo explícito.
+nixPkgs = ['nodejs_22']
+
+[variables]
+# Evita prompts y acelera la build
+CI = 'true'
+# Mueve la caché de npm fuera de node_modules para que no toque /app/node_modules/.cache
+NPM_CONFIG_CACHE = '/tmp/.npm'
+
+[phases.install]
+# Una sola instalación
+cmds = [
+  'npm ci'
+]
+# Cachea el directorio de npm (seguro), no node_modules/.cache
+cacheDirectories = ['/root/.npm', '/tmp/.npm']
+
+[phases.build]
+# Solo compilar; NO repetir npm ci
+cmds = [
+  'npm run build'
+]
+# Desactiva cualquier cacheo bajo node_modules/.cache
+cacheDirectories = []
+
+[start]
+cmd = 'npm run start'
