@@ -24,6 +24,36 @@ function mapFilters(params = {}) {
   };
 }
 
+/** Normaliza las respuestas de filtros a un contrato estable en el frontend. */
+function normalizeFilters(raw = {}) {
+  // Acepta varios posibles nombres de campos y los estandariza
+  const secciones =
+    raw.secciones ??
+    raw.sections ??
+    raw.seccion ??
+    raw.section ??
+    [];
+  const departamentos =
+    raw.departamentos ??
+    raw.agencias ??
+    raw.departments ??
+    raw.agencies ??
+    [];
+  const epigrafes =
+    raw.epigrafes ??
+    raw.epigrafe ??
+    raw.topics ??
+    raw.tags ??
+    [];
+  const years =
+    raw.years ??
+    raw.anios ??
+    raw.años ??
+    [];
+
+  return { secciones, departamentos, epigrafes, years };
+}
+
 /* =================== Lectura =================== */
 
 /** Lista de items con filtros (acepta `config`, ej. { signal }). */
@@ -116,6 +146,45 @@ export async function getComments(id, params = {}, config = {}) {
   return [];
 }
 
+/** ================== Filtros (¡nuevo!) ================== */
+/**
+ * Obtiene opciones de filtros para el buscador/listados.
+ * Soporta varios endpoints del backend y normaliza la respuesta.
+ */
+export async function getFilterOptions(config = {}) {
+  // 1) /filters
+  try {
+    const { data } = await api.get("/filters", { ...config });
+    return normalizeFilters(data);
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status && status !== 404) throw err;
+  }
+  // 2) /filtros (alias en ES)
+  try {
+    const { data } = await api.get("/filtros", { ...config });
+    return normalizeFilters(data);
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status && status !== 404) throw err;
+  }
+  // 3) /meta/filters
+  try {
+    const { data } = await api.get("/meta/filters", { ...config });
+    return normalizeFilters(data);
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status && status !== 404) throw err;
+  }
+  // 4) Valor por defecto para que el UI pueda renderizar
+  return normalizeFilters({
+    secciones: [],
+    departamentos: [],
+    epigrafes: [],
+    years: [],
+  });
+}
+
 /* =================== Escritura/acciones =================== */
 
 /** Publica un comentario en un item. */
@@ -201,6 +270,7 @@ export const boeService = {
   getResumen,
   getImpacto,
   getComments,
+  getFilterOptions, // <-- añadido
   postComment,
   likeItem,
   dislikeItem,
