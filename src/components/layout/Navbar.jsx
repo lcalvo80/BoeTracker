@@ -4,18 +4,24 @@ import { FaBars, FaTimes } from "react-icons/fa";
 import {
   SignedIn,
   SignedOut,
-  SignInButton,
-  SignUpButton,
   UserButton,
+  useClerk
 } from "@clerk/clerk-react";
 
 const Navbar = () => {
   const [menuOpen, setMenuOpen] = useState(false);
   const { pathname } = useLocation();
+  const { openSignIn, openSignUp } = useClerk();
 
   const closeMenu = () => setMenuOpen(false);
   const isActive = (to) =>
     pathname === to ? "text-blue-700 font-semibold" : "text-gray-700";
+
+  const handleSignUp = () =>
+    openSignUp({ mode: "modal", afterSignUpUrl: "/pricing" });
+
+  const handleSignIn = () =>
+    openSignIn({ mode: "modal", afterSignInUrl: "/account" });
 
   return (
     <nav className="bg-white shadow-md sticky top-0 z-50">
@@ -42,18 +48,21 @@ const Navbar = () => {
 
           {/* Área de sesión */}
           <SignedOut>
-            {/* IMPORTANTE: afterSignUpUrl EN SignUpButton (no en el <button>) */}
-            <SignUpButton mode="modal" afterSignUpUrl="/pricing">
-              <button type="button" className="px-3 py-2 text-sm font-medium rounded-md bg-gray-100 text-gray-900 hover:bg-gray-200">
-                Crear cuenta
-              </button>
-            </SignUpButton>
+            <button
+              type="button"
+              onClick={handleSignUp}
+              className="px-3 py-2 text-sm font-medium rounded-md bg-gray-100 text-gray-900 hover:bg-gray-200"
+            >
+              Crear cuenta
+            </button>
 
-            <SignInButton mode="modal" afterSignInUrl="/account">
-              <button type="button" className="px-3 py-2 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700">
-                Iniciar sesión
-              </button>
-            </SignInButton>
+            <button
+              type="button"
+              onClick={handleSignIn}
+              className="px-3 py-2 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700"
+            >
+              Iniciar sesión
+            </button>
           </SignedOut>
 
           <SignedIn>
@@ -99,28 +108,23 @@ const Navbar = () => {
           {/* Área de sesión en mobile */}
           <div className="pt-2 border-t">
             <SignedOut>
-              {/* Igual que arriba: prop en SignUpButton, no en el botón */}
-              <SignUpButton mode="modal" afterSignUpUrl="/pricing">
-                <button
-                  type="button"
-                  className="w-full px-3 py-2 text-sm font-medium rounded-md bg-gray-100 text-gray-900 hover:bg-gray-200"
-                  onClick={closeMenu}
-                >
-                  Crear cuenta
-                </button>
-              </SignUpButton>
+              <button
+                type="button"
+                onClick={() => { handleSignUp(); closeMenu(); }}
+                className="w-full px-3 py-2 text-sm font-medium rounded-md bg-gray-100 text-gray-900 hover:bg-gray-200"
+              >
+                Crear cuenta
+              </button>
 
               <div className="h-2" />
 
-              <SignInButton mode="modal" afterSignInUrl="/account">
-                <button
-                  type="button"
-                  className="w-full px-3 py-2 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700"
-                  onClick={closeMenu}
-                >
-                  Iniciar sesión
-                </button>
-              </SignInButton>
+              <button
+                type="button"
+                onClick={() => { handleSignIn(); closeMenu(); }}
+                className="w-full px-3 py-2 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700"
+              >
+                Iniciar sesión
+              </button>
             </SignedOut>
 
             <SignedIn>
