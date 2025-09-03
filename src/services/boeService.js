@@ -50,7 +50,7 @@ export async function getItemById(id) {
 
 /**
  * Resumen de un item por ID.
- * Intenta primero /items/:id/resumen; si no existe, usa /items/:id y
+ * Intenta /items/:id/resumen; si no existe, usa /items/:id y
  * devuelve data.resumen || data.summary si están presentes.
  * @param {string|number} id
  * @returns {Promise<any>}
@@ -60,33 +60,55 @@ export async function getResumen(id) {
     throw new Error("getResumen requiere un id válido.");
   }
 
-  // 1) Endpoint específico si existe en el backend
   try {
     const { data } = await api.get(`/items/${id}/resumen`);
     return data;
   } catch (err) {
-    // Si no es 404/endpoint inexistente, relanza
     const status = err?.response?.status;
-    if (status && status !== 404) {
-      throw err;
-    }
+    if (status && status !== 404) throw err;
   }
 
-  // 2) Fallback: usar el detalle y extraer resumen
   const detalle = await getItemById(id);
   if (detalle && (detalle.resumen ?? detalle.summary)) {
     return detalle.resumen ?? detalle.summary;
   }
-
-  // 3) Si no hay resumen, devuelve algo consistente
   return { resumen: null };
 }
 
-// (opcional) export por defecto para ambos estilos de import
+/**
+ * Impacto de un item por ID.
+ * Intenta /items/:id/impacto; si no existe, usa /items/:id y
+ * devuelve data.impacto || data.impact si están presentes.
+ * @param {string|number} id
+ * @returns {Promise<any>}
+ */
+export async function getImpacto(id) {
+  if (id === undefined || id === null || `${id}`.trim() === "") {
+    throw new Error("getImpacto requiere un id válido.");
+  }
+
+  try {
+    const { data } = await api.get(`/items/${id}/impacto`);
+    return data;
+  } catch (err) {
+    const status = err?.response?.status;
+    if (status && status !== 404) throw err;
+  }
+
+  const detalle = await getItemById(id);
+  if (detalle && (detalle.impacto ?? detalle.impact)) {
+    return detalle.impacto ?? detalle.impact;
+  }
+  return { impacto: null };
+}
+
+/* ===== Export organizado para satisfacer ESLint (no anonymous default) ===== */
+
 export const boeService = {
   getItems,
   getItemById,
   getResumen,
+  getImpacto,
 };
 
 export default boeService;
