@@ -59,21 +59,32 @@ def _dedupe_preserve_order(seq):
 
 # claves multi-valor
 MULTI_KEYS_PLURALS = {"departamentos", "secciones", "epigrafes", "tags", "ids"}
+
 # normalización de nombres
 NORMALIZE_KEYS = {
+    # multi
     "departamento": "departamentos", "departamentos": "departamentos",
     "seccion": "secciones", "secciones": "secciones",
     "epigrafe": "epigrafes", "epigrafes": "epigrafes",
     "tag": "tags", "tags": "tags",
     "id": "ids", "ids": "ids",
-    "q": "q", "query": "q", "search": "q",
+    # FE alternativo (mapeos del front/service)
+    "seccion_codigo": "secciones",
+    "departamento_codigo": "departamentos",
+    # texto
+    "q": "q", "query": "q", "search": "q", "q_adv": "q",
+    # fechas
+    "fecha": "fecha",
     "fecha_desde": "fecha_desde", "desde": "fecha_desde", "from": "fecha_desde", "date_from": "fecha_desde",
     "fecha_hasta": "fecha_hasta", "hasta": "fecha_hasta", "to": "fecha_hasta", "date_to": "fecha_hasta",
+    "useRange": "useRange",
+    # flags
     "has_resumen": "has_resumen",
     "has_impacto": "has_impacto",
     "has_comments": "has_comments",
     "favoritos": "favoritos",
     "destacado": "destacado",
+    # paginación/orden
     "page": "page", "limit": "limit",
     "sort_by": "sort_by", "sort_dir": "sort_dir",
 }
@@ -96,6 +107,7 @@ def _parse_query_args(args):
     - Soporta k[]=a&k[]=b, k=a&k=b y k=a,b
     - Para claves multi, agrega y deduplica preservando orden.
     - Normaliza fechas, booleanos, paginación y ordenación.
+    - Acepta 'fecha' (exacta) y 'useRange' para convertir a [fecha_desde, fecha_hasta].
     """
     data = {}
 
@@ -121,14 +133,36 @@ def _parse_query_args(args):
     if "q" in data and data["q"] is not None:
         data["q"] = (str(data["q"]).strip() or None)
 
-    # 4) fechas
-    data["fecha_desde"] = _safe_date(data.get("fecha_desde"))
-    data["fecha_hasta"] = _safe_date(data.get("fecha_hasta"))
-
-    # 5) flags bool
-    for flag in ("has_resumen", "has_impacto", "has_comments", "favoritos", "destacado"):
+    # 4) flags bool
+    #    incluye useRange (cómo interpretar 'fecha' exacta)
+    for flag in ("has_resumen", "has_impacto", "has_comments", "favoritos", "destacado", "useRange"):
         if flag in data:
             data[flag] = _safe_bool(data[flag])
+
+    # 5) fechas (ISO)
+    #    normaliza fecha exacta y rango (fecha_desde/hasta)
+    fecha_exacta = _safe_date(data.get("fecha"))
+    fecha_desde = _safe_date(data.get("fecha_desde"))
+    fecha_hasta = _safe_date(data.get("fecha_hasta"))
+
+    use_range = data.get("useRange", None)
+    if use_range is False and fecha_exacta:
+        # modo fecha exacta: fuerza desde=hasta=fecha y limpia claves
+        data["fecha_desde"] = fecha_exacta
+        data["fecha_hasta"] = fecha_exacta
+        data.pop("fecha", None)
+    else:
+        # si ya vinieron desde/hasta, usamos las normalizadas
+        if fecha_desde:
+            data["fecha_desde"] = fecha_desde
+        else:
+            data.pop("fecha_desde", None)
+        if fecha_hasta:
+            data["fecha_hasta"] = fecha_hasta
+        else:
+            data.pop("fecha_hasta", None)
+        # si llega 'fecha' pero useRange True/None, ignórala (se usará el rango)
+        data.pop("fecha", None)
 
     # 6) paginación
     data["page"]  = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
@@ -160,14 +194,22 @@ def api_items():
         # Llamamos SIEMPRE al controller (para que los tests puedan monkeypatchear)
         result = get_filtered_items(parsed)
 
-        # Si está activado el modo debug por cabecera + config, enriquecemos la respuesta
+        # Asegura 'pages' si el controller no lo aporta
+        if isinstance(result, dict):
+            total = result.get("total", 0) or 0
+            limit = result.get("limit", parsed.get("limit", 12)) or 12
+            pages = result.get("pages")
+            if pages is None and limit:
+                pages = (total + limit - 1) // limit
+                result["pages"] = pages
+
+        # Debug opcional (con cabecera y flag en config)
         if request.headers.get("X-Debug-Filters") == "1" and current_app.config.get("DEBUG_FILTERS_ENABLED", False):
             debug = {
                 "_debug": True,
                 "raw_query": request.query_string.decode("utf-8", errors="ignore"),
                 "parsed_filters": parsed,
             }
-            # fusiona manteniendo campos del resultado
             if isinstance(result, dict):
                 result = {**result, **debug}
             else:
@@ -247,7 +289,7 @@ def api_epigrafes():
     except Exception:
         current_app.logger.exception("epigrafes failed")
         return _json_with_cache([], 200, max_age=60)
-    
+
 # ===== Endpoint de eco/diagnóstico explícito (solo DEV) =====
 @bp.route("/_debug/echo", methods=["GET"])
 def api_items_echo():
