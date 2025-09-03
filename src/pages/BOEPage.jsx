@@ -1,3 +1,4 @@
+// src/pages/BOEPage.jsx
 import React, { useEffect, useMemo, useState } from "react";
 import Calendar from "react-calendar";
 import "react-calendar/dist/Calendar.css";
@@ -48,6 +49,7 @@ const BOEPage = () => {
   const [compactMode, setCompactMode] = useState(false);
   const [totalItems, setTotalItems] = useState(0);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
   const [filters, setFilters] = useState({
     q_adv: "",
@@ -101,11 +103,12 @@ const BOEPage = () => {
     if (identificador?.trim()) params.identificador = identificador.trim();
     if (control?.trim()) params.control = control.trim();
 
+    // 👇 nombres que espera el backend
     if (Array.isArray(secciones) && secciones.length > 0) {
-      params.seccion_codigo = secciones.join(",");
+      params.seccion = secciones.join(",");
     }
     if (Array.isArray(departamentos) && departamentos.length > 0) {
-      params.departamento_codigo = departamentos.join(",");
+      params.departamento = departamentos.join(",");
     }
     if (Array.isArray(epigrafes) && epigrafes.length > 0) {
       params.epigrafe = epigrafes.join(",");
@@ -132,7 +135,9 @@ const BOEPage = () => {
     const fetchItems = async () => {
       try {
         setError("");
-        const { data } = await getItems(queryParams);
+        setLoading(true);
+        // getItems devuelve `data` directamente
+        const data = await getItems(queryParams);
         setItems(Array.isArray(data?.items) ? data.items : []);
         setTotalItems(Number.isFinite(data?.total) ? data.total : 0);
       } catch (err) {
@@ -141,10 +146,12 @@ const BOEPage = () => {
         setTotalItems(0);
         setError(
           err?.response?.data?.error ||
-            err?.response?.data?.detail ||
-            err?.message ||
-            "Error al cargar publicaciones."
+          err?.response?.data?.detail ||
+          err?.message ||
+          "Error al cargar publicaciones."
         );
+      } finally {
+        setLoading(false);
       }
     };
     fetchItems();
@@ -434,6 +441,8 @@ const BOEPage = () => {
             <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
               {error}
             </div>
+          ) : loading ? (
+            <div className="p-6 text-gray-600">Cargando...</div>
           ) : items?.length > 0 ? (
             <div className={`grid gap-4 ${compactMode ? "grid-cols-1" : "sm:grid-cols-2"}`}>
               {items.map((item) => (
