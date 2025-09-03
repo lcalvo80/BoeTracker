@@ -14,120 +14,98 @@ from app.services.lookup import (
     list_secciones_lookup,
 )
 
-# ======================== helpers generales ========================
-
-def _col_exists(conn, table: str, col: str) -> bool:
-    """Comprueba si existe la columna `col` en `table` (esquema public)."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema='public'
-              AND table_name=%s
-              AND column_name=%s
-            LIMIT 1
-            """,
-            (table, col),
-        )
-        return cur.fetchone() is not None
-
-def _rows(cur) -> List[Dict[str, Any]]:
-    cols = [c.name for c in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-def _as_list(v) -> List[str]:
-    """Normaliza una entrada a lista de strings (acepta list o str coma-separado)."""
-    if v is None:
-        return []
-    if isinstance(v, (list, tuple)):
-        return [str(x).strip() for x in v if str(x).strip() != ""]
-    s = str(v).strip()
-    if not s:
-        return []
-    return [p.strip() for p in s.split(",") if p.strip() != ""]
+# ----------------------- helpers -----------------------
+def _norm(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    s = s.strip()
+    if not s or s.lower() in {"todos", "all", "null", "none"}:
+        return None
+    return s
 
 def _to_date(s: Optional[str]):
-    """Parsea fecha en formatos comunes → date() o None."""
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
             pass
     return None
 
-def _pick_first_existing_col(conn, table: str, candidates: Sequence[str]) -> Optional[str]:
-    """Devuelve la primera columna existente de `candidates` en `table`, o None."""
-    for c in candidates:
-        if _col_exists(conn, table, c):
-            return c
-    return None
+def _rows(cur) -> List[Dict[str, Any]]:
+    cols = [c.name for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-# ======================== listado con filtros ========================
+def _split_csv(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    return [p for p in parts if p]
 
-def get_filtered_items(p: Dict[str, Any]) -> Dict[str, Any]:
+def _col_exists(conn, table: str, col: str) -> bool:
+    # Nota: llamado pocas veces por request; si quieres, cachea en g/LocalProxy.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s AND column_name=%s
+            LIMIT 1
+            """,
+            (table, col),
+        )
+        return cur.fetchone() is not None
+
+# ----------------------- listado con filtros -----------------------
+def get_filtered_items(params: Dict[str, str]) -> Dict[str, Any]:
     """
-    Filtros esperados (tras saneo en la ruta):
-      - p["departamentos"] : list[str]
-      - p["secciones"]     : list[str]
-      - p["epigrafes"]     : list[str]
-      - p["tags"]          : list[str]   (opcional, si existe columna/relación)
-      - p["ids"]           : list[str]
-      - p["q"]             : str|None
-      - p["fecha_desde"], p["fecha_hasta"] : 'YYYY-MM-DD'|None
-      - p["page"], p["limit"] : int
-      - p["sort_by"] in {'created_at','fecha','updated_at','relevancia','titulo'}
-      - p["sort_dir"] in {'asc','desc'}
+    Filtros soportados:
+      - page, limit
+      - sort_by in {created_at, titulo, id, likes, dislikes}, sort_dir in {asc, desc}
+      - fecha, fecha_desde, fecha_hasta (sobre created_at o created_at_date si existe)
+      - departamento_codigo: coma separada (IN)
+      - seccion_codigo: coma separada (IN)
+      - epigrafe: coma separada (IN)
+      - q_adv: ILIKE sobre titulo/resumen/contenido(/informe_impacto::text si existe)
+      - identificador: ILIKE
+      - control: ILIKE (si existe)
     """
-    page: int = int(p.get("page", 1))
-    limit: int = int(p.get("limit", 12))
-    sort_by: str = str(p.get("sort_by", "created_at"))
-    sort_dir: str = "ASC" if str(p.get("sort_dir", "desc")).lower() == "asc" else "DESC"
+    page = max(int(params.get("page", 1)), 1)
+    limit = min(max(int(params.get("limit", 12)), 1), 100)
 
-    q: Optional[str] = p.get("q") or None
-    fecha_desde = _to_date(p.get("fecha_desde"))
-    fecha_hasta = _to_date(p.get("fecha_hasta"))
+    sort_by = (params.get("sort_by", "created_at") or "").lower()
+    sort_dir = (params.get("sort_dir", "desc") or "").lower()
+    if sort_by not in {"created_at", "titulo", "id", "likes", "dislikes"}:
+        sort_by = "created_at"
+    if sort_dir not in {"asc", "desc"}:
+        sort_dir = "desc"
 
-    departamentos = _as_list(p.get("departamentos"))
-    secciones     = _as_list(p.get("secciones"))
-    epigrafes     = _as_list(p.get("epigrafes"))
-    tags          = _as_list(p.get("tags"))
-    ids           = _as_list(p.get("ids"))
+    fecha_eq = _to_date(_norm(params.get("fecha")))
+    fecha_desde = _to_date(_norm(params.get("fecha_desde")))
+    fecha_hasta = _to_date(_norm(params.get("fecha_hasta")))
+
+    dep_list = _split_csv(_norm(params.get("departamento_codigo") or params.get("departamento")))
+    sec_list = _split_csv(_norm(params.get("seccion_codigo") or params.get("seccion")))
+    epi_list = _split_csv(_norm(params.get("epigrafe")))
+
+    q_adv = _norm(params.get("q_adv") or params.get("q"))
+    identificador = _norm(params.get("identificador"))
+    control_val = _norm(params.get("control"))
 
     with get_db() as conn:
-        # -------- columnas disponibles / mapping flexible --------
-        # fecha de negocio: si existe 'fecha' úsala; si no cae a DATE(created_at / created_at_date)
-        has_fecha = _col_exists(conn, "items", "fecha")
-        has_created_at      = _col_exists(conn, "items", "created_at")
+        # columnas disponibles
         has_created_at_date = _col_exists(conn, "items", "created_at_date")
-
-        date_expr = (
-            sql.SQL("i.fecha")
-            if has_fecha
-            else (sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)"))
-        )
-
-        # nombres de columnas de catálogo (acepta *_codigo o sin sufijo)
-        dep_col = _pick_first_existing_col(conn, "items", ("departamento_codigo", "departamento"))
-        sec_col = _pick_first_existing_col(conn, "items", ("seccion_codigo", "seccion"))
-        epi_col = _pick_first_existing_col(conn, "items", ("epigrafe",))
-
-        # otras columnas opcionales
-        has_titulo    = _col_exists(conn, "items", "titulo")
-        has_resumen   = _col_exists(conn, "items", "resumen")
+        has_created_at = _col_exists(conn, "items", "created_at")
+        has_control = _col_exists(conn, "items", "control")
         has_contenido = _col_exists(conn, "items", "contenido")
-        has_informe   = _col_exists(conn, "items", "informe_impacto")
-        has_impacto   = _col_exists(conn, "items", "impacto")
-        has_relev     = _col_exists(conn, "items", "relevancia")
-        has_upd       = _col_exists(conn, "items", "updated_at")
-        has_likes     = _col_exists(conn, "items", "likes")
-        has_dislikes  = _col_exists(conn, "items", "dislikes")
-        has_ident     = _col_exists(conn, "items", "identificador")
-        has_tags      = _col_exists(conn, "items", "tags")  # por si es text[] o jsonb
+        has_resumen = _col_exists(conn, "items", "resumen")
+        has_titulo = _col_exists(conn, "items", "titulo")
+        has_likes = _col_exists(conn, "items", "likes")
+        has_dislikes = _col_exists(conn, "items", "dislikes")
+        has_informe_imp = _col_exists(conn, "items", "informe_impacto")
+        has_impacto = _col_exists(conn, "items", "impacto")
 
-        # tablas de lookup (nombres flexibles)
+        # catálogos disponibles
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
             if _lookup_table_exists(conn, t):
@@ -140,172 +118,271 @@ def get_filtered_items(p: Dict[str, Any]) -> Dict[str, Any]:
                 sec_table = t
                 break
 
-        # -------- WHERE dinámico --------
+        # WHERE dinámico
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        # fecha_desde / fecha_hasta
-        if fecha_desde:
-            where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr))
-            args.append(fecha_desde)
-        if fecha_hasta:
-            where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr))
-            args.append(fecha_hasta)
+        # fechas (usa created_at si existe, si no created_at_date)
+        date_expr = sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)")
 
-        # ids
-        if ids and has_ident:
-            where_sql_parts.append(sql.SQL("i.identificador = ANY(%s)"))
-            args.append(ids)
+        if fecha_eq:
+            where_sql_parts.append(sql.SQL("{} = %s").format(date_expr))
+            args.append(fecha_eq)
+        else:
+            if fecha_desde:
+                where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr))
+                args.append(fecha_desde)
+            if fecha_hasta:
+                where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr))
+                args.append(fecha_hasta)
 
-        # departamentos
-        if departamentos and dep_col:
-            where_sql_parts.append(sql.SQL(f"i.{dep_col} = ANY(%s)"))
-            args.append(departamentos)
+        # IN filters
+        def _in_clause(col_name: str, values: Sequence[str]) -> Optional[Tuple[sql.SQL, List[str]]]:
+            if not values:
+                return None
+            placeholders = sql.SQL(", ").join(sql.Placeholder() * len(values))
+            return sql.SQL("{} IN ({})").format(sql.SQL(col_name), placeholders), list(values)
 
-        # secciones
-        if secciones and sec_col:
-            where_sql_parts.append(sql.SQL(f"i.{sec_col} = ANY(%s)"))
-            args.append(secciones)
+        in_dep = _in_clause("i.departamento_codigo", dep_list)
+        if in_dep:
+            where_sql_parts.append(in_dep[0])
+            args.extend(in_dep[1])
 
-        # epigrafes
-        if epigrafes and epi_col:
-            where_sql_parts.append(sql.SQL(f"i.{epi_col} = ANY(%s)"))
-            args.append(epigrafes)
+        in_sec = _in_clause("i.seccion_codigo", sec_list)
+        if in_sec:
+            where_sql_parts.append(in_sec[0])
+            args.extend(in_sec[1])
 
-        # tags (si existe columna 'tags'). Soporta text[] o jsonb/array de texto
-        if tags and has_tags:
-            # Caso 1: text[] → tags && ARRAY[...]
-            # Caso 2: jsonb → tags ?| ARRAY[...]
-            # Para simplicidad: usar ANY por cada tag con OR (más compatible).
-            tag_clauses = [sql.SQL("EXISTS (SELECT 1 WHERE %s = ANY(i.tags))")]  # text[]
-            args.extend(tags)
-            # Si fuese jsonb y quieres compatibilidad adicional, podrías OR con: (i.tags ? %s)
-            where_sql_parts.append(
-                sql.SQL("(") +
-                sql.SQL(" OR ").join(tag_clauses * len(tags)) +
-                sql.SQL(")")
-            )
+        in_epi = _in_clause("i.epigrafe", epi_list)
+        if in_epi:
+            where_sql_parts.append(in_epi[0])
+            args.extend(in_epi[1])
 
-        # q: ILIKE sobre columnas disponibles
-        if q:
-            like_val = f"%{q}%"
+        # texto: q_adv → ILIKE en columnas disponibles
+        if q_adv:
+            like_val = f"%{q_adv}%"
             text_clauses = []
             if has_titulo:
-                text_clauses.append(sql.SQL("i.titulo ILIKE %s")); args.append(like_val)
+                text_clauses.append(sql.SQL("i.titulo ILIKE %s"))
+                args.append(like_val)
             if has_resumen:
-                text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
+                text_clauses.append(sql.SQL("i.resumen ILIKE %s"))
+                args.append(like_val)
             if has_contenido:
-                text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
-            # informe_impacto como texto si cadena es ≥3 chars (para no matar índices en consultas muy cortas)
-            if has_informe and len(q) >= 3:
-                text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s")); args.append(like_val)
-
+                text_clauses.append(sql.SQL("i.contenido ILIKE %s"))
+                args.append(like_val)
+            # incluir informe_impacto::text sólo si existe y la query tiene al menos 3 chars
+            if has_informe_imp and len(q_adv) >= 3:
+                text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s"))
+                args.append(like_val)
             if text_clauses:
-                where_sql_parts.append(
-                    sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")")
-                )
+                where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
+
+        if identificador:
+            where_sql_parts.append(sql.SQL("i.identificador ILIKE %s"))
+            args.append(f"%{identificador}%")
+
+        if control_val and has_control:
+            where_sql_parts.append(sql.SQL("i.control ILIKE %s"))
+            args.append(f"%{control_val}%")
 
         where_sql = sql.SQL("WHERE ") + sql.SQL(" AND ").join(where_sql_parts) if where_sql_parts else sql.SQL("")
 
-        # -------- SELECT + LEFT JOINs a lookups --------
+        # SELECT + JOINs
         select_cols = [
-            sql.SQL("i.id") if _col_exists(conn, "items", "id") else sql.SQL("NULL AS id"),
-            sql.SQL("i.identificador") if has_ident else sql.SQL("NULL AS identificador"),
+            sql.SQL("i.id"),
+            sql.SQL("i.identificador"),
             sql.SQL("i.titulo") if has_titulo else sql.SQL("NULL AS titulo"),
             sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
-            # impacto normalizado
-            sql.SQL("i.informe_impacto AS impacto") if has_informe
-                else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
-            # catálogos base
-            sql.SQL(f"i.{dep_col}") if dep_col else sql.SQL("NULL AS departamento_codigo"),
-            sql.SQL(f"i.{sec_col}") if sec_col else sql.SQL("NULL AS seccion_codigo"),
-            sql.SQL(f"i.{epi_col}") if epi_col else sql.SQL("NULL AS epigrafe"),
-            # fechas
-            sql.SQL("i.fecha") if has_fecha else (
-                sql.SQL("i.created_at") if has_created_at else (
-                    sql.SQL("i.created_at_date AS created_at") if has_created_at_date else sql.SQL("NULL AS created_at")
-                )
-            ),
+            # impacto normalizado: prioriza informe_impacto
+            sql.SQL("i.informe_impacto AS impacto")
+            if has_informe_imp
+            else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
+            sql.SQL("i.departamento_codigo"),
+            sql.SQL("i.seccion_codigo"),
+            sql.SQL("i.epigrafe"),
+            sql.SQL("i.created_at")
+            if has_created_at
+            else (sql.SQL("i.created_at_date AS created_at") if has_created_at_date else sql.SQL("NULL AS created_at")),
             sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
             sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
+            sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
         ]
-
         joins: List[sql.SQL] = []
-        if dep_table and dep_col:
+
+        if dep_table:
             select_cols.append(sql.SQL("d.nombre AS departamento_nombre"))
-            joins.append(
-                sql.SQL("LEFT JOIN {} d ON d.codigo = i.{}").format(
-                    sql.Identifier(dep_table), sql.Identifier(dep_col)
-                )
-            )
+            joins.append(sql.SQL("LEFT JOIN {} d ON d.codigo = i.departamento_codigo").format(sql.Identifier(dep_table)))
         else:
             select_cols.append(sql.SQL("NULL AS departamento_nombre"))
 
-        if sec_table and sec_col:
+        if sec_table:
             select_cols.append(sql.SQL("s.nombre AS seccion_nombre"))
-            joins.append(
-                sql.SQL("LEFT JOIN {} s ON s.codigo = i.{}").format(
-                    sql.Identifier(sec_table), sql.Identifier(sec_col)
-                )
-            )
+            joins.append(sql.SQL("LEFT JOIN {} s ON s.codigo = i.seccion_codigo").format(sql.Identifier(sec_table)))
         else:
             select_cols.append(sql.SQL("NULL AS seccion_nombre"))
 
-        # -------- ORDER BY (whitelist + fallback por columnas disponibles) --------
-        # mapping de sort_by a expresión SQL
-        if sort_by == "fecha":
-            sort_expr = sql.SQL("i.fecha") if has_fecha else date_expr
-        elif sort_by == "updated_at" and has_upd:
-            sort_expr = sql.SQL("i.updated_at")
-        elif sort_by in ("relevancia", "relevance") and has_relev:
-            sort_expr = sql.SQL("i.relevancia")
-        elif sort_by == "titulo" and has_titulo:
-            sort_expr = sql.SQL("i.titulo")
-        else:
-            # created_at o fallback a created_at_date/fecha
-            sort_expr = sql.SQL("i.created_at") if has_created_at else (
-                sql.SQL("i.created_at_date") if has_created_at_date else date_expr
-            )
+        # ORDER BY whitelisted
+        sort_by_sql = sql.SQL("i.created_at") if sort_by == "created_at" else sql.SQL("i." + sort_by)
+        sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
 
-        order_sql = sql.SQL("ORDER BY {} {}").format(sort_expr, sql.SQL(sort_dir))
-
-        # -------- consulta principal y conteo --------
-        offset = (page - 1) * limit
-        base_select_sql = sql.SQL("""
+        base_select_sql = sql.SQL(
+            """
             SELECT {cols}
             FROM items i
             {joins}
             {where}
-            {order}
+            ORDER BY {sort_by} {sort_dir}
             LIMIT %s OFFSET %s
-        """).format(
+            """
+        ).format(
             cols=sql.SQL(", ").join(select_cols),
             joins=sql.SQL(" ").join(joins),
             where=where_sql,
-            order=order_sql,
+            sort_by=sort_by_sql,
+            sort_dir=sort_dir_sql,
         )
 
         count_sql = sql.SQL("SELECT COUNT(*) FROM items i ") + where_sql
 
+        offset = (page - 1) * limit
+
         with conn.cursor() as cur:
             cur.execute(count_sql, args)
-            total = cur.fetchone()[0] or 0
-
+            total = cur.fetchone()[0]
             cur.execute(base_select_sql, args + [limit, offset])
             data = _rows(cur)
 
-    pages = (total + limit - 1) // limit if limit else 0
     return {
         "items": data,
         "page": page,
         "limit": limit,
         "total": total,
-        "pages": pages,
+        "pages": (total + limit - 1) // limit,
         "sort_by": sort_by,
-        "sort_dir": "asc" if sort_dir == "ASC" else "desc",
+        "sort_dir": sort_dir,
     }
 
-# ======================== detalle & derivados ========================
-
+# ----------------------- detalle & derivados -----------------------
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
-    with get_db() as conn
+    with get_db() as conn, conn.cursor() as cur:
+        # columnas opcionales; para alias usa "informe_impacto AS impacto" si la base lo permite
+        base_cols = [
+            "id",
+            "identificador",
+            "titulo",
+            "contenido",
+            "resumen",
+            "departamento_codigo",
+            "seccion_codigo",
+            "epigrafe",
+            "created_at",
+            "likes",
+            "dislikes",
+            "control",
+        ]
+        existing_cols = [c for c in base_cols if _col_exists(conn, "items", c)]
+
+        sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
+        # impacto normalizado
+        if _col_exists(conn, "items", "informe_impacto"):
+            sel_parts.append("i.informe_impacto AS impacto")
+        elif _col_exists(conn, "items", "impacto"):
+            sel_parts.append("i.impacto")
+
+        sel = ", ".join(sel_parts) or "i.identificador"
+        cur.execute(f"SELECT {sel} FROM items i WHERE identificador = %s LIMIT 1", (identificador,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        names = [desc.name for desc in cur.description]
+        data = dict(zip(names, row))
+
+    # Por si no pudimos hacer el alias en SQL, aliásalo en Python
+    if "impacto" not in data and "informe_impacto" in data:
+        data["impacto"] = data.get("informe_impacto")
+
+    # Garantiza claves mínimas
+    for k in (
+        "titulo",
+        "resumen",
+        "impacto",
+        "likes",
+        "dislikes",
+        "control",
+        "departamento_codigo",
+        "seccion_codigo",
+        "epigrafe",
+        "created_at",
+    ):
+        data.setdefault(k, None)
+
+    return data
+
+def get_item_resumen(identificador: str) -> Dict[str, Any]:
+    with get_db() as conn, conn.cursor() as cur:
+        # si no existe la columna, devolvemos None
+        if not _col_exists(conn, "items", "resumen"):
+            return {"identificador": identificador, "resumen": None}
+        cur.execute("SELECT resumen FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+        row = cur.fetchone()
+    return {"identificador": identificador, "resumen": row[0] if row else None}
+
+def get_item_impacto(identificador: str) -> Dict[str, Any]:
+    with get_db() as conn, conn.cursor() as cur:
+        # usa el campo real de la BD
+        if not _col_exists(conn, "items", "informe_impacto"):
+            # fallback si existiese antigua columna impacto
+            if _col_exists(conn, "items", "impacto"):
+                cur.execute("SELECT impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+                row = cur.fetchone()
+                return {"identificador": identificador, "impacto": row[0] if row else None}
+            return {"identificador": identificador, "impacto": None}
+        cur.execute("SELECT informe_impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+        row = cur.fetchone()
+    return {"identificador": identificador, "impacto": row[0] if row else None}
+
+def like_item(identificador: str) -> Dict[str, Any]:
+    with get_db() as conn, conn.cursor() as cur:
+        if not _col_exists(conn, "items", "likes"):
+            return {"identificador": identificador, "likes": None}
+        cur.execute(
+            "UPDATE items SET likes = COALESCE(likes,0) + 1 WHERE identificador = %s RETURNING likes",
+            (identificador,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    return {"identificador": identificador, "likes": row[0] if row else 0}
+
+def dislike_item(identificador: str) -> Dict[str, Any]:
+    with get_db() as conn, conn.cursor() as cur:
+        if not _col_exists(conn, "items", "dislikes"):
+            return {"identificador": identificador, "dislikes": None}
+        cur.execute(
+            "UPDATE items SET dislikes = COALESCE(dislikes,0) + 1 WHERE identificador = %s RETURNING dislikes",
+            (identificador,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    return {"identificador": identificador, "dislikes": row[0] if row else 0}
+
+# ----------------------- listados (catálogos) -----------------------
+def list_departamentos() -> List[Dict[str, Any]]:
+    return list_departamentos_lookup()
+
+def list_secciones() -> List[Dict[str, Any]]:
+    return list_secciones_lookup()
+
+def list_epigrafes() -> List[str]:
+    sql_text = """
+        SELECT DISTINCT TRIM(epigrafe) AS epigrafe
+        FROM items
+        WHERE TRIM(COALESCE(epigrafe,'')) <> ''
+        ORDER BY epigrafe
+    """
+    with get_db() as conn, conn.cursor() as cur:
+        # si no existe la columna epigrafe, devolvemos []
+        if not _col_exists(conn, "items", "epigrafe"):
+            return []
+        cur.execute(sql_text)
+        return [r[0] for r in cur.fetchall()]
