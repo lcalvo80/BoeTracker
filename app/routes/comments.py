@@ -94,12 +94,19 @@ def list_item_comments(ident):
                 items = [_row_dict(r, cols) for r in rows]
 
         pages = ceil(total / limit) if limit else 0
-        return jsonify({"items": items, "page": page if total else 1, "pages": pages if total else 0, "total": total}), 200
+        # Añadimos 'limit' para facilitar la UI (opcional recomendado)
+        return jsonify({
+            "items": items,
+            "page": page if total else 1,
+            "pages": pages if total else 0,
+            "total": total,
+            "limit": limit,
+        }), 200
 
     except Exception:
         current_app.logger.exception("list_item_comments failed")
         # Respuesta estable para la UI
-        return jsonify({"items": [], "page": 1, "pages": 0, "total": 0}), 200
+        return jsonify({"items": [], "page": 1, "pages": 0, "total": 0, "limit": limit}), 200
 
 # =========================
 # POST /api/items/<ident>/comments
@@ -128,7 +135,7 @@ def add_item_comment(ident):
                 has_content = True
 
             text_col   = "content" if has_content else "comentario"
-            # En tu esquema actual existe user_name (no author)
+            # En tu esquema actual puede existir user_name (o author)
             author_col = "author" if has_author else ("user_name" if has_user_name else None)
 
             cols = ["item_identificador", text_col]
