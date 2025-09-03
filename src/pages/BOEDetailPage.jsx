@@ -1,3 +1,4 @@
+// src/pages/BOEDetailPage.jsx
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
@@ -281,6 +282,9 @@ const renderImpacto = (impactoStr) => {
   );
 };
 
+/* ========== Helper para soportar ambos contratos (AxiosResponse o data directa) ========== */
+const getData = (res) => (res && typeof res === "object" && "data" in res ? res.data : res);
+
 /* ========== Página ========== */
 
 const BOEDetailPage = () => {
@@ -313,7 +317,7 @@ const BOEDetailPage = () => {
       setError("");
       try {
         const itemRes = await getItemById(ident);
-        const data = itemRes?.data || null;
+        const data = getData(itemRes) || null;
         if (!data) throw new Error("No se encontró el elemento");
         if (!isMounted) return;
 
@@ -324,8 +328,8 @@ const BOEDetailPage = () => {
         const [r, im] = await Promise.allSettled([getResumen(ident), getImpacto(ident)]);
         if (!isMounted) return;
 
-        const resumenRaw = r.status === "fulfilled" ? r.value?.data?.resumen ?? r.value?.data : "";
-        const impactoRaw = im.status === "fulfilled" ? im.value?.data?.impacto ?? im.value?.data : "";
+        const resumenRaw = r.status === "fulfilled" ? getData(r.value) : "";
+        const impactoRaw = im.status === "fulfilled" ? getData(im.value) : "";
 
         const resumenText = maybeInflateBase64Gzip(normalizeTextBlock(resumenRaw));
         const impactoText = maybeInflateBase64Gzip(normalizeTextBlock(impactoRaw));
@@ -356,7 +360,8 @@ const BOEDetailPage = () => {
       setLoadingComments(true);
       setCommentError("");
       try {
-        const { data } = await getComments(ident, { page, limit: 20 });
+        const res = await getComments(ident, { page, limit: 20 });
+        const data = getData(res);
         const items = Array.isArray(data?.items) ? data.items : [];
         setComments(items);
         setCommentsMeta({
@@ -387,7 +392,8 @@ const BOEDetailPage = () => {
   const onLike = async () => {
     setLikes((v) => (Number.isFinite(v) ? v + 1 : 1));
     try {
-      const { data } = await likeItem(ident);
+      const res = await likeItem(ident);
+      const data = getData(res);
       if (Number.isFinite(data?.likes)) setLikes(data.likes);
     } catch {
       setLikes((v) => Math.max(0, (Number.isFinite(v) ? v : 1) - 1));
@@ -397,7 +403,8 @@ const BOEDetailPage = () => {
   const onDislike = async () => {
     setDislikes((v) => (Number.isFinite(v) ? v + 1 : 1));
     try {
-      const { data } = await dislikeItem(ident);
+      const res = await dislikeItem(ident);
+      const data = getData(res);
       if (Number.isFinite(data?.dislikes)) setDislikes(data.dislikes);
     } catch {
       setDislikes((v) => Math.max(0, (Number.isFinite(v) ? v : 1) - 1));
