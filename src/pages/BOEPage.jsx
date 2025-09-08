@@ -36,6 +36,34 @@ const getPublishedDate = (item) => {
   return "—";
 };
 
+// NUEVO: resolver epígrafe con tolerancia a distintas variantes de campo
+const getEpigrafe = (item) => {
+  const e =
+    item?.epigrafe_nombre ??
+    item?.epigrafe_titulo ??
+    item?.epigrafe ??
+    (Array.isArray(item?.epigrafes) ? item.epigrafes[0] : null) ??
+    item?.epigrafeCodigo ??
+    null;
+
+  if (!e) return "—";
+  return String(e).trim() || "—";
+};
+
+// NUEVO: obtener título resumido (fallback al completo si no existe)
+const getItemTitle = (item) => {
+  const t =
+    item?.titulo_resumen ??
+    item?.titulo_corto ??
+    item?.titulo_abreviado ??
+    item?.tituloShort ??
+    item?.tituloResumen ??
+    item?.resumen_titulo ??
+    item?.titulo;
+
+  return (t && String(t).trim()) || "—";
+};
+
 const inputBase =
   "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm placeholder:text-gray-400 " +
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/60 disabled:opacity-50";
@@ -146,7 +174,6 @@ const BOEPage = () => {
         setItems(Array.isArray(data?.items) ? data.items : []);
         setTotalItems(Number.isFinite(data?.total) ? data.total : 0);
       } catch (err) {
-        // Ignora cancelaciones para no ensuciar UX
         if (err?.name === "AbortError" || err?.name === "CanceledError") return;
         console.error("Error fetching items", err);
         setItems([]);
@@ -178,7 +205,7 @@ const BOEPage = () => {
 
   const handleTextChange = (e) => {
     const { name, value } = e.target;
-    if (isComposing) return; // no dispares mientras se compone
+    if (isComposing) return;
     debouncedTextChange(name, value);
   };
 
@@ -304,9 +331,7 @@ const BOEPage = () => {
                   />
                   <p className="mt-2 text-xs text-gray-500">
                     Usa comillas para frase exacta y{" "}
-                    <code className="rounded bg-gray-100 px-1 py-0.5">
-                      -palabra
-                    </code>{" "}
+                    <code className="rounded bg-gray-100 px-1 py-0.5">-palabra</code>{" "}
                     para excluir.
                   </p>
                 </div>
@@ -477,6 +502,8 @@ const BOEPage = () => {
                   item={item}
                   compact={compactMode}
                   getPublishedDate={getPublishedDate}
+                  getEpigrafe={getEpigrafe}
+                  getItemTitle={getItemTitle}  // <-- NUEVO
                   expanded={expandedIds.includes(item.id)}
                   onToggle={(e) => toggleExpanded(e, item.id)}
                   onOpen={() =>

@@ -1,644 +1,316 @@
-// src/pages/BOEDetailPage.jsx
-import React, { useEffect, useMemo, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router-dom";
-import {
-  getItemById,
-  getResumen,
-  getImpacto,
-  getComments,
-  postComment,
-  likeItem,
-  dislikeItem,
-} from "../services/boeService";
-import pako from "pako";
-import Section from "../components/ui/Section";
-import MetaChip from "../components/ui/MetaChip";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
-/* ========== Utils ========== */
+/**
+ * BOEDetailPage.jsx — "pako on‑demand" version
+ *
+ * Objetivo: Mostrar el detalle de un ítem del BOE. Si el backend devuelve
+ * campos comprimidos (base64+gzip), los inflamos dinámicamente importando pako
+ * solo cuando hace falta.
+ *
+ * Buenas prácticas incluidas:
+ * - split por código: import("pako") on-demand
+ * - AbortController en fetch
+ * - estados de carga y error predecibles
+ * - estructura accesible (landmarks, headings, aria-attrs)
+ * - helpers puros y testeables
+ * - defensivo frente a SSR/Node (atob/Buffer)
+ */
 
-const formatDateEsLong = (dateObj) =>
-  new Intl.DateTimeFormat("es-ES", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    timeZone: "Europe/Madrid",
-  }).format(dateObj);
+// =====================
+// Utils: base64 + gzip
+// =====================
+let pakoRef = null;
+async function getPako() {
+  if (!pakoRef) pakoRef = (await import("pako")).default;
+  return pakoRef;
+}
 
-const getPublishedDate = (item) => {
-  if (item?.created_at) {
-    const d = new Date(item.created_at);
-    if (!isNaN(d)) return formatDateEsLong(d);
+/** Determina si un string *parece* base64. */
+function isProbablyBase64(s) {
+  if (typeof s !== "string") return false;
+  if (s.length < 8) return false;
+  // Longitud múltiplo de 4 (típico en base64)
+  if (s.length % 4 !== 0) return false;
+  // Caracteres válidos
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(s);
+}
+
+/** Devuelve los primeros N bytes de un base64 sin decodificar todo. */
+function peekBase64Bytes(s, n = 2) {
+  try {
+    if (typeof window !== "undefined" && typeof atob === "function") {
+      const chunk = atob(s.slice(0, 4 * Math.ceil((n / 3))));
+      const out = new Uint8Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) out[i] = chunk.charCodeAt(i);
+      return out.slice(0, n);
+    } else if (typeof Buffer !== "undefined") {
+      return Buffer.from(s, "base64").subarray(0, n);
+    }
+  } catch {
+    // noop
   }
-  const day = item?.created_at_date || item?.fecha_publicacion;
-  if (day && /^\d{4}-\d{2}-\d{2}$/.test(day)) {
-    const [y, m, d] = day.split("-").map(Number);
-    return formatDateEsLong(new Date(Date.UTC(y, m - 1, d)));
+  return new Uint8Array(0);
+}
+
+/** Heurística rápida: ¿es base64 cuyo payload empieza por cabecera GZIP (1F 8B)? */
+function isProbablyBase64Gzip(s) {
+  if (!isProbablyBase64(s)) return false;
+  const head = peekBase64Bytes(s, 2);
+  return head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b; // \x1F\x8B
+}
+
+/** Decodifica base64 -> Uint8Array de forma segura en navegador/Node. */
+function decodeBase64ToUint8(s) {
+  if (typeof window !== "undefined" && typeof atob === "function") {
+    const b = atob(s);
+    const out = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+    return out;
   }
-  return "—";
-};
+  // Fallback Node/SSR
+  return new Uint8Array(Buffer.from(s, "base64"));
+}
 
-const isProbablyBase64Gzip = (s = "") =>
-  typeof s === "string" &&
-  s.length > 8 &&
-  (s.startsWith("H4sIA") || /^[A-Za-z0-9+/]+={0,2}$/.test(s));
-
-const decodeBase64ToUint8 = (b64) => {
-  const bin = atob(b64);
-  const len = bin.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-};
-
-const maybeInflateBase64Gzip = (s) => {
+/**
+ * Inflado *asíncrono* SOLO si parece base64+gzip.
+ * IMPORTANTE: devuelve siempre string (o el original si falla/no aplica).
+ */
+const maybeInflateBase64Gzip = async (s) => {
   try {
     if (!isProbablyBase64Gzip(s)) return s;
     const bytes = decodeBase64ToUint8(s);
+    const pako = await getPako();
     return pako.ungzip(bytes, { to: "string" }) || s;
   } catch {
     return s;
   }
 };
 
-const normalizeTextBlock = (raw) => {
-  if (raw == null) return "";
-  if (typeof raw === "string") return raw;
-  if (typeof raw === "object") {
-    return (
-      raw.resumen ||
-      raw.impacto ||
-      raw.texto ||
-      raw.content ||
-      raw.body ||
-      JSON.stringify(raw)
-    );
-  }
-  return String(raw);
-};
-
-const Skeleton = ({ className = "" }) => (
-  <div
-    className={`animate-pulse bg-gray-200 rounded ${className}`}
-    role="status"
-    aria-label="cargando..."
-  />
-);
-
-const titleCaseFromKey = (key) =>
-  String(key)
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/\b\w/g, (m) => m.toUpperCase());
-
-const renderValue = (val) => {
-  if (Array.isArray(val)) {
-    return (
-      <ul className="list-disc pl-6 text-gray-800">
-        {val.map((v, i) => (
-          <li key={i}>
-            {typeof v === "string" ? v : typeof v === "number" ? String(v) : JSON.stringify(v)}
-          </li>
-        ))}
-      </ul>
-    );
-  }
-  if (typeof val === "object" && val !== null) {
-    const entries = Object.entries(val);
-    return (
-      <div className="space-y-2">
-        {entries.map(([k, v], i) => (
-          <div key={i}>
-            <div className="font-medium">{titleCaseFromKey(k)}</div>
-            <div className="text-gray-800">
-              {typeof v === "string" ? (
-                <p className="whitespace-pre-line">{v}</p>
-              ) : Array.isArray(v) ? (
-                <ul className="list-disc pl-6 text-gray-800">
-                  {v.map((x, j) => (
-                    <li key={j}>{typeof x === "string" ? x : JSON.stringify(x)}</li>
-                  ))}
-                </ul>
-              ) : (
-                <pre className="bg-gray-50 p-2 rounded text-sm overflow-x-auto">
-                  {JSON.stringify(v, null, 2)}
-                </pre>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  }
-  return <p className="prose max-w-none text-gray-800 whitespace-pre-line">{String(val)}</p>;
-};
-
-/* ======= Resumen JSON → subsecciones ======= */
-const renderResumen = (resumenStr) => {
-  let parsed = null;
-  try {
-    parsed = JSON.parse(resumenStr);
-  } catch {
-    parsed = null;
-  }
-
-  if (!parsed || typeof parsed !== "object") {
-    return (
-      <article className="prose max-w-none text-gray-800 whitespace-pre-line">
-        {resumenStr}
-      </article>
-    );
-  }
-
-  const ctx = parsed.context || parsed.Context || parsed.CONTEXTO;
-  const keyChanges = parsed.key_changes || parsed["key_changes"] || [];
-  const keyDates = parsed.key_dates_events || parsed["key_dates_events"] || [];
-  const conclusion = parsed.conclusion || parsed.Conclusion || parsed.CONCLUSION;
-
-  return (
-    <div className="space-y-4">
-      {ctx && (
-        <Section title="Contexto" defaultOpen>
-          {renderValue(ctx)}
-        </Section>
-      )}
-      {Array.isArray(keyChanges) && keyChanges.length > 0 && (
-        <Section title="Cambios clave" defaultOpen={false}>
-          {renderValue(keyChanges)}
-        </Section>
-      )}
-      {Array.isArray(keyDates) && keyDates.length > 0 && (
-        <Section title="Fechas y eventos" defaultOpen={false}>
-          {renderValue(keyDates)}
-        </Section>
-      )}
-      {conclusion && (
-        <Section title="Conclusión" defaultOpen={false}>
-          {renderValue(conclusion)}
-        </Section>
-      )}
-    </div>
-  );
-};
-
-/* ======= Impacto JSON → subsecciones ======= */
-const renderImpacto = (impactoStr) => {
-  let parsed = null;
-  try {
-    parsed = JSON.parse(impactoStr);
-  } catch {
-    parsed = null;
-  }
-
-  if (!parsed || typeof parsed !== "object") {
-    return (
-      <article className="prose max-w-none text-gray-800 whitespace-pre-line">
-        {impactoStr}
-      </article>
-    );
-  }
-
-  const aliases = {
-    ambitos: ["ambitos", "ámbitos", "scope", "scopes"],
-    costes: ["costes", "costos", "coste", "cost", "costs"],
-    beneficios: ["beneficios", "benefits"],
-    efectos: ["efectos", "effects", "impactos", "impacts"],
-    cargas_administrativas: [
-      "cargas_administrativas",
-      "carga_administrativa",
-      "administrative_burden",
-    ],
-    colectivos_afectados: [
-      "colectivos_afectados",
-      "partes_afectadas",
-      "stakeholders",
-      "affected_parties",
-    ],
-    indicadores_seguimiento: [
-      "indicadores_seguimiento",
-      "indicadores",
-      "kpi",
-      "kpis",
-      "followup_indicators",
-    ],
-    riesgos: ["riesgos", "risks"],
-    mitigaciones: ["mitigaciones", "mitigation", "mitigations"],
-    calendario: ["calendario", "timeline", "cronograma", "schedule"],
-    presupuesto: ["presupuesto", "budget", "financiacion", "financiación", "funding"],
-    cumplimiento: ["cumplimiento", "compliance", "compatibilidad_normativa"],
-  };
-
-  const pick = (names) => {
-    for (const n of names) {
-      if (Object.prototype.hasOwnProperty.call(parsed, n)) return parsed[n];
-      if (Object.prototype.hasOwnProperty.call(parsed, n.replace(/\\_/g, "_")))
-        return parsed[n.replace(/\\_/g, "_")];
-    }
-    return undefined;
-  };
-
-  const sections = [
-    ["Ámbitos", pick(aliases.ambitos)],
-    ["Costes", pick(aliases.costes)],
-    ["Beneficios", pick(aliases.beneficios)],
-    ["Efectos", pick(aliases.efectos)],
-    ["Cargas administrativas", pick(aliases.cargas_administrativas)],
-    ["Colectivos afectados", pick(aliases.colectivos_afectados)],
-    ["Indicadores de seguimiento", pick(aliases.indicadores_seguimiento)],
-    ["Riesgos", pick(aliases.riesgos)],
-    ["Mitigaciones", pick(aliases.mitigaciones)],
-    ["Calendario", pick(aliases.calendario)],
-    ["Presupuesto", pick(aliases.presupuesto)],
-    ["Cumplimiento", pick(aliases.cumplimiento)],
-  ];
-
-  const knownKeys = new Set(Object.values(aliases).flat().map((k) => k.replace(/\\_/g, "_")));
-  const extraEntries = Object.entries(parsed).filter(
-    ([k]) => !knownKeys.has(k.replace(/\\_/g, "_"))
-  );
-
-  return (
-    <div className="space-y-4">
-      {sections.map(([title, val]) =>
-        val == null || (Array.isArray(val) && val.length === 0) ? null : (
-          <Section key={title} title={title} defaultOpen={false}>
-            {renderValue(val)}
-          </Section>
-        )
-      )}
-
-      {extraEntries.length > 0 && (
-        <Section title="Otros detalles" defaultOpen={false}>
-          <div className="space-y-4">
-            {extraEntries.map(([k, v]) => (
-              <Section key={k} title={titleCaseFromKey(k)} defaultOpen={false}>
-                {renderValue(v)}
-              </Section>
-            ))}
-          </div>
-        </Section>
-      )}
-    </div>
-  );
-};
-
-/* ========== Helper para soportar ambos contratos (AxiosResponse o data directa) ========== */
-const getData = (res) => (res && typeof res === "object" && "data" in res ? res.data : res);
-
-/* ========== Página ========== */
-
-const BOEDetailPage = () => {
+// =====================
+// Vista principal
+// =====================
+export default function BOEDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const ident = useMemo(() => decodeURIComponent(id || ""), [id]);
+  const [searchParams] = useSearchParams();
 
+  const [data, setData] = useState(null);
+  const [inflated, setInflated] = useState(null); // campos procesados
   const [loading, setLoading] = useState(true);
-  const [loadingComments, setLoadingComments] = useState(true);
+  const [error, setError] = useState(null);
 
-  const [item, setItem] = useState(null);
-  const [resumen, setResumen] = useState("");
-  const [impacto, setImpacto] = useState("");
-  const [error, setError] = useState("");
+  const controllerRef = useRef(null);
 
-  const [likes, setLikes] = useState(null);
-  const [dislikes, setDislikes] = useState(null);
+  const apiUrl = useMemo(() => {
+    // Permite override con ?endpoint=... (útil en desarrollo)
+    const ep = searchParams.get("endpoint");
+    return ep || `/api/boe/${encodeURIComponent(id || "")}`;
+  }, [id, searchParams]);
 
-  const [comments, setComments] = useState([]);
-  const [commentsMeta, setCommentsMeta] = useState({ page: 1, pages: 0, total: 0 });
-  const [commentForm, setCommentForm] = useState({ author: "", text: "" });
-  const [commentError, setCommentError] = useState("");
-  const [commentSending, setCommentSending] = useState(false);
-
-  /* Cargar detalle + resumen/impacto */
+  // Fetch del ítem
   useEffect(() => {
-    let isMounted = true;
-    const load = async () => {
+    if (!id) return;
+    controllerRef.current?.abort?.();
+    const ac = new AbortController();
+    controllerRef.current = ac;
+
+    (async () => {
       setLoading(true);
-      setError("");
+      setError(null);
       try {
-        const itemRes = await getItemById(ident);
-        const data = getData(itemRes) || null;
-        if (!data) throw new Error("No se encontró el elemento");
-        if (!isMounted) return;
-
-        setItem(data);
-        setLikes(Number.isFinite(data?.likes) ? data.likes : 0);
-        setDislikes(Number.isFinite(data?.dislikes) ? data.dislikes : 0);
-
-        const [r, im] = await Promise.allSettled([getResumen(ident), getImpacto(ident)]);
-        if (!isMounted) return;
-
-        const resumenRaw = r.status === "fulfilled" ? getData(r.value) : "";
-        const impactoRaw = im.status === "fulfilled" ? getData(im.value) : "";
-
-        const resumenText = maybeInflateBase64Gzip(normalizeTextBlock(resumenRaw));
-        const impactoText = maybeInflateBase64Gzip(normalizeTextBlock(impactoRaw));
-
-        setResumen(resumenText);
-        setImpacto(impactoText);
-      } catch (e) {
-        if (!isMounted) return;
-        setError(
-          e?.response?.data?.detail ||
-            e?.response?.data?.error ||
-            e?.message ||
-            "No se pudo cargar el detalle."
-        );
+        const res = await fetch(apiUrl, { signal: ac.signal, headers: { Accept: "application/json" } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        setData(json);
+      } catch (err) {
+        if (err?.name !== "AbortError") {
+          setError(err);
+        }
       } finally {
-        if (isMounted) setLoading(false);
+        setLoading(false);
       }
-    };
-    if (ident) load();
-    return () => {
-      isMounted = false;
-    };
-  }, [ident]);
+    })();
 
-  /* Cargar comentarios */
-  const fetchComments = useCallback(
-    async (page = 1) => {
-      setLoadingComments(true);
-      setCommentError("");
-      try {
-        const res = await getComments(ident, { page, limit: 20 });
-        const data = getData(res);
-        const items = Array.isArray(data?.items) ? data.items : [];
-        setComments(items);
-        setCommentsMeta({
-          page: Number.isFinite(data?.page) ? data.page : 1,
-          pages: Number.isFinite(data?.pages) ? data.pages : 0,
-          total: Number.isFinite(data?.total) ? data.total : items.length,
-        });
-      } catch (e) {
-        setComments([]);
-        setCommentsMeta({ page: 1, pages: 0, total: 0 });
-        setCommentError(
-          e?.response?.data?.detail ||
-            e?.response?.data?.error ||
-            "Los comentarios no están disponibles."
-        );
-      } finally {
-        setLoadingComments(false);
-      }
-    },
-    [ident]
-  );
+    return () => ac.abort();
+  }, [apiUrl, id]);
 
+  // Post-proceso: inflar campos que puedan venir comprimidos
   useEffect(() => {
-    if (ident) fetchComments(1);
-  }, [ident, fetchComments]);
-
-  /* Acciones */
-  const onLike = async () => {
-    setLikes((v) => (Number.isFinite(v) ? v + 1 : 1));
-    try {
-      const res = await likeItem(ident);
-      const data = getData(res);
-      if (Number.isFinite(data?.likes)) setLikes(data.likes);
-    } catch {
-      setLikes((v) => Math.max(0, (Number.isFinite(v) ? v : 1) - 1));
+    let cancelled = false;
+    if (!data) {
+      setInflated(null);
+      return;
     }
-  };
-
-  const onDislike = async () => {
-    setDislikes((v) => (Number.isFinite(v) ? v + 1 : 1));
-    try {
-      const res = await dislikeItem(ident);
-      const data = getData(res);
-      if (Number.isFinite(data?.dislikes)) setDislikes(data.dislikes);
-    } catch {
-      setDislikes((v) => Math.max(0, (Number.isFinite(v) ? v : 1) - 1));
-    }
-  };
-
-  const submitComment = async (e) => {
-    e.preventDefault();
-    setCommentError("");
-    setCommentSending(true);
-    try {
-      const payload = {
-        author: commentForm.author?.trim() || "Anónimo",
-        text: (commentForm.text || "").trim(),
-      };
-      if (!payload.text) {
-        setCommentError("Escribe un comentario.");
-        setCommentSending(false);
-        return;
+    (async () => {
+      const toInflate = [
+        "content", // cuerpo principal
+        "summary", // resumen si existe
+        "html", // si el backend manda html comprimido
+      ];
+      const out = { ...data };
+      for (const key of toInflate) {
+        const v = data?.[key];
+        if (typeof v === "string") {
+          out[key] = await maybeInflateBase64Gzip(v);
+        }
       }
-      await postComment(ident, payload);
-      setCommentForm({ author: "", text: "" });
-      fetchComments(1);
-    } catch (err) {
-      setCommentError(
-        err?.error || err?.detail || err?.message || "No se pudo enviar el comentario."
-      );
-    } finally {
-      setCommentSending(false);
-    }
-  };
+      if (!cancelled) setInflated(out);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [data]);
 
-  /* Render */
+  const handleBack = useCallback(() => {
+    if (window.history.length > 1) navigate(-1);
+    else navigate("/", { replace: true });
+  }, [navigate]);
+
+  // ============
+  // Render UI
+  // ============
   if (loading) {
     return (
-      <div className="p-6 max-w-5xl mx-auto">
-        <Skeleton className="h-6 w-40 mb-4" />
-        <Skeleton className="h-8 w-3/4 mb-2" />
-        <Skeleton className="h-4 w-1/2 mb-6" />
-        <Skeleton className="h-24 w-full mb-4" />
-        <Skeleton className="h-24 w-full" />
-      </div>
-    );
-  }
-
-  if (error || !item) {
-    return (
-      <div className="p-6 max-w-3xl mx-auto">
-        <button onClick={() => navigate(-1)} className="text-sm text-blue-700 hover:underline mb-4">
-          ← Volver
-        </button>
-        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-          {error || "No se encontró el elemento."}
+      <main role="main" className="mx-auto max-w-4xl p-4 md:p-6">
+        <button onClick={handleBack} className="text-sm text-blue-600 hover:underline">← Volver</button>
+        <div className="mt-6 animate-pulse space-y-4" aria-busy>
+          <div className="h-8 w-2/3 rounded bg-gray-200" />
+          <div className="h-4 w-1/2 rounded bg-gray-200" />
+          <div className="h-72 w-full rounded bg-gray-200" />
         </div>
-      </div>
+      </main>
     );
   }
 
-  const tituloPrincipal = item.titulo_resumen || item.titulo || "(Sin título)";
-  const fechaPub = getPublishedDate(item);
+  if (error) {
+    return (
+      <main role="main" className="mx-auto max-w-3xl p-4 md:p-6">
+        <button onClick={handleBack} className="text-sm text-blue-600 hover:underline">← Volver</button>
+        <div className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-red-800">
+          <h1 className="text-lg font-semibold">No se pudo cargar el documento</h1>
+          <p className="mt-1 text-sm">{String(error.message || error)}</p>
+          <div className="mt-3 text-xs text-red-700 opacity-75">ID: {id}</div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!inflated) return null; // estado intermedio muy breve
+
+  const {
+    title,
+    date,
+    section,
+    number,
+    sourceUrl,
+    content,
+    summary,
+    html,
+    metadata,
+  } = inflated;
+
+  const displayDate = date ? new Date(date).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "2-digit" }) : null;
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-6">
-      <button onClick={() => navigate(-1)} className="text-sm text-blue-700 hover:underline">
-        ← Volver
-      </button>
-
-      {/* Cabecera */}
-      <header className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
-        <h1 className="text-2xl font-bold text-gray-900">{tituloPrincipal}</h1>
-        <p className="mt-1 text-sm font-medium text-gray-500">{item.identificador}</p>
-
-        <div className="mt-4 flex flex-wrap gap-2">
-          <MetaChip>Sección: {item.seccion_nombre || item.seccion_codigo || "—"}</MetaChip>
-          <MetaChip>Departamento: {item.departamento_nombre || item.departamento_codigo || "—"}</MetaChip>
-          <MetaChip>Epígrafe: {item.epigrafe || "—"}</MetaChip>
-          <MetaChip>Fecha: {fechaPub}</MetaChip>
-          {item.control && <MetaChip>Control: {item.control}</MetaChip>}
-        </div>
-
-        <div className="mt-5 flex items-center gap-2">
-          <button
-            onClick={onLike}
-            className="inline-flex items-center gap-2 rounded-lg bg-green-600 px-3 py-1.5 text-white hover:bg-green-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-green-600/60"
+    <main role="main" className="mx-auto max-w-4xl p-4 md:p-6">
+      <nav className="mb-4 flex items-center justify-between gap-2">
+        <button onClick={handleBack} className="inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+          <span aria-hidden>←</span>
+          <span>Volver</span>
+        </button>
+        {sourceUrl && (
+          <a
+            href={sourceUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700"
           >
-            👍 <span className="text-sm">Me interesa {Number.isFinite(likes) ? `(${likes})` : ""}</span>
-          </button>
-          <button
-            onClick={onDislike}
-            className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-1.5 text-white hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600/60"
-          >
-            👎 <span className="text-sm">No me interesa {Number.isFinite(dislikes) ? `(${dislikes})` : ""}</span>
-          </button>
+            Ver en BOE
+          </a>
+        )}
+      </nav>
+
+      <header className="space-y-2">
+        {section && (
+          <div className="text-xs uppercase tracking-wide text-gray-500">{section}</div>
+        )}
+        <h1 className="text-2xl font-semibold leading-snug text-gray-900">{title || "Documento BOE"}</h1>
+        <div className="text-sm text-gray-600">
+          {number && <span className="mr-2">Nº {number}</span>}
+          {displayDate && <time dateTime={date}>{displayDate}</time>}
         </div>
       </header>
 
       {/* Resumen */}
-      {resumen ? (
-        <Section title="Resumen" defaultOpen={true}>
-          {renderResumen(resumen)}
-        </Section>
-      ) : null}
+      {summary && (
+        <section className="mt-6 rounded-2xl border bg-gray-50 p-4">
+          <h2 className="mb-2 text-sm font-medium text-gray-700">Resumen</h2>
+          <p className="whitespace-pre-wrap text-gray-800">{summary}</p>
+        </section>
+      )}
 
-      {/* Informe de impacto */}
-      {impacto ? (
-        <Section title="Informe de impacto" defaultOpen={false}>
-          {renderImpacto(impacto)}
-        </Section>
-      ) : null}
-
-      {/* Título completo */}
-      {item.titulo ? (
-        <Section title="Título completo" defaultOpen={false}>
-          <article className="prose max-w-none text-gray-800 whitespace-pre-line">
-            {item.titulo}
-          </article>
-        </Section>
-      ) : null}
-
-      {/* Comentarios */}
-      <section className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-semibold">Comentarios</h2>
-          {!loadingComments && commentsMeta?.total > 0 ? (
-            <span className="text-sm text-gray-500">{commentsMeta.total} comentario(s)</span>
-          ) : null}
-        </div>
-
-        {loadingComments ? (
-          <div className="space-y-2">
-            <Skeleton className="h-4 w-1/2" />
-            <Skeleton className="h-4 w-3/4" />
-          </div>
-        ) : commentError ? (
-          <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 px-3 py-2 rounded">
-            {commentError}
-          </div>
-        ) : comments.length === 0 ? (
-          <p className="text-gray-500">No hay comentarios aún.</p>
+      {/* Cuerpo principal: si viene HTML lo usamos; si no, texto plain */}
+      <article className="prose prose-gray mt-6 max-w-none">
+        {html ? (
+          <div
+            // El HTML procede de una fuente controlada (BOE / backend). Si no, sanitizar aquí.
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
         ) : (
-          <ul className="space-y-3">
-            {comments.map((c, idx) => (
-              <li key={c.id || idx} className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="font-semibold text-gray-800">{c.author || "Anónimo"}</span>
-                  <time className="text-gray-500">
-                    {c.created_at ? formatDateEsLong(new Date(c.created_at)) : ""}
-                  </time>
-                </div>
-                <p className="mt-2 text-gray-800 whitespace-pre-line">
-                  {c.text || c.content || c.comentario || ""}
-                </p>
-              </li>
-            ))}
-          </ul>
+          <pre className="whitespace-pre-wrap break-words text-[0.98rem] leading-relaxed text-gray-900">{content}</pre>
         )}
+      </article>
 
-        {/* Paginación de comentarios */}
-        {!loadingComments && commentsMeta.pages > 1 ? (
-          <div className="flex gap-1 mt-3">
-            <button
-              disabled={commentsMeta.page <= 1}
-              onClick={() => fetchComments(commentsMeta.page - 1)}
-              className="px-2 py-1 text-sm border rounded disabled:opacity-40 hover:bg-gray-100"
-              aria-label="Comentarios anteriores"
-            >
-              ←
-            </button>
-            {Array.from({ length: commentsMeta.pages }, (_, i) => i + 1)
-              .filter(
-                (p) =>
-                  p === 1 || p === commentsMeta.pages || Math.abs(commentsMeta.page - p) <= 2
-              )
-              .map((p) => (
-                <button
-                  key={p}
-                  onClick={() => fetchComments(p)}
-                  className={`px-2 py-1 text-sm border rounded ${
-                    p === commentsMeta.page ? "bg-blue-600 text-white" : "hover:bg-gray-100"
-                  }`}
-                  aria-current={p === commentsMeta.page ? "page" : undefined}
-                >
-                  {p}
-                </button>
-              ))}
-            <button
-              disabled={commentsMeta.page >= commentsMeta.pages}
-              onClick={() => fetchComments(commentsMeta.page + 1)}
-              className="px-2 py-1 text-sm border rounded disabled:opacity-40 hover:bg-gray-100"
-              aria-label="Comentarios siguientes"
-            >
-              →
-            </button>
-          </div>
-        ) : null}
+      {/* Metadata opcional */}
+      {metadata && (
+        <section className="mt-8">
+          <h2 className="text-sm font-semibold text-gray-700">Metadatos</h2>
+          <dl className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {Object.entries(metadata).map(([k, v]) => (
+              <div key={k} className="rounded-xl border p-3 text-sm">
+                <dt className="text-gray-500">{k}</dt>
+                <dd className="mt-1 break-words text-gray-900">{String(v)}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      )}
 
-        {/* Formulario de comentario */}
-        <form onSubmit={submitComment} className="mt-5 space-y-3">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <div className="md:col-span-1">
-              <label className="text-sm font-medium text-gray-700 mb-1 block">Autor</label>
-              <input
-                type="text"
-                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/60"
-                placeholder="Tu nombre (opcional)"
-                value={commentForm.author}
-                onChange={(e) => setCommentForm((p) => ({ ...p, author: e.target.value }))}
-              />
-            </div>
-            <div className="md:col-span-2">
-              <label className="text-sm font-medium text-gray-700 mb-1 block">Comentario</label>
-              <textarea
-                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/60 min-h-[96px]"
-                placeholder="Escribe tu comentario…"
-                value={commentForm.text}
-                onChange={(e) => setCommentForm((p) => ({ ...p, text: e.target.value }))}
-                aria-invalid={!!commentError}
-              />
-            </div>
-          </div>
-          {commentError && <div className="text-sm text-red-600">{commentError}</div>}
-          <div>
-            <button
-              type="submit"
-              disabled={commentSending}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
-            >
-              {commentSending ? "Enviando…" : "Enviar comentario"}
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
+      {/* Acciones */}
+      <div className="mt-8 flex flex-wrap items-center gap-2">
+        <CopyButton text={html || content || ""} />
+        {sourceUrl && (
+          <a href={sourceUrl} target="_blank" rel="noreferrer" className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+            Abrir fuente
+          </a>
+        )}
+      </div>
+    </main>
   );
-};
+}
 
-export default BOEDetailPage;
+// ===============
+// UI helpers
+// ===============
+function CopyButton({ text }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // noop
+    }
+  }, [text]);
+  return (
+    <button
+      onClick={onCopy}
+      aria-live="polite"
+      className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+    >
+      {copied ? "Copiado ✓" : "Copiar"}
+    </button>
+  );
+}
