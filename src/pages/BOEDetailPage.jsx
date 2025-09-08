@@ -2,19 +2,7 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 /**
- * BOEDetailPage.jsx — "pako on‑demand" version
- *
- * Objetivo: Mostrar el detalle de un ítem del BOE. Si el backend devuelve
- * campos comprimidos (base64+gzip), los inflamos dinámicamente importando pako
- * solo cuando hace falta.
- *
- * Buenas prácticas incluidas:
- * - split por código: import("pako") on-demand
- * - AbortController en fetch
- * - estados de carga y error predecibles
- * - estructura accesible (landmarks, headings, aria-attrs)
- * - helpers puros y testeables
- * - defensivo frente a SSR/Node (atob/Buffer)
+ * BOEDetailPage.jsx — "pako on-demand" version (actualizado)
  */
 
 // =====================
@@ -26,41 +14,33 @@ async function getPako() {
   return pakoRef;
 }
 
-/** Determina si un string *parece* base64. */
 function isProbablyBase64(s) {
   if (typeof s !== "string") return false;
   if (s.length < 8) return false;
-  // Longitud múltiplo de 4 (típico en base64)
   if (s.length % 4 !== 0) return false;
-  // Caracteres válidos
   return /^[A-Za-z0-9+/]+={0,2}$/.test(s);
 }
 
-/** Devuelve los primeros N bytes de un base64 sin decodificar todo. */
 function peekBase64Bytes(s, n = 2) {
   try {
     if (typeof window !== "undefined" && typeof atob === "function") {
-      const chunk = atob(s.slice(0, 4 * Math.ceil((n / 3))));
+      const chunk = atob(s.slice(0, 4 * Math.ceil(n / 3)));
       const out = new Uint8Array(chunk.length);
       for (let i = 0; i < chunk.length; i++) out[i] = chunk.charCodeAt(i);
       return out.slice(0, n);
     } else if (typeof Buffer !== "undefined") {
       return Buffer.from(s, "base64").subarray(0, n);
     }
-  } catch {
-    // noop
-  }
+  } catch {}
   return new Uint8Array(0);
 }
 
-/** Heurística rápida: ¿es base64 cuyo payload empieza por cabecera GZIP (1F 8B)? */
 function isProbablyBase64Gzip(s) {
   if (!isProbablyBase64(s)) return false;
   const head = peekBase64Bytes(s, 2);
-  return head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b; // \x1F\x8B
+  return head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b;
 }
 
-/** Decodifica base64 -> Uint8Array de forma segura en navegador/Node. */
 function decodeBase64ToUint8(s) {
   if (typeof window !== "undefined" && typeof atob === "function") {
     const b = atob(s);
@@ -68,14 +48,9 @@ function decodeBase64ToUint8(s) {
     for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
     return out;
   }
-  // Fallback Node/SSR
   return new Uint8Array(Buffer.from(s, "base64"));
 }
 
-/**
- * Inflado *asíncrono* SOLO si parece base64+gzip.
- * IMPORTANTE: devuelve siempre string (o el original si falla/no aplica).
- */
 const maybeInflateBase64Gzip = async (s) => {
   try {
     if (!isProbablyBase64Gzip(s)) return s;
@@ -96,19 +71,17 @@ export default function BOEDetailPage() {
   const [searchParams] = useSearchParams();
 
   const [data, setData] = useState(null);
-  const [inflated, setInflated] = useState(null); // campos procesados
+  const [inflated, setInflated] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   const controllerRef = useRef(null);
 
   const apiUrl = useMemo(() => {
-    // Permite override con ?endpoint=... (útil en desarrollo)
     const ep = searchParams.get("endpoint");
     return ep || `/api/boe/${encodeURIComponent(id || "")}`;
   }, [id, searchParams]);
 
-  // Fetch del ítem
   useEffect(() => {
     if (!id) return;
     controllerRef.current?.abort?.();
@@ -135,7 +108,7 @@ export default function BOEDetailPage() {
     return () => ac.abort();
   }, [apiUrl, id]);
 
-  // Post-proceso: inflar campos que puedan venir comprimidos
+  // Post-proceso: inflar campos potencialmente comprimidos
   useEffect(() => {
     let cancelled = false;
     if (!data) {
@@ -144,9 +117,13 @@ export default function BOEDetailPage() {
     }
     (async () => {
       const toInflate = [
-        "content", // cuerpo principal
-        "summary", // resumen si existe
-        "html", // si el backend manda html comprimido
+        "content",
+        "summary",
+        "html",
+        // NUEVO: campos que podrían venir comprimidos también
+        "epigrafe",
+        "full_title",
+        "titulo_completo",
       ];
       const out = { ...data };
       for (const key of toInflate) {
@@ -167,9 +144,6 @@ export default function BOEDetailPage() {
     else navigate("/", { replace: true });
   }, [navigate]);
 
-  // ============
-  // Render UI
-  // ============
   if (loading) {
     return (
       <main role="main" className="mx-auto max-w-4xl p-4 md:p-6">
@@ -196,7 +170,7 @@ export default function BOEDetailPage() {
     );
   }
 
-  if (!inflated) return null; // estado intermedio muy breve
+  if (!inflated) return null;
 
   const {
     title,
@@ -208,9 +182,28 @@ export default function BOEDetailPage() {
     summary,
     html,
     metadata,
+    epigrafe,
+    url_pdf,          // NUEVO: link PDF
+    full_title,       // NUEVO: posible título extendido
+    titulo_completo,  // NUEVO: alias posible
   } = inflated;
 
-  const displayDate = date ? new Date(date).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "2-digit" }) : null;
+  const displayDate = date
+    ? new Date(date).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "2-digit" })
+    : null;
+
+  // “Título completo” preferido si existe
+  const completeTitle = (full_title || titulo_completo || title || "").trim();
+  const showCompleteTitleBlock = completeTitle && completeTitle !== (title || "").trim();
+
+  // Detección simple de “Informe de impacto”
+  const isImpactReport =
+    /impacto/i.test(section || "") || (metadata && /impacto/i.test(String(metadata?.tipo || "")));
+
+  // Picks comunes para informes de impacto
+  const afectados = metadata?.afectados;
+  const ambito = metadata?.ambito || metadata?.ámbito;
+  const materias = metadata?.materias || metadata?.sectores || metadata?.materia;
 
   return (
     <main role="main" className="mx-auto max-w-4xl p-4 md:p-6">
@@ -219,28 +212,57 @@ export default function BOEDetailPage() {
           <span aria-hidden>←</span>
           <span>Volver</span>
         </button>
-        {sourceUrl && (
-          <a
-            href={sourceUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700"
-          >
-            Ver en BOE
-          </a>
-        )}
+
+        <div className="flex items-center gap-2">
+          {url_pdf && (
+            <a
+              href={url_pdf}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-sm font-medium hover:bg-gray-50"
+            >
+              Ver PDF
+            </a>
+          )}
+          {sourceUrl && (
+            <a
+              href={sourceUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Ver en BOE
+            </a>
+          )}
+        </div>
       </nav>
 
       <header className="space-y-2">
         {section && (
           <div className="text-xs uppercase tracking-wide text-gray-500">{section}</div>
         )}
-        <h1 className="text-2xl font-semibold leading-snug text-gray-900">{title || "Documento BOE"}</h1>
+        <h1 className="text-2xl font-semibold leading-snug text-gray-900">
+          {title || "Documento BOE"}
+        </h1>
+
+        {/* Epígrafe (subtítulo) */}
+        {epigrafe && (
+          <p className="text-sm text-gray-700">{epigrafe}</p>
+        )}
+
         <div className="text-sm text-gray-600">
           {number && <span className="mr-2">Nº {number}</span>}
           {displayDate && <time dateTime={date}>{displayDate}</time>}
         </div>
       </header>
+
+      {/* Título completo encima del resumen, si difiere del principal */}
+      {showCompleteTitleBlock && (
+        <section className="mt-6 rounded-2xl border bg-gray-50 p-4">
+          <h2 className="mb-2 text-sm font-medium text-gray-700">Título completo</h2>
+          <p className="whitespace-pre-wrap text-gray-900">{completeTitle}</p>
+        </section>
+      )}
 
       {/* Resumen */}
       {summary && (
@@ -250,36 +272,87 @@ export default function BOEDetailPage() {
         </section>
       )}
 
-      {/* Cuerpo principal: si viene HTML lo usamos; si no, texto plain */}
+      {/* Cuerpo principal */}
       <article className="prose prose-gray mt-6 max-w-none">
         {html ? (
-          <div
-            // El HTML procede de una fuente controlada (BOE / backend). Si no, sanitizar aquí.
-            dangerouslySetInnerHTML={{ __html: html }}
-          />
+          <div dangerouslySetInnerHTML={{ __html: html }} />
         ) : (
           <pre className="whitespace-pre-wrap break-words text-[0.98rem] leading-relaxed text-gray-900">{content}</pre>
         )}
       </article>
 
-      {/* Metadata opcional */}
+      {/* Metadatos / Informe de impacto */}
       {metadata && (
-        <section className="mt-8">
-          <h2 className="text-sm font-semibold text-gray-700">Metadatos</h2>
-          <dl className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {Object.entries(metadata).map(([k, v]) => (
-              <div key={k} className="rounded-xl border p-3 text-sm">
-                <dt className="text-gray-500">{k}</dt>
-                <dd className="mt-1 break-words text-gray-900">{String(v)}</dd>
-              </div>
-            ))}
-          </dl>
-        </section>
+        <>
+          {isImpactReport ? (
+            <section className="mt-8">
+              <h2 className="text-sm font-semibold text-gray-700">Informe de Impacto</h2>
+
+              {/* Afectados */}
+              {afectados && (
+                <div className="mt-3 rounded-xl border p-4">
+                  <h3 className="text-sm font-medium text-gray-700">Afectados</h3>
+                  {Array.isArray(afectados) ? (
+                    <ul className="mt-2 list-disc pl-5 text-sm text-gray-900">
+                      {afectados.map((a, i) => (
+                        <li key={i} className="break-words">{String(a)}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-2 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(afectados)}</p>
+                  )}
+                </div>
+              )}
+
+              {/* Ámbito */}
+              {ambito && (
+                <div className="mt-3 rounded-xl border p-4">
+                  <h3 className="text-sm font-medium text-gray-700">Ámbito</h3>
+                  <p className="mt-2 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(ambito)}</p>
+                </div>
+              )}
+
+              {/* Materias / Sectores */}
+              {materias && (
+                <div className="mt-3 rounded-xl border p-4">
+                  <h3 className="text-sm font-medium text-gray-700">Materias / Sectores</h3>
+                  {Array.isArray(materias) ? (
+                    <ul className="mt-2 list-disc pl-5 text-sm text-gray-900">
+                      {materias.map((m, i) => (
+                        <li key={i} className="break-words">{String(m)}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-2 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(materias)}</p>
+                  )}
+                </div>
+              )}
+            </section>
+          ) : (
+            // Grid genérico solo si NO es informe de impacto
+            <section className="mt-8">
+              <h2 className="text-sm font-semibold text-gray-700">Metadatos</h2>
+              <dl className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {Object.entries(metadata).map(([k, v]) => (
+                  <div key={k} className="rounded-xl border p-3 text-sm">
+                    <dt className="text-gray-500">{k}</dt>
+                    <dd className="mt-1 break-words text-gray-900">{String(v)}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          )}
+        </>
       )}
 
       {/* Acciones */}
       <div className="mt-8 flex flex-wrap items-center gap-2">
         <CopyButton text={html || content || ""} />
+        {url_pdf && (
+          <a href={url_pdf} target="_blank" rel="noreferrer" className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+            Ver PDF
+          </a>
+        )}
         {sourceUrl && (
           <a href={sourceUrl} target="_blank" rel="noreferrer" className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
             Abrir fuente
@@ -300,9 +373,7 @@ function CopyButton({ text }) {
       await navigator.clipboard.writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
-    } catch {
-      // noop
-    }
+    } catch {}
   }, [text]);
   return (
     <button
