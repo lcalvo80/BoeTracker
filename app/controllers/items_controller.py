@@ -90,18 +90,26 @@ def _col_exists(conn, table: str, col: str) -> bool:
         )
         return cur.fetchone() is not None
 
+def _fts_available(conn) -> bool:
+    """True si la tabla items tiene columna tsvector 'fts'."""
+    return _col_exists(conn, "items", "fts")
+
+def _ts_lang(conn) -> str:
+    """Lenguaje FTS a usar (ajústalo si lo haces configurable)."""
+    return "spanish"
+
 # ====================== Listado con filtros ======================
 
 def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Filtros soportados (con alias):
       - page, limit
-      - sort_by in {created_at, titulo, id, likes, dislikes}, sort_dir in {asc, desc}
+      - sort_by in {created_at, titulo, id, likes, dislikes, relevancia}, sort_dir in {asc, desc}
       - fecha, fecha_desde, fecha_hasta (aplican sobre created_at o created_at_date si existe)
       - departamento | departamentos | departamento_codigo (CSV o array)
       - seccion      | secciones     | seccion_codigo      (CSV o array)
       - epigrafe     | epigrafes                            (CSV o array)
-      - q | q_adv (ILIKE sobre titulo/resumen/contenido/CAST(informe_impacto AS TEXT))
+      - q | q_adv (FTS si existe o ILIKE sobre titulo/resumen/contenido/CAST(informe_impacto AS TEXT))
       - identificador (ILIKE)
       - control (ILIKE si existe columna)
     """
@@ -124,7 +132,7 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
     # ordenación segura
     sort_by = (params.get("sort_by", "created_at") or "").lower()
     sort_dir = (params.get("sort_dir", "desc") or "").lower()
-    if sort_by not in {"created_at", "titulo", "id", "likes", "dislikes"}:
+    if sort_by not in {"created_at", "titulo", "id", "likes", "dislikes", "relevancia"}:
         sort_by = "created_at"
     if sort_dir not in {"asc", "desc"}:
         sort_dir = "desc"
@@ -207,21 +215,27 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         if in_epi:
             where_sql_parts.append(in_epi[0]); args.extend(in_epi[1])
 
-        # texto: q_adv → ILIKE en columnas disponibles
-        if q_adv:
-            like_val = f"%{q_adv}%"
-            text_clauses = []
-            if has_titulo:
-                text_clauses.append(sql.SQL("i.titulo ILIKE %s")); args.append(like_val)
-            if has_resumen:
-                text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
-            if has_contenido:
-                text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
-            # incluir informe_impacto::text sólo si existe y la query tiene al menos 3 chars
-            if has_informe_imp and len(q_adv) >= 3:
-                text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s")); args.append(like_val)
-            if text_clauses:
-                where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
+        # texto: FTS (si existe y q>=2), si no ILIKE; 'informe_impacto' incluido
+        _use_fts_rank = False
+        if q_adv and len(q_adv) >= 2:
+            if _fts_available(conn):
+                # i.fts @@ plainto_tsquery('spanish', %s)
+                where_sql_parts.append(sql.SQL("i.fts @@ plainto_tsquery(%s, %s)"))
+                args.extend([_ts_lang(conn), q_adv])
+                _use_fts_rank = True
+            else:
+                like_val = f"%{q_adv}%"
+                text_clauses = []
+                if has_titulo:
+                    text_clauses.append(sql.SQL("i.titulo ILIKE %s")); args.append(like_val)
+                if has_resumen:
+                    text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
+                if has_contenido:
+                    text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
+                if has_informe_imp:
+                    text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s")); args.append(like_val)
+                if text_clauses:
+                    where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
 
         if identificador:
             where_sql_parts.append(sql.SQL("i.identificador ILIKE %s"))
@@ -266,23 +280,31 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             select_cols.append(sql.SQL("NULL AS seccion_nombre"))
 
-        # ORDER BY whitelisted
-        sort_by_sql = sql.SQL("i.created_at") if sort_by == "created_at" else sql.SQL("i." + sort_by)
-        sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
+        # ORDER BY (soporta relevancia con FTS)
+        if sort_by == "relevancia" and _use_fts_rank:
+            # ORDER BY ts_rank(i.fts, plainto_tsquery('spanish', %s)) [ASC|DESC]
+            order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s)) ")
+            order_params: List[Any] = [_ts_lang(conn), q_adv]
+            sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
+            order_clause = order_by_sql + sort_dir_sql
+        else:
+            sort_by_sql = sql.SQL("i.created_at") if sort_by == "created_at" else sql.SQL("i." + sort_by)
+            sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
+            order_clause = sort_by_sql + sql.SQL(" ") + sort_dir_sql
+            order_params = []
 
         base_select_sql = sql.SQL("""
             SELECT {cols}
             FROM items i
             {joins}
             {where}
-            ORDER BY {sort_by} {sort_dir}
+            ORDER BY {order_clause}
             LIMIT %s OFFSET %s
         """).format(
             cols=sql.SQL(", ").join(select_cols),
             joins=sql.SQL(" ").join(joins),
             where=where_sql,
-            sort_by=sort_by_sql,
-            sort_dir=sort_dir_sql
+            order_clause=order_clause,
         )
 
         count_sql = sql.SQL("SELECT COUNT(*) FROM items i ") + where_sql
@@ -292,7 +314,7 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         with conn.cursor() as cur:
             cur.execute(count_sql, args)
             total = cur.fetchone()[0]
-            cur.execute(base_select_sql, args + [limit, offset])
+            cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
 
     return {
