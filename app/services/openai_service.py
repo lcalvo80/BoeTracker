@@ -1,35 +1,118 @@
+# openai_service.py
 import os
 import json
+import time
+import logging
+
 from utils.helpers import extract_section, clean_code_block
 
+# --- Parámetros de robustez ---
+_OPENAI_TIMEOUT = 30           # segundos por request
+_OPENAI_MAX_RETRIES = 3        # reintentos de aplicación (además de los internos del SDK)
+_OPENAI_BACKOFF_BASE = 1.5     # factor base para backoff exponencial (1.5, 2, 3, ...)
+
+def _sleep_with_retry_after(exc, attempt):
+    """
+    Respeta Retry-After si existe (429), si no aplica backoff exponencial.
+    """
+    retry_after = None
+    try:
+        # SDK v1 expone response en e.response si es APIError
+        retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+    except Exception:
+        pass
+
+    if retry_after:
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            delay = ( _OPENAI_BACKOFF_BASE ** attempt )
+    else:
+        delay = ( _OPENAI_BACKOFF_BASE ** attempt )
+
+    delay = min(delay, 20.0)  # tapa superior razonable
+    logging.warning(f"⏳ Backoff {attempt}: durmiendo {delay:.1f}s...")
+    time.sleep(delay)
+
+def _chat_completion_with_retry(client, *, messages, model="gpt-4o", max_tokens=600, temperature=0.2):
+    """
+    Envoltorio robusto para una única llamada a chat.completions.create
+    - Reintenta en 429/5xx y timeouts.
+    - Respeta Retry-After.
+    - Propaga errores no recuperables.
+    """
+    last_err = None
+    for attempt in range(_OPENAI_MAX_RETRIES + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as e:
+            last_err = e
+            # Clasifica errores recuperables (timeout, 429, 5xx)
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            is_timeout = isinstance(e, TimeoutError) or "timeout" in str(e).lower()
+            is_rate_or_5xx = code in (429, 500, 502, 503, 504)
+
+            if attempt < _OPENAI_MAX_RETRIES and (is_rate_or_5xx or is_timeout):
+                logging.warning(f"⚠️ OpenAI call failed (attempt {attempt}/{_OPENAI_MAX_RETRIES}) code={code}: {e}")
+                _sleep_with_retry_after(e, attempt + 1)
+                continue
+
+            # No recuperable o sin intentos restantes
+            logging.error(f"❌ OpenAI call error (final): code={code} {e}")
+            raise
+    # Si llegara aquí (no debería), relanza último error
+    raise last_err  # pragma: no cover
+
 def get_openai_responses(title, content):
+    """
+    Mantiene la firma original y las 3 llamadas:
+    - título resumido
+    - resumen estructurado (texto) -> postprocesado a JSON usando extract_section
+    - impacto (texto) -> postprocesado a JSON usando extract_section
+
+    Devuelve:
+    (titulo_resumen: str, resumen_json: str, impacto_json: str)
+    """
     import openai
 
-    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Cliente v1 con timeout y reintentos internos del SDK (suma a nuestros reintentos de aplicación)
+    client = openai.OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        timeout=_OPENAI_TIMEOUT,
+        max_retries=0  # desactivamos los internos; controlamos nosotros
+    )
 
     try:
         # -------------------------
-        # TÍTULO RESUMIDO
+        # 1) TÍTULO RESUMIDO
         # -------------------------
         title_prompt = (
-            f"Resume este título oficial en un máximo de 10 palabras, usando lenguaje claro y directo. "
-            f"Evita frases largas o lenguaje técnico. El resultado debe ser adecuado como título corto de una web informativa: {title}"
+            "Resume este título oficial en un máximo de 10 palabras, usando lenguaje claro y directo. "
+            "Evita frases largas o lenguaje técnico. El resultado debe ser adecuado como título corto de una web informativa:\n\n"
+            f"{title}"
         )
+        title_messages = [
+            {"role": "system", "content": "Resumes títulos del BOE de forma clara y accesible para el público general. Devuelve solo el texto del título, sin comillas ni markdown."},
+            {"role": "user", "content": title_prompt},
+        ]
 
-        title_response = client.chat.completions.create(
+        title_resp = _chat_completion_with_retry(
+            client,
+            messages=title_messages,
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Resumes títulos del BOE de forma clara y accesible para el público general."},
-                {"role": "user", "content": title_prompt}
-            ],
             max_tokens=50,
-            temperature=0.3
+            temperature=0.3,
         )
-        titulo_resumen = title_response.choices[0].message.content.strip()
+        titulo_resumen = (title_resp.choices[0].message.content or "").strip()
         titulo_resumen = titulo_resumen.rstrip(".").strip()
 
         # -------------------------
-        # RESUMEN ESTRUCTURADO
+        # 2) RESUMEN ESTRUCTURADO (texto plano con encabezados)
         # -------------------------
         resumen_prompt = f"""
 Actúa como un experto asistente legal especializado en analizar publicaciones oficiales como el Boletín Oficial del Estado (BOE).
@@ -53,30 +136,35 @@ Resumen final de implicaciones o próximos pasos relevantes. Debe ocupar un solo
 
 Contenido:
 {content}
-"""
+""".strip()
 
-        resumen_response = client.chat.completions.create(
+        resumen_messages = [
+            {"role": "system", "content": "Eres un asistente legal. Devuelve solo texto plano sin markdown ni símbolos extra."},
+            {"role": "user", "content": resumen_prompt},
+        ]
+
+        resumen_resp = _chat_completion_with_retry(
+            client,
+            messages=resumen_messages,
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Eres un asistente legal."},
-                {"role": "user", "content": resumen_prompt}
-            ]
+            max_tokens=900,
+            temperature=0.2,
         )
-        resumen_text = clean_code_block(resumen_response.choices[0].message.content.strip())
+        resumen_text = clean_code_block((resumen_resp.choices[0].message.content or "").strip())
 
         resumen_json = {
-            "context": extract_section(resumen_text, "Contexto"),
+            "context": extract_section(resumen_text, "Contexto") or "",
             "key_changes": [
-                line.strip() for line in extract_section(resumen_text, "Cambios clave").split("\n") if line.strip()
+                line.strip() for line in (extract_section(resumen_text, "Cambios clave") or "").split("\n") if line.strip()
             ],
             "key_dates_events": [
-                line.strip() for line in extract_section(resumen_text, "Fechas clave").split("\n") if line.strip()
+                line.strip() for line in (extract_section(resumen_text, "Fechas clave") or "").split("\n") if line.strip()
             ],
-            "conclusion": extract_section(resumen_text, "Conclusión")
+            "conclusion": extract_section(resumen_text, "Conclusión") or "",
         }
 
         # -------------------------
-        # IMPACTO LEGISLATIVO
+        # 3) IMPACTO LEGISLATIVO (texto plano con encabezados)
         # -------------------------
         impacto_prompt = f"""
 Actúa como un analista legislativo con experiencia en la evaluación de normativas oficiales publicadas en el Boletín Oficial del Estado (BOE).
@@ -101,38 +189,47 @@ Sugerencias para los afectados o entidades implicadas. Enuméralas, una por lín
 
 Contenido:
 {content}
-"""
+""".strip()
 
-        impacto_response = client.chat.completions.create(
+        impacto_messages = [
+            {"role": "system", "content": "Eres un analista legislativo. Devuelve solo texto plano sin markdown."},
+            {"role": "user", "content": impacto_prompt},
+        ]
+
+        impacto_resp = _chat_completion_with_retry(
+            client,
+            messages=impacto_messages,
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Eres un analista legislativo."},
-                {"role": "user", "content": impacto_prompt}
-            ]
+            max_tokens=900,
+            temperature=0.2,
         )
-
-        impacto_text = clean_code_block(impacto_response.choices[0].message.content.strip())
+        impacto_text = clean_code_block((impacto_resp.choices[0].message.content or "").strip())
 
         impacto_json = {
             "afectados": [
-                line.strip() for line in extract_section(impacto_text, "Afectados").split("\n") if line.strip()
+                line.strip() for line in (extract_section(impacto_text, "Afectados") or "").split("\n") if line.strip()
             ],
             "cambios_operativos": [
-                line.strip() for line in extract_section(impacto_text, "Cambios operativos").split("\n") if line.strip()
+                line.strip() for line in (extract_section(impacto_text, "Cambios operativos") or "").split("\n") if line.strip()
             ],
             "riesgos_potenciales": [
-                line.strip() for line in extract_section(impacto_text, "Riesgos potenciales").split("\n") if line.strip()
+                line.strip() for line in (extract_section(impacto_text, "Riesgos potenciales") or "").split("\n") if line.strip()
             ],
             "beneficios_previstos": [
-                line.strip() for line in extract_section(impacto_text, "Beneficios previstos").split("\n") if line.strip()
+                line.strip() for line in (extract_section(impacto_text, "Beneficios previstos") or "").split("\n") if line.strip()
             ],
             "recomendaciones": [
-                line.strip() for line in extract_section(impacto_text, "Recomendaciones").split("\n") if line.strip()
-            ]
+                line.strip() for line in (extract_section(impacto_text, "Recomendaciones") or "").split("\n") if line.strip()
+            ],
         }
 
-        return titulo_resumen, json.dumps(resumen_json, ensure_ascii=False), json.dumps(impacto_json, ensure_ascii=False)
+        # Devuelve exactamente como antes
+        return (
+            titulo_resumen,
+            json.dumps(resumen_json, ensure_ascii=False),
+            json.dumps(impacto_json, ensure_ascii=False),
+        )
 
     except Exception as e:
-        print(f"❌ Error con OpenAI: {e}")
-        return "", json.dumps({}), json.dumps({})
+        logging.error(f"❌ Error con OpenAI: {e}")
+        return "", json.dumps({}, ensure_ascii=False), json.dumps({}, ensure_ascii=False)
