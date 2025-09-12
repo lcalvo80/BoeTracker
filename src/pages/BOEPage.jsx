@@ -12,7 +12,7 @@ const ITEMS_PER_PAGE = 12;
 
 const toIsoDate = (d) =>
   d instanceof Date && !isNaN(d)
-    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // YYYY-MM-DD
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // YYYY-MM-D
     : null;
 
 const formatDateEsLong = (dateObj) =>
