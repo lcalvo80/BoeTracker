@@ -11,6 +11,13 @@ const MetaPill = ({ label, value }) => {
   );
 };
 
+const looksLikeGzipBase64 = (s) => {
+  if (!s || typeof s !== "string") return false;
+  if (/^H4sI[A-Za-z0-9+/=]{10,}$/.test(s)) return true; // típico GZIP+Base64
+  if (/^[A-Za-z0-9+/=]{50,}$/.test(s) && !/\s/.test(s)) return true; // base64 larga sin espacios
+  return false;
+};
+
 const ResultCard = ({
   item,
   compact = false,
@@ -22,12 +29,11 @@ const ResultCard = ({
   getPublishedDate,
   getEpigrafe,
   getItemTitle,     // título resumido
-  getFullTitle,     // título completo (opcional)
-  getIdentifier,    // identificador (opcional)
-  getSeccion,       // sección (opcional)
-  getDepartamento,  // departamento (opcional)
+  getFullTitle,     // título completo
+  getIdentifier,    // identificador
+  getSeccion,       // sección
+  getDepartamento,  // departamento
 }) => {
-  // --------- Resolución tolerante de campos ----------
   const fecha = getPublishedDate ? getPublishedDate(item) : "—";
 
   const identificador = getIdentifier
@@ -67,13 +73,12 @@ const ResultCard = ({
 
   const epigrafe = getEpigrafe
     ? getEpigrafe(item)
-    : (item?.epigrafe_nombre ??
+    : (item?.epigrafe?.nombre ??
+       item?.epigrafe_nombre ??
        item?.epigrafe_titulo ??
        item?.epigrafe ??
        (Array.isArray(item?.epigrafes) ? item.epigrafes[0] : null) ??
        "—");
-
-  // ----------------------------------------------------
 
   return (
     <article
@@ -81,7 +86,7 @@ const ResultCard = ({
       aria-labelledby={`pub-${item?.id || identificador}-title`}
     >
       <div className="p-4 sm:p-5">
-        {/* Fila superior: Identificador + Fecha */}
+        {/* Cabecera: Identificador + Fecha */}
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-600">
           <span className="font-mono text-[11px] text-gray-800">
             ID: {identificador || "—"}
@@ -90,12 +95,8 @@ const ResultCard = ({
           <span className="tabular-nums">{fecha}</span>
         </div>
 
-        {/* Título resumido en negrita */}
-        <button
-          type="button"
-          onClick={onOpen}
-          className="mt-2 block text-left w-full"
-        >
+        {/* Título resumido en negrita (clic abre detalle) */}
+        <button type="button" onClick={onOpen} className="mt-2 block text-left w-full">
           <h3
             id={`pub-${item?.id || identificador}-title`}
             className="text-gray-900 font-semibold text-base sm:text-lg leading-snug line-clamp-2"
@@ -112,14 +113,12 @@ const ResultCard = ({
           <MetaPill label="Epígrafe" value={epigrafe} />
         </div>
 
-        {/* Resumen breve opcional si no es compacto */}
-        {!compact && item?.resumen && (
-          <p className="mt-3 text-sm text-gray-700 line-clamp-3">
-            {item.resumen}
-          </p>
+        {/* Resumen breve si no es compacto y no parece base64/gzip */}
+        {!compact && item?.resumen && !looksLikeGzipBase64(item.resumen) && (
+          <p className="mt-3 text-sm text-gray-700 line-clamp-3">{item.resumen}</p>
         )}
 
-        {/* Footer de acciones */}
+        {/* Acciones */}
         <div className="mt-3 flex items-center justify-between">
           <button
             type="button"
@@ -140,15 +139,13 @@ const ResultCard = ({
           </button>
         </div>
 
-        {/* Contenido expandible: Título completo */}
+        {/* Desplegable: Título completo */}
         {expanded && (
           <div
             id={`rc-${identificador}-expand`}
             className="mt-3 rounded-lg border border-gray-100 bg-gray-50 p-3 text-sm text-gray-800"
           >
-            <div className="font-medium text-gray-900 mb-1">
-              Título completo
-            </div>
+            <div className="font-medium text-gray-900 mb-1">Título completo</div>
             <p className="leading-relaxed">{tituloCompleto}</p>
           </div>
         )}
