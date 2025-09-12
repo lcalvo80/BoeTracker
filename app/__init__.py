@@ -1,6 +1,7 @@
 # app/__init__.py
 from flask import Flask, jsonify
 from flask_cors import CORS
+from flask_sock import Sock   # ★ NUEVO
 import os
 
 def create_app(config: dict | None = None):
@@ -15,7 +16,7 @@ def create_app(config: dict | None = None):
 
     # ================= CORS =================
     # Define FRONTEND_ORIGIN en Railway con el dominio exacto del frontend
-    # ej: https://boefrontend-production.up.railway.app
+    # ej: https://boefrontend-production-7205.up.railway.app
     FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
     CORS(
@@ -47,5 +48,19 @@ def create_app(config: dict | None = None):
     @app.route("/api/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok"}), 200
+
+    # ================= WebSocket ================= ★ NUEVO
+    sock = Sock(app)
+
+    @sock.route("/ws")
+    def ws_handler(ws):
+        # Saludo inicial
+        ws.send('{"type":"hello","msg":"ws up"}')
+        # Loop simple (eco)
+        while True:
+            data = ws.receive()
+            if data is None:
+                break
+            ws.send(data)
 
     return app
