@@ -1,4 +1,3 @@
-// src/pages/BOEPage.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Calendar from "react-calendar";
 import "react-calendar/dist/Calendar.css";
@@ -63,6 +62,7 @@ const getItemTitle = (item) => {
 const getIdentificador = (item) =>
   item?.identificador ?? item?.id ?? item?.boe_id ?? "—";
 
+// IMPORTANTE: no hacer fallback al resumen. Si no hay título completo, devolvemos "".
 const getFullTitle = (item) => {
   const t =
     item?.titulo ??
@@ -71,7 +71,7 @@ const getFullTitle = (item) => {
     item?.title ??
     item?.name ??
     null;
-  return (t && String(t).trim()) || getItemTitle(item) || "—";
+  return (t && String(t).trim()) || "";
 };
 
 const getSeccion = (item) =>
