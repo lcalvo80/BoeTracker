@@ -16,7 +16,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8000
-
-# Importante: usamos la factory "app:create_app()"
-# y el worker con WebSocket: geventwebsocket
-CMD ["sh", "-c", "gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:${PORT:-8000} 'app:create_app()'"]
+CMD ["sh", "-c", "PORT=${PORT:-8000}; echo PORT=$PORT; exec python -m hypercorn --bind 0.0.0.0:${PORT} --workers 1 app.asgi:app"]
