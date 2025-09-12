@@ -1,38 +1,25 @@
 // src/services/http.js
 import axios from "axios";
 
-// Si NO hay REACT_APP_API_BASE_URL, usamos '/api' (same-origin detrás de reverse proxy)
-const API = (process.env.REACT_APP_API_BASE_URL || "/api").replace(/\/$/, "");
+/** Permite pasar:
+ *  - REACT_APP_API_BASE_URL="https://boetracker-production-7205.up.railway.app"
+ *  - o dejarlo vacío para usar "/api" (edge/proxy)
+ */
+const RAW = (process.env.REACT_APP_API_BASE_URL || "/api").replace(/\/+$/, "");
+
+// Si RAW empieza por http(s), añade sufijo /api; si es relativo ("/api"), úsalo tal cual
+const API = RAW.startsWith("http") ? `${RAW}/api` : RAW;
 
 export const api = axios.create({
   baseURL: API,
   timeout: 15000,
-  headers: { "Content-Type": "application/json" },
-  // withCredentials: true, // descomenta si usas cookies/sesión cross-site
+  headers: { "Content-Type": "application/json", Accept: "application/json" },
 });
 
-/** Crea un AbortController para cancelación desde el FE (axios v1 soporta `signal`) */
-export const createAbortController = () => new AbortController();
-
-api.interceptors.response.use(
-  (response) => response,
-  (err) => {
-    // Ignora logs ruidosos si la petición fue cancelada
-    if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED" || err?.name === "AbortError") {
-      return Promise.reject(err);
-    }
-    const url = err?.config?.url || "";
-    const status = err?.response?.status;
-    console.error(`API error: ${status || err.message} → ${url}`);
-    return Promise.reject(err);
-  }
-);
-
-// Helpers que devuelven directamente `data` y aceptan `config` (incluye `signal`)
-export const get   = (path, config)           => api.get(path, config).then((r) => r.data);
-export const post  = (path, data, config)     => api.post(path, data, config).then((r) => r.data);
-export const del   = (path, config)           => api.delete(path, config).then((r) => r.data);
-export const put   = (path, data, config)     => api.put(path, data, config).then((r) => r.data);
-export const patch = (path, data, config)     => api.patch(path, data, config).then((r) => r.data);
+export const get   = (path, cfg)           => api.get(path, cfg).then(r => r.data);
+export const post  = (path, data, cfg)     => api.post(path, data, cfg).then(r => r.data);
+export const del   = (path, cfg)           => api.delete(path, cfg).then(r => r.data);
+export const put   = (path, data, cfg)     => api.put(path, data, cfg).then(r => r.data);
+export const patch = (path, data, cfg)     => api.patch(path, data, cfg).then(r => r.data);
 
 export default api;

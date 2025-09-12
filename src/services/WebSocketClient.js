@@ -1,17 +1,40 @@
 // src/services/WebSocketClient.js
 
+// Detecta entorno
 const isProd = process.env.NODE_ENV === "production";
-const RAW_WS_BASE = (isProd
-  ? process.env.REACT_APP_WS_BASE_URL
-  : process.env.REACT_APP_WS_BASE_URL_DEV
-) || "";
 
-/** Normaliza base y convierte http(s) -> ws(s) */
+// Permite configurar un backend WS distinto vía envs
+// Producción: REACT_APP_WS_BASE_URL (ej: https://backend-prod.up.railway.app)
+// Desarrollo: REACT_APP_WS_BASE_URL_DEV (ej: http://localhost:8000)
+const RAW_WS_BASE =
+  (isProd
+    ? process.env.REACT_APP_WS_BASE_URL
+    : process.env.REACT_APP_WS_BASE_URL_DEV) || "";
+
+/** Base por defecto: mismo origen del front (ideal en Railway) */
+const DEFAULT_WS_BASE = (() => {
+  if (typeof window === "undefined") return "";
+  // window.location.origin => ej: https://boefrontend-production.up.railway.app
+  return window.location.origin;
+})();
+
+/** Normaliza base, convierte http(s)->ws(s) y elimina puertos en wss:// */
 function normalizeBase(base) {
-  if (!base) return "";
-  let b = base.trim().replace(/\/+$/, "");
-  if (b.startsWith("http://"))  b = "ws://"  + b.slice("http://".length);
+  const fallback = DEFAULT_WS_BASE || "";
+  let b = (base || fallback).trim().replace(/\/+$/, "");
+  if (!b) return b;
+
+  // http(s) -> ws(s)
+  if (b.startsWith("http://")) b = "ws://" + b.slice("http://".length);
   if (b.startsWith("https://")) b = "wss://" + b.slice("https://".length);
+
+  // En producción con WSS no debemos fijar puertos (Railway entra por 443)
+  if (b.startsWith("wss://")) {
+    b = b.replace(
+      /^wss:\/\/([^/:\s]+)(:\d+)?(.*)?$/,
+      (_m, host, _port, rest = "") => `wss://${host}${rest}`
+    );
+  }
   return b;
 }
 
@@ -50,7 +73,6 @@ export class WebSocketClient {
     onStatus,
     onRawMessage,
   } = {}) {
-    this.base = base;
     this.path = path;
     this.token = token;
     this.tokenProvider = tokenProvider;
@@ -72,13 +94,16 @@ export class WebSocketClient {
     this._pongTimer = null;
     this._reconnectTimer = null;
 
+    // Fallback al origin del front si no hay envs
+    this.base = normalizeBase(base || DEFAULT_WS_BASE);
     if (!this.base) {
-      console.warn("[WS] Deshabilitado: falta REACT_APP_WS_BASE_URL / _DEV");
+      console.warn("[WS] No hay base válida para WS.");
       return;
     }
 
     this._connect();
 
+    // Gestión de visibilidad/red para optimizar latido y reconexión
     if (typeof document !== "undefined" && document.addEventListener) {
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) this._stopHeartbeat();
@@ -92,14 +117,22 @@ export class WebSocketClient {
   }
 
   _emitStatus(s) {
-    try { this.onStatus && this.onStatus(s); } catch (e) { /* noop */ }
+    try {
+      this.onStatus && this.onStatus(s);
+    } catch {
+      /* noop */
+    }
   }
 
   async _buildUrl() {
     const baseUrl = joinUrl(this.base, this.path || "/ws");
     let tk = this.token;
     if (!tk && this.tokenProvider) {
-      try { tk = await this.tokenProvider(); } catch (e) { console.warn("[WS] tokenProvider error:", e); }
+      try {
+        tk = await this.tokenProvider();
+      } catch (e) {
+        console.warn("[WS] tokenProvider error:", e);
+      }
     }
     if (!tk) return baseUrl;
     const sep = baseUrl.includes("?") ? "&" : "?";
@@ -133,23 +166,41 @@ export class WebSocketClient {
     };
 
     this.socket.onmessage = (evt) => {
+      // Callback crudo (útil para logs/telemetría)
       if (this.onRawMessage) {
-        try { this.onRawMessage(evt); } catch (e) { console.error("[WS] onRawMessage error:", e); }
+        try {
+          this.onRawMessage(evt);
+        } catch (e) {
+          console.error("[WS] onRawMessage error:", e);
+        }
       }
-      // Detección de pong
+
       try {
         const raw = evt.data;
         let payload = raw;
         if (this.autoJson && typeof raw === "string") {
-          try { payload = JSON.parse(raw); } catch { /* keep string */ }
+          try {
+            payload = JSON.parse(raw);
+          } catch {
+            /* mantener string si no es JSON */
+          }
         }
-        // Considera pong si viene {type:'pong'} o string 'pong'
-        const isPong = (payload && typeof payload === "object" && payload.type === "pong") || (payload === "pong");
+
+        // Detección de pong: {type:'pong'} o "pong"
+        const isPong =
+          (payload && typeof payload === "object" && payload.type === "pong") ||
+          payload === "pong";
         if (isPong) this._clearPongTimeout();
 
-        // Notifica a subs
+        // Notifica a los subs
         const dataToSend = this.autoJson ? payload : raw;
-        this.subscribers.forEach((h) => { try { h(dataToSend); } catch (e) { console.error("[WS] Handler error:", e); } });
+        this.subscribers.forEach((h) => {
+          try {
+            h(dataToSend);
+          } catch (e) {
+            console.error("[WS] Handler error:", e);
+          }
+        });
       } catch (e) {
         console.error("[WS] onmessage error:", e);
       }
@@ -160,7 +211,7 @@ export class WebSocketClient {
       console.error("[WS] Error:", e);
     };
 
-    this.socket.onclose = (e) => {
+    this.socket.onclose = () => {
       this._stopHeartbeat();
       this._emitStatus("closed");
       if (this._closing) {
@@ -172,8 +223,8 @@ export class WebSocketClient {
   }
 
   _scheduleReconnect() {
-    // backoff exponencial con jitter (full jitter)
-    const base = Math.min(300 * (2 ** this.retries), this.maxBackoff);
+    // Backoff exponencial con jitter (full jitter)
+    const base = Math.min(300 * 2 ** this.retries, this.maxBackoff);
     const delay = Math.floor(Math.random() * base);
     this.retries += 1;
     console.warn(`[WS] Desconectado. Reintentando en ~${delay}ms...`);
@@ -183,7 +234,7 @@ export class WebSocketClient {
   }
 
   _maybeReconnectSoon() {
-    // Si vuelve la red, intenta reconectar antes
+    // Si vuelve la red o el doc se muestra, intenta antes
     if (!this._closing && (!this.socket || this.socket.readyState !== WebSocket.OPEN)) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = setTimeout(() => this._connect(), 200);
@@ -210,7 +261,9 @@ export class WebSocketClient {
     if (!this.pongTimeout) return;
     this._pongTimer = setTimeout(() => {
       console.warn("[WS] Pong timeout. Forzando reconexión.");
-      try { this.socket?.close(); } catch {}
+      try {
+        this.socket?.close();
+      } catch {}
       // onclose programará la reconexión
     }, this.pongTimeout);
   }
@@ -253,7 +306,9 @@ export class WebSocketClient {
     this.token = nextToken ?? this.token;
     if (this.socket?.readyState === WebSocket.OPEN) {
       // Cierra para renegociar URL con el token nuevo
-      try { this.socket.close(); } catch {}
+      try {
+        this.socket.close();
+      } catch {}
     } else {
       this._maybeReconnectSoon();
     }
@@ -263,6 +318,7 @@ export class WebSocketClient {
     this.subscribers.add(handler);
     return () => this.offMessage(handler);
   }
+
   offMessage(handler) {
     this.subscribers.delete(handler);
   }
@@ -273,8 +329,12 @@ export class WebSocketClient {
     this._stopHeartbeat();
     clearTimeout(this._reconnectTimer);
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
-      try { this.socket.close(); } catch {}
+      try {
+        this.socket.close();
+      } catch {}
     }
     this.socket = null;
   }
 }
+
+export default WebSocketClient;
