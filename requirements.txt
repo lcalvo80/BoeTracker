@@ -8,3 +8,4 @@ gunicorn
 flask-sock
 gevent
 gevent-websocket
+hypercorn
