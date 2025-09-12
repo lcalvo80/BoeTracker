@@ -12,7 +12,7 @@ const ITEMS_PER_PAGE = 12;
 
 const toIsoDate = (d) =>
   d instanceof Date && !isNaN(d)
-    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // YYYY-MM-D
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // YYYY-MM-DD
     : null;
 
 const formatDateEsLong = (dateObj) =>
@@ -36,7 +36,7 @@ const getPublishedDate = (item) => {
   return "—";
 };
 
-// NUEVO: resolver epígrafe con tolerancia a distintas variantes de campo
+// Epígrafe tolerante
 const getEpigrafe = (item) => {
   const e =
     item?.epigrafe_nombre ??
@@ -50,7 +50,7 @@ const getEpigrafe = (item) => {
   return String(e).trim() || "—";
 };
 
-// NUEVO: obtener título resumido (fallback al completo si no existe)
+// Título resumido (fallback al completo)
 const getItemTitle = (item) => {
   const t =
     item?.titulo_resumen ??
@@ -63,6 +63,37 @@ const getItemTitle = (item) => {
 
   return (t && String(t).trim()) || "—";
 };
+
+// NUEVO: identificador tolerante
+const getIdentificador = (item) =>
+  item?.identificador ?? item?.id ?? item?.boe_id ?? "—";
+
+// NUEVO: título completo (fallback a resumido)
+const getFullTitle = (item) => {
+  const t =
+    item?.titulo ??
+    item?.titulo_completo ??
+    item?.tituloCompleto ??
+    item?.title ??
+    item?.name ??
+    null;
+  return (t && String(t).trim()) || getItemTitle(item) || "—";
+};
+
+// NUEVO: sección y departamento tolerantes
+const getSeccion = (item) =>
+  item?.seccion?.nombre ??
+  item?.seccion_nombre ??
+  item?.seccion ??
+  (Array.isArray(item?.secciones) ? item.secciones[0] : null) ??
+  "—";
+
+const getDepartamento = (item) =>
+  item?.departamento?.nombre ??
+  item?.departamento_nombre ??
+  item?.departamento ??
+  (Array.isArray(item?.departamentos) ? item.departamentos[0] : null) ??
+  "—";
 
 const inputBase =
   "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm placeholder:text-gray-400 " +
@@ -180,9 +211,9 @@ const BOEPage = () => {
         setTotalItems(0);
         setError(
           err?.response?.data?.error ||
-          err?.response?.data?.detail ||
-          err?.message ||
-          "Error al cargar publicaciones."
+            err?.response?.data?.detail ||
+            err?.message ||
+            "Error al cargar publicaciones."
         );
       } finally {
         setLoading(false);
@@ -503,7 +534,11 @@ const BOEPage = () => {
                   compact={compactMode}
                   getPublishedDate={getPublishedDate}
                   getEpigrafe={getEpigrafe}
-                  getItemTitle={getItemTitle}  // <-- NUEVO
+                  getItemTitle={getItemTitle}
+                  getFullTitle={getFullTitle}
+                  getIdentifier={getIdentificador}
+                  getSeccion={getSeccion}
+                  getDepartamento={getDepartamento}
                   expanded={expandedIds.includes(item.id)}
                   onToggle={(e) => toggleExpanded(e, item.id)}
                   onOpen={() =>
