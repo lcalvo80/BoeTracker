@@ -4,10 +4,9 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import api from "../services/http";
 
 /**
- * BOEDetailPage.jsx — UI alineada con mockups + backend /api/items
- * - Detalle, resumen, impacto, comentarios, likes/dislikes
- * - Acordeones, chips, botón PDF rojo, copiar
- * - Inflado base64+gzip para content/summary/html/epigrafe/títulos/impacto
+ * BOEDetailPage.jsx — UI: H1= titulo_resumen, subtítulo con título largo,
+ * metadatos verticales, botón PDF, resumen dividido (contexto/fechas/conclusión),
+ * resto igual (contenido, impacto, metadatos, comentarios).
  */
 
 // =====================
@@ -63,12 +62,10 @@ const maybeInflateBase64Gzip = async (s) => {
   }
 };
 
-// Detecta si un string parece HTML para decidir render
 const looksLikeHTML = (s) => typeof s === "string" && /<\/?[a-z][\s\S]*>/i.test(s);
 
 // =====================
-// Fetch helpers (backend /api/items)
-// >>> IMPORTANTE: no anteponer "/api" aquí; deja que axios.baseURL lo ponga.
+// API helpers (baseURL ya incluye /api)
 // =====================
 async function fetchDetail(id, signal) {
   const { data } = await api.get(`items/${encodeURIComponent(id)}`, { signal });
@@ -88,10 +85,7 @@ async function fetchImpacto(id, signal) {
 }
 async function fetchComments(id, page = 1, limit = 10, signal) {
   try {
-    const { data } = await api.get(`items/${encodeURIComponent(id)}/comments`, {
-      params: { page, limit },
-      signal,
-    });
+    const { data } = await api.get(`items/${encodeURIComponent(id)}/comments`, { params: { page, limit }, signal });
     return data || { items: [], page: 1, pages: 0, total: 0, limit };
   } catch {
     return { items: [], page: 1, pages: 0, total: 0, limit };
@@ -110,6 +104,27 @@ async function dislikeItem(id) {
   return data;
 }
 
+// ===== Resumen helpers =====
+function deriveSummaryParts(rawStruct, rawSummary) {
+  // Prioriza objeto estructurado metadata.resumen { contexto, fechas, conclusion }
+  const base = {
+    contexto: null,
+    fechas: null,     // array o string
+    conclusion: null,
+  };
+  if (rawStruct && typeof rawStruct === "object") {
+    return {
+      contexto: rawStruct.contexto ?? null,
+      fechas: rawStruct.fechas ?? null,
+      conclusion: rawStruct.conclusion ?? null,
+    };
+  }
+  if (typeof rawSummary === "string" && rawSummary.trim()) {
+    return { ...base, contexto: rawSummary.trim() };
+  }
+  return base;
+}
+
 // =====================
 // Vista principal
 // =====================
@@ -118,9 +133,8 @@ export default function BOEDetailPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
-  const [detail, setDetail] = useState(null);
   const [inflated, setInflated] = useState(null);
-  const [summary, setSummary] = useState(null);
+  const [summaryParts, setSummaryParts] = useState({ contexto: null, fechas: null, conclusion: null });
   const [impacto, setImpacto] = useState(null);
 
   const [likes, setLikes] = useState(null);
@@ -138,7 +152,6 @@ export default function BOEDetailPage() {
 
   const controllerRef = useRef(null);
 
-  // Permite override por query param ?endpoint=https://...
   const explicitEndpoint = searchParams.get("endpoint");
   const useExplicit = explicitEndpoint && /^https?:\/\//i.test(explicitEndpoint);
 
@@ -155,20 +168,24 @@ export default function BOEDetailPage() {
       try {
         let raw;
         if (useExplicit) {
-          // NO baseURL + endpoint absoluto
           const { data } = await api.get(explicitEndpoint, { signal: ac.signal, baseURL: "" });
           raw = data;
         } else {
           raw = await fetchDetail(id, ac.signal);
         }
 
-        // Normaliza nombres al shape del FE
+        // Normalización de nombres
         const norm = {
           identificador: raw.identificador ?? id,
-          title: raw.titulo ?? raw.title ?? "",
+          // Títulos
+          titulo_resumen: raw.titulo_resumen ?? null,
+          titulo: raw.titulo ?? raw.title ?? "",
+          titulo_completo: raw.titulo_completo ?? null,
+          // Texto/HTML
           summary: raw.resumen ?? raw.summary ?? null,
           content: raw.contenido ?? raw.content ?? null,
           html: raw.html ?? null,
+          // Metas
           epigrafe: raw.epigrafe ?? null,
           section: raw.seccion_nombre || raw.seccion || raw.seccion_codigo || null,
           departamento: raw.departamento_nombre || raw.departamento || raw.departamento_codigo || null,
@@ -184,22 +201,24 @@ export default function BOEDetailPage() {
           },
           likes: raw.likes ?? null,
           dislikes: raw.dislikes ?? null,
-          full_title: raw.titulo_completo ?? null,
-          titulo_completo: raw.titulo_completo ?? null,
         };
 
         // Infla campos que puedan venir base64+gzip
-        const toInflateKeys = ["content", "summary", "html", "epigrafe", "full_title", "titulo_completo"];
+        const toInflateKeys = ["summary", "content", "html", "epigrafe", "titulo", "titulo_completo", "titulo_resumen"];
         for (const k of toInflateKeys) {
           if (typeof norm[k] === "string") {
             norm[k] = await maybeInflateBase64Gzip(norm[k]);
           }
         }
 
-        setDetail(norm);
         setInflated(norm);
         setLikes(norm.likes);
         setDislikes(norm.dislikes);
+
+        // Construye resumen dividido
+        const structFromMeta = raw?.metadata?.resumen;
+        const parts = deriveSummaryParts(structFromMeta, norm.summary);
+        setSummaryParts(parts);
       } catch (err) {
         if (err?.name !== "AbortError") setError(err);
       } finally {
@@ -210,29 +229,16 @@ export default function BOEDetailPage() {
     return () => ac.abort();
   }, [id, explicitEndpoint, useExplicit]);
 
-  // -------- Carga de resumen & impacto (lazy) --------
+  // -------- Carga de impacto (lazy) --------
   useEffect(() => {
-    if (!id || useExplicit) return; // si endpoint externo, no asumimos rutas derivadas
+    if (!id || useExplicit) return;
     const ac = new AbortController();
     (async () => {
       try {
-        const [r, imp] = await Promise.allSettled([
-          fetchResumen(id, ac.signal),
-          fetchImpacto(id, ac.signal),
-        ]);
-        if (r.status === "fulfilled") {
-          let val = r.value;
-          if (typeof val === "string") val = await maybeInflateBase64Gzip(val);
-          setSummary(val ?? null);
-        }
-        if (imp.status === "fulfilled") {
-          let ival = imp.value;
-          if (typeof ival === "string") ival = await maybeInflateBase64Gzip(ival);
-          setImpacto(ival ?? null);
-        }
-      } catch {
-        // no-op
-      }
+        let ival = await fetchImpacto(id, ac.signal);
+        if (typeof ival === "string") ival = await maybeInflateBase64Gzip(ival);
+        setImpacto(ival ?? null);
+      } catch {}
     })();
     return () => ac.abort();
   }, [id, useExplicit]);
@@ -293,12 +299,9 @@ export default function BOEDetailPage() {
       const created = await postComment(id, { text, author: commentAuthor.trim() || undefined });
       setCommentText("");
       setCommentAuthor("");
-      // prepend optimista
       setComments((prev) => [created, ...prev]);
       setCTotal((t) => t + 1);
-    } catch {
-      // no-op
-    } finally {
+    } catch {} finally {
       setAddingComment(false);
     }
   }, [id, useExplicit, commentText, commentAuthor]);
@@ -330,10 +333,13 @@ export default function BOEDetailPage() {
   if (!inflated) return null;
 
   const {
-    title,
+    titulo_resumen,
+    titulo,
+    titulo_completo,
     section,
     departamento,
     epigrafe,
+    identificador,
     control,
     created_at,
     url_pdf,
@@ -341,35 +347,19 @@ export default function BOEDetailPage() {
     metadata,
     html,
     content,
-    full_title,
-    titulo_completo,
-    identificador,
   } = inflated;
 
   const displayDate = created_at
     ? new Date(created_at).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "2-digit" })
     : null;
 
-  const completeTitle = (full_title || titulo_completo || title || "").trim();
-  const showCompleteTitleBlock = completeTitle && completeTitle !== (title || "").trim();
-
-  // Chips estilo mockup
-  const chips = [
-    section ? { k: "Sección", v: section } : null,
-    departamento ? { k: "Departamento", v: departamento } : null,
-    epigrafe ? { k: "Epígrafe", v: epigrafe } : null,
-    identificador ? { k: "Identificador", v: identificador } : null,
-    control ? { k: "Control", v: control } : null,
-    displayDate ? { k: "Fecha publicación", v: displayDate } : null,
-  ].filter(Boolean);
+  const longTitle = (titulo_completo || titulo || "").trim();
 
   // Impacto: si llega JSON string -> parse
   let impactoNode = null;
   if (impacto) {
     let parsed = impacto;
-    if (typeof parsed === "string") {
-      try { parsed = JSON.parse(parsed); } catch {}
-    }
+    if (typeof parsed === "string") { try { parsed = JSON.parse(parsed); } catch {} }
     if (parsed && typeof parsed === "object") {
       const entries = Object.entries(parsed);
       impactoNode = (
@@ -389,15 +379,13 @@ export default function BOEDetailPage() {
         </div>
       );
     } else {
-      impactoNode = (
-        <p className="whitespace-pre-wrap text-gray-800">{String(impacto)}</p>
-      );
+      impactoNode = <p className="whitespace-pre-wrap text-gray-800">{String(impacto)}</p>;
     }
   }
 
   return (
     <main role="main" className="mx-auto max-w-5xl p-4 md:p-6">
-      {/* Top bar: volver + votos + PDF rojo */}
+      {/* Top bar: volver + votos */}
       <div className="mb-3 flex items-center justify-between">
         <button
           onClick={handleBack}
@@ -412,7 +400,64 @@ export default function BOEDetailPage() {
           <button onClick={handleDislike} className="rounded-xl border px-3 py-1.5 text-sm">
             👎 <span className="tabular-nums">{dislikes ?? 0}</span>
           </button>
-          {url_pdf && (
+        </div>
+      </div>
+
+      {/* Cabecera: H1 = titulo_resumen, subtítulo = título largo */}
+      <div className="rounded-2xl border bg-white p-5 shadow-sm">
+        <h1 className="text-2xl font-bold leading-snug text-gray-900">
+          {titulo_resumen || titulo || "Documento BOE"}
+        </h1>
+
+        {longTitle && (
+          <p className="mt-2 text-gray-800 whitespace-pre-wrap">
+            {longTitle}
+          </p>
+        )}
+
+        {/* Metadatos en vertical en orden solicitado */}
+        <dl className="mt-4 space-y-2 text-sm">
+          {section && (
+            <div>
+              <dt className="text-gray-500">Sección</dt>
+              <dd className="text-gray-900">{section}</dd>
+            </div>
+          )}
+          {departamento && (
+            <div>
+              <dt className="text-gray-500">Departamento</dt>
+              <dd className="text-gray-900">{departamento}</dd>
+            </div>
+          )}
+          {epigrafe && (
+            <div>
+              <dt className="text-gray-500">Epígrafe</dt>
+              <dd className="text-gray-900">{epigrafe}</dd>
+            </div>
+          )}
+          {identificador && (
+            <div>
+              <dt className="text-gray-500">Identificador</dt>
+              <dd className="text-gray-900 break-words">{identificador}</dd>
+            </div>
+          )}
+          {control && (
+            <div>
+              <dt className="text-gray-500">Control</dt>
+              <dd className="text-gray-900 break-words">{control}</dd>
+            </div>
+          )}
+          {displayDate && (
+            <div>
+              <dt className="text-gray-500">Fecha publicación</dt>
+              <dd className="text-gray-900">{displayDate}</dd>
+            </div>
+          )}
+        </dl>
+
+        {/* Botón PDF */}
+        {url_pdf && (
+          <div className="mt-4">
             <a
               href={url_pdf}
               target="_blank"
@@ -421,37 +466,46 @@ export default function BOEDetailPage() {
             >
               Ver PDF
             </a>
-          )}
-        </div>
-      </div>
-
-      {/* Cabecera + chips */}
-      <div className="rounded-2xl border bg-white p-5 shadow-sm">
-        <h1 className="text-2xl font-semibold leading-snug text-gray-900">
-          {title || "Documento BOE"}
-        </h1>
-        <div className="mt-4 flex flex-wrap gap-2">
-          {chips.map(({ k, v }, i) => (
-            <span key={i} className="inline-flex items-center gap-2 rounded-full border bg-gray-50 px-3 py-1 text-xs">
-              <span className="text-gray-500">{k}:</span>
-              <span className="font-medium text-gray-900">{String(v)}</span>
-            </span>
-          ))}
-        </div>
-
-        {showCompleteTitleBlock && (
-          <div className="mt-4 rounded-xl bg-gray-50 p-4">
-            <h2 className="mb-1 text-sm font-medium text-gray-700">Título completo</h2>
-            <p className="text-gray-900 whitespace-pre-wrap">{completeTitle}</p>
           </div>
         )}
       </div>
 
-      {/* Resumen */}
-      {(summary || inflated.summary) && (
+      {/* Resumen dividido */}
+      {(summaryParts.contexto || summaryParts.fechas || summaryParts.conclusion) && (
         <section className="mt-5 rounded-2xl border bg-white p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-900">Resumen</h2>
-          <p className="mt-2 whitespace-pre-wrap text-gray-800">{summary ?? inflated.summary}</p>
+
+          {summaryParts.contexto && (
+            <div className="mt-3">
+              <h3 className="text-sm font-medium text-gray-700">Contexto</h3>
+              <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.contexto}</p>
+            </div>
+          )}
+
+          {summaryParts.fechas && (
+            <div className="mt-3">
+              <h3 className="text-sm font-medium text-gray-700">Fechas clave</h3>
+              {Array.isArray(summaryParts.fechas) ? (
+                <ul className="mt-1 list-disc pl-5 text-gray-800">
+                  {summaryParts.fechas.map((f, i) => <li key={i}>{String(f)}</li>)}
+                </ul>
+              ) : (
+                <ul className="mt-1 list-disc pl-5 text-gray-800">
+                  {String(summaryParts.fechas).split(/\r?\n|\u2022|-/).map((line, i) => {
+                    const t = line.trim();
+                    return t ? <li key={i}>{t}</li> : null;
+                  })}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {summaryParts.conclusion && (
+            <div className="mt-3">
+              <h3 className="text-sm font-medium text-gray-700">Conclusión</h3>
+              <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.conclusion}</p>
+            </div>
+          )}
         </section>
       )}
 
@@ -498,7 +552,6 @@ export default function BOEDetailPage() {
         <section className="mt-6 rounded-2xl border bg-white p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-900">Comentarios ({cTotal})</h2>
 
-          {/* Formulario */}
           <form onSubmit={onSubmitComment} className="mt-3 grid gap-2 md:grid-cols-3">
             <input
               type="text"
@@ -526,7 +579,6 @@ export default function BOEDetailPage() {
             </div>
           </form>
 
-          {/* Lista */}
           <div className="mt-4 space-y-3">
             {comments.length === 0 ? (
               <p className="text-sm text-gray-600">Aún no hay comentarios.</p>
@@ -542,7 +594,6 @@ export default function BOEDetailPage() {
             )}
           </div>
 
-          {/* Paginación */}
           {cPages > 1 && (
             <div className="mt-4 flex items-center gap-2">
               <button
