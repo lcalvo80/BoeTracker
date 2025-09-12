@@ -9,4 +9,3 @@ flask-sock
 gevent
 gevent-websocket
 hypercorn
-hypercorn.middleware
