@@ -12,7 +12,7 @@ const ITEMS_PER_PAGE = 12;
 
 const toIsoDate = (d) =>
   d instanceof Date && !isNaN(d)
-    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // YYYY-MM-DD
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" })
     : null;
 
 const formatDateEsLong = (dateObj) =>
@@ -36,21 +36,18 @@ const getPublishedDate = (item) => {
   return "—";
 };
 
-// Epígrafe tolerante
 const getEpigrafe = (item) => {
   const e =
+    item?.epigrafe?.nombre ??
     item?.epigrafe_nombre ??
     item?.epigrafe_titulo ??
     item?.epigrafe ??
     (Array.isArray(item?.epigrafes) ? item.epigrafes[0] : null) ??
     item?.epigrafeCodigo ??
     null;
-
-  if (!e) return "—";
-  return String(e).trim() || "—";
+  return e ? String(e).trim() || "—" : "—";
 };
 
-// Título resumido (fallback al completo)
 const getItemTitle = (item) => {
   const t =
     item?.titulo_resumen ??
@@ -60,15 +57,12 @@ const getItemTitle = (item) => {
     item?.tituloResumen ??
     item?.resumen_titulo ??
     item?.titulo;
-
   return (t && String(t).trim()) || "—";
 };
 
-// NUEVO: identificador tolerante
 const getIdentificador = (item) =>
   item?.identificador ?? item?.id ?? item?.boe_id ?? "—";
 
-// NUEVO: título completo (fallback a resumido)
 const getFullTitle = (item) => {
   const t =
     item?.titulo ??
@@ -80,7 +74,6 @@ const getFullTitle = (item) => {
   return (t && String(t).trim()) || getItemTitle(item) || "—";
 };
 
-// NUEVO: sección y departamento tolerantes
 const getSeccion = (item) =>
   item?.seccion?.nombre ??
   item?.seccion_nombre ??
@@ -123,7 +116,6 @@ const BOEPage = () => {
     useRange: false,
   });
 
-  // debounce + IME
   const [typing, setTyping] = useState(null);
   const [isComposing, setIsComposing] = useState(false);
 
@@ -133,7 +125,6 @@ const BOEPage = () => {
     secciones: [],
   });
 
-  // Cargar opciones de filtros
   useEffect(() => {
     const load = async () => {
       try {
@@ -151,7 +142,6 @@ const BOEPage = () => {
     load();
   }, []);
 
-  // params → backend (fechas en ISO; q = q_adv)
   const queryParams = useMemo(() => {
     const {
       q_adv, identificador, control,
@@ -164,23 +154,16 @@ const BOEPage = () => {
     const fecha_hasta_iso = fecha_hasta ? toIsoDate(fecha_hasta) : undefined;
 
     return {
-      // texto
       q: q_adv?.trim() || undefined,
       identificador: identificador?.trim() || undefined,
       control: control?.trim() || undefined,
-
-      // arrays
       secciones,
       departamentos,
       epigrafes,
-
-      // fechas como string ISO (no Date)
       useRange,
       fecha: !useRange ? fecha_iso : undefined,
       fecha_desde: useRange ? fecha_desde_iso : undefined,
       fecha_hasta: useRange ? fecha_hasta_iso : undefined,
-
-      // paginación/orden
       page: currentPage,
       limit: ITEMS_PER_PAGE,
       sort_by: "created_at",
@@ -188,10 +171,8 @@ const BOEPage = () => {
     };
   }, [filters, currentPage]);
 
-  // AbortController para cancelar la petición anterior
   const controllerRef = useRef(null);
 
-  // Carga de items (con cancelación)
   useEffect(() => {
     if (controllerRef.current) controllerRef.current.abort();
     controllerRef.current = new AbortController();
@@ -201,7 +182,7 @@ const BOEPage = () => {
       try {
         setError("");
         setLoading(true);
-        const data = await getItems(queryParams, { signal }); // <- pasa signal a axios
+        const data = await getItems(queryParams, { signal });
         setItems(Array.isArray(data?.items) ? data.items : []);
         setTotalItems(Number.isFinite(data?.total) ? data.total : 0);
       } catch (err) {
@@ -224,7 +205,6 @@ const BOEPage = () => {
     return () => controllerRef.current?.abort();
   }, [queryParams]);
 
-  // Handlers texto (debounce + IME)
   const debouncedTextChange = (name, value) => {
     if (typing) clearTimeout(typing);
     const t = setTimeout(() => {
@@ -526,7 +506,8 @@ const BOEPage = () => {
           ) : loading ? (
             <div className="p-6 text-gray-600">Cargando...</div>
           ) : items?.length > 0 ? (
-            <div className={`grid gap-4 ${compactMode ? "grid-cols-1" : "sm:grid-cols-2"}`}>
+            // ⬇️ Siempre 1 tarjeta por fila
+            <div className="grid grid-cols-1 gap-4">
               {items.map((item) => (
                 <ResultCard
                   key={item.id}
