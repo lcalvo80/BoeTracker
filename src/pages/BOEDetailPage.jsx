@@ -5,7 +5,7 @@ import { getBoeById } from "../services/boeService";
 import api from "../services/http";
 
 /**
- * BOEDetailPage.jsx — UI alineada con mockups (chips, PDF rojo, acordeones)
+ * BOEDetailPage.jsx — UI: chips, votos, botón PDF rojo y tarjetas
  * Mantiene fetch + pako on-demand para campos base64+gzip.
  */
 
@@ -28,7 +28,7 @@ function peekBase64Bytes(s, n = 2) {
     if (typeof window !== "undefined" && typeof atob === "function") {
       const chunk = atob(s.slice(0, 4 * Math.ceil(n / 3)));
       const out = new Uint8Array(chunk.length);
-      for (let i = 0; i < chunk.length; i++) out[i] = b.charCodeAt(i);
+      for (let i = 0; i < chunk.length; i++) out[i] = chunk.charCodeAt(i); // <- fix
       return out.slice(0, n);
     } else if (typeof Buffer !== "undefined") {
       return Buffer.from(s, "base64").subarray(0, n);
@@ -140,7 +140,7 @@ export default function BOEDetailPage() {
     title,
     date,
     section,
-    // number <-- ¡eliminado de la desestructuración!
+    // number — NO desestructurar para evitar 'no-unused-vars'
     sourceUrl,
     content,
     summary,
@@ -154,6 +154,7 @@ export default function BOEDetailPage() {
     control,
   } = inflated;
 
+  // Fallbacks para el número en metadatos
   const numberVal =
     inflated?.number ??
     metadata?.numero ??
@@ -167,6 +168,7 @@ export default function BOEDetailPage() {
 
   const completeTitle = (full_title || titulo_completo || title || "").trim();
 
+  // Chips metadatos (incluye Nº)
   const chips = [
     section ? { k: "Sección", v: section } : null,
     numberVal ? { k: "Nº", v: numberVal } : null,
@@ -181,28 +183,41 @@ export default function BOEDetailPage() {
 
   return (
     <main className="mx-auto max-w-5xl p-4">
+      {/* Barra superior: volver, votos y PDF rojo */}
       <div className="mb-3 flex items-center justify-between">
-        <button onClick={handleBack} className="inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+        <button
+          onClick={handleBack}
+          className="inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+        >
           ← Volver atrás
         </button>
         <div className="flex items-center gap-2">
           <button className="rounded-xl border px-3 py-1.5 text-sm">👍 0</button>
           <button className="rounded-xl border px-3 py-1.5 text-sm">👎 0</button>
           {url_pdf && (
-            <a href={url_pdf} target="_blank" rel="noreferrer" className="rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700">
+            <a
+              href={url_pdf}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
+            >
               Ver PDF
             </a>
           )}
         </div>
       </div>
 
+      {/* Cabecera y chips */}
       <div className="rounded-2xl border bg-white p-5 shadow-sm">
         <h1 className="text-2xl font-semibold leading-snug text-gray-900">
           {title || "Documento BOE"}
         </h1>
         <div className="mt-4 flex flex-wrap gap-2">
           {chips.map(({ k, v }, i) => (
-            <span key={i} className="inline-flex items-center gap-2 rounded-full border bg-gray-50 px-3 py-1 text-xs">
+            <span
+              key={i}
+              className="inline-flex items-center gap-2 rounded-full border bg-gray-50 px-3 py-1 text-xs"
+            >
               <span className="text-gray-500">{k}:</span>
               <span className="font-medium text-gray-900">{String(v)}</span>
             </span>
@@ -217,6 +232,7 @@ export default function BOEDetailPage() {
         )}
       </div>
 
+      {/* Resumen */}
       {summary && (
         <section className="mt-5 rounded-2xl border bg-white p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-900">Resumen</h2>
@@ -224,17 +240,21 @@ export default function BOEDetailPage() {
         </section>
       )}
 
+      {/* Contenido */}
       <section className="mt-5 rounded-2xl border bg-white p-5 shadow-sm">
         <h2 className="text-base font-semibold text-gray-900">Contenido</h2>
-        <article className="prose prose-gray mt-3 max-w-none">
+        <article className="prose mt-3 max-w-none">
           {html ? (
             <div dangerouslySetInnerHTML={{ __html: html }} />
           ) : (
-            <pre className="whitespace-pre-wrap break-words text-[0.98rem] leading-relaxed text-gray-900">{content}</pre>
+            <pre className="whitespace-pre-wrap break-words text-[0.98rem] leading-relaxed text-gray-900">
+              {content}
+            </pre>
           )}
         </article>
       </section>
 
+      {/* Metadatos */}
       {metadata && Object.keys(metadata).length > 0 && (
         <section className="mt-5 rounded-2xl border bg-white p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-900">Metadatos</h2>
@@ -242,17 +262,25 @@ export default function BOEDetailPage() {
             {Object.entries(metadata).map(([k, v]) => (
               <div key={k} className="rounded-xl border p-3 text-sm">
                 <dt className="text-gray-500">{k}</dt>
-                <dd className="mt-1 break-words text-gray-900">{Array.isArray(v) ? v.join(", ") : String(v)}</dd>
+                <dd className="mt-1 break-words text-gray-900">
+                  {Array.isArray(v) ? v.join(", ") : String(v)}
+                </dd>
               </div>
             ))}
           </dl>
         </section>
       )}
 
+      {/* Acciones finales */}
       <div className="mt-6 flex flex-wrap items-center gap-2">
         <CopyButton text={html || content || ""} />
         {sourceUrl && (
-          <a href={sourceUrl} target="_blank" rel="noreferrer" className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+          <a
+            href={sourceUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+          >
             Abrir en BOE
           </a>
         )}
@@ -274,7 +302,11 @@ function CopyButton({ text }) {
     } catch {}
   }, [text]);
   return (
-    <button onClick={onCopy} aria-live="polite" className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+    <button
+      onClick={onCopy}
+      aria-live="polite"
+      className="rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+    >
       {copied ? "Copiado ✓" : "Copiar"}
     </button>
   );
