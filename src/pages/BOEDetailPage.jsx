@@ -1,11 +1,26 @@
 // src/pages/BOEDetailPage.jsx
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Disclosure } from "@headlessui/react";
+import {
+  ArrowLeftIcon,
+  ChevronDownIcon,
+  DocumentTextIcon,
+  HandThumbUpIcon,
+  HandThumbDownIcon,
+  CalendarDaysIcon,
+  LightBulbIcon,
+  BookOpenIcon,
+  UserGroupIcon,
+  ArrowPathIcon,
+  ExclamationTriangleIcon,
+  SparklesIcon,
+} from "@heroicons/react/24/outline";
 import api from "../services/http";
 
-// =====================
-// Utils: base64 + gzip
-// =====================
+/* ============================================================
+   Utilidades: base64 + gzip (pako on-demand)
+   ============================================================ */
 let pakoRef = null;
 async function getPako() { if (!pakoRef) pakoRef = (await import("pako")).default; return pakoRef; }
 function isProbablyBase64(s){return typeof s==="string"&&s.length>=8&&s.length%4===0&&/^[A-Za-z0-9+/]+={0,2}$/.test(s);}
@@ -14,10 +29,11 @@ function isProbablyBase64Gzip(s){if(!isProbablyBase64(s))return false;const h=pe
 function decodeBase64ToUint8(s){if(typeof window!=="undefined"&&typeof atob==="function"){const b=atob(s);const o=new Uint8Array(b.length);for(let i=0;i<b.length;i++)o[i]=b.charCodeAt(i);return o;}return new Uint8Array(Buffer.from(s,"base64"));}
 const maybeInflateBase64Gzip=async(s)=>{try{if(!s||typeof s!=="string")return s;if(!isProbablyBase64Gzip(s))return s;const bytes=decodeBase64ToUint8(s);const p=await getPako();return p.ungzip(bytes,{to:"string"})||s;}catch{return s;}};
 const looksLikeHTML=(s)=>typeof s==="string"&&/<\/?[a-z][\s\S]*>/i.test(s);
+const cx=(...c)=>c.filter(Boolean).join(" ");
 
-// =====================
-// API helpers (axios.baseURL ya incluye /api)
-// =====================
+/* ============================================================
+   API helpers (axios.baseURL ya debe ser "/api")
+   ============================================================ */
 async function fetchDetail(id, signal){const {data}=await api.get(`items/${encodeURIComponent(id)}`,{signal});return data;}
 async function fetchImpacto(id, signal){try{const {data}=await api.get(`items/${encodeURIComponent(id)}/impacto`,{signal});return data?.impacto??null;}catch{return null;}}
 async function fetchComments(id,page=1,limit=10,signal){try{const {data}=await api.get(`items/${encodeURIComponent(id)}/comments`,{params:{page,limit},signal});return data||{items:[],page:1,pages:0,total:0,limit};}catch{return{items:[],page:1,pages:0,total:0,limit};}}
@@ -25,9 +41,11 @@ async function postComment(id,payload){const {data}=await api.post(`items/${enco
 async function likeItem(id){const {data}=await api.post(`items/${encodeURIComponent(id)}/like`);return data;}
 async function dislikeItem(id){const {data}=await api.post(`items/${encodeURIComponent(id)}/dislike`);return data;}
 
-// ===== Resumen helpers =====
+/* ============================================================
+   Resumen helpers: estructura Contexto/Fechas/Cambios/Conclusión
+   ============================================================ */
 function parseSummary(rawSummary, rawMetaResumen){
-  // 1) Si metadata.resumen es objeto, úsalo
+  // 1) Si viene estructurado en metadata.resumen
   if (rawMetaResumen && typeof rawMetaResumen === "object"){
     return {
       contexto: rawMetaResumen.context ?? rawMetaResumen.contexto ?? null,
@@ -36,7 +54,7 @@ function parseSummary(rawSummary, rawMetaResumen){
       conclusion: rawMetaResumen.conclusion ?? null,
     };
   }
-  // 2) Si summary es JSON válido, parsea
+  // 2) Si summary es JSON válido
   if (typeof rawSummary === "string" && rawSummary.trim().startsWith("{")){
     try{
       const obj = JSON.parse(rawSummary);
@@ -46,29 +64,29 @@ function parseSummary(rawSummary, rawMetaResumen){
         fechas: obj.key_dates_events ?? obj.fechas ?? null,
         conclusion: obj.conclusion ?? null,
       };
-    }catch{/* cae al 3) */}
+    }catch{/* fallback */}
   }
-  // 3) Fallback: todo el summary a Contexto
+  // 3) Fallback: todo a Contexto
   return {
     contexto: (typeof rawSummary === "string" && rawSummary.trim()) ? rawSummary.trim() : null,
     cambios: null, fechas: null, conclusion: null
   };
 }
 
-// =====================
-// View
-// =====================
+/* ============================================================
+   Página
+   ============================================================ */
 export default function BOEDetailPage(){
   const { id } = useParams();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
-  const [inflated,setInflated]=useState(null);
-  const [impacto,setImpacto]=useState(null);
+  const [doc,setDoc]=useState(null);
   const [summaryParts,setSummaryParts]=useState({contexto:null,cambios:null,fechas:null,conclusion:null});
+  const [impacto,setImpacto]=useState(null);
 
-  const [likes,setLikes]=useState(null);
-  const [dislikes,setDislikes]=useState(null);
+  const [likes,setLikes]=useState(0);
+  const [dislikes,setDislikes]=useState(0);
 
   const [comments,setComments]=useState([]);
   const [cPage,setCPage]=useState(1);
@@ -84,7 +102,7 @@ export default function BOEDetailPage(){
   const explicitEndpoint=searchParams.get("endpoint");
   const useExplicit=explicitEndpoint && /^https?:\/\//i.test(explicitEndpoint);
 
-  // Load detail
+  // Carga de detalle
   useEffect(()=>{ if(!id) return;
     controllerRef.current?.abort?.();
     const ac=new AbortController(); controllerRef.current=ac;
@@ -95,58 +113,46 @@ export default function BOEDetailPage(){
         if(useExplicit){ const {data}=await api.get(explicitEndpoint,{signal:ac.signal,baseURL:""}); raw=data; }
         else{ raw=await fetchDetail(id,ac.signal); }
 
+        // Normaliza y usa nombres "bonitos" desde BD (seccion_nombre, departamento_nombre)
         const norm={
           identificador: raw.identificador ?? id,
-          // títulos
-          titulo_resumen: raw.titulo_resumen ?? null,
-          titulo: raw.titulo ?? raw.title ?? "",
-          titulo_completo: raw.titulo_completo ?? null,
-          // texto
-          summary: raw.resumen ?? raw.summary ?? null,
-          content: raw.contenido ?? raw.content ?? null,
-          html: raw.html ?? null,
-          // nombres desde BD (preferimos *_nombre)
+          titulo_resumen: await maybeInflateBase64Gzip(raw.titulo_resumen ?? ""),
+          titulo: await maybeInflateBase64Gzip(raw.titulo ?? raw.title ?? ""),
+          titulo_completo: await maybeInflateBase64Gzip(raw.titulo_completo ?? ""),
+          summary: await maybeInflateBase64Gzip(raw.resumen ?? raw.summary ?? ""),
+          content: await maybeInflateBase64Gzip(raw.contenido ?? raw.content ?? ""),
+          html: await maybeInflateBase64Gzip(raw.html ?? ""),
+          epigrafe: await maybeInflateBase64Gzip(raw.epigrafe ?? ""),
           section: raw.seccion_nombre || raw.seccion || raw.seccion_codigo || null,
           departamento: raw.departamento_nombre || raw.departamento || raw.departamento_codigo || null,
-          epigrafe: raw.epigrafe ?? null,
           control: raw.control ?? null,
           created_at: raw.created_at ?? raw.fecha ?? null,
-          // PDF + source con fallbacks
+          // PDF + fuente
           url_pdf: raw.url_pdf ?? raw.pdf_url ?? raw.pdf ?? raw.urlPdf ?? null,
           sourceUrl: raw.sourceUrl ?? raw.url_boe ?? null,
-          // reacciones
-          likes: raw.likes ?? null, dislikes: raw.dislikes ?? null,
-          // metadata por si el resumen viene estructurado
-          metadata: raw.metadata || {},
+          likes: Number.isFinite(raw.likes) ? raw.likes : 0,
+          dislikes: Number.isFinite(raw.dislikes) ? raw.dislikes : 0,
+          metaResumen: raw?.metadata?.resumen || null,
         };
-        // inflate posibles strings gzip
-        for (const k of ["summary","content","html","epigrafe","titulo","titulo_completo","titulo_resumen"]){
-          if(typeof norm[k]==="string"){ norm[k]=await maybeInflateBase64Gzip(norm[k]); }
-        }
-        setInflated(norm);
-        setLikes(norm.likes); setDislikes(norm.dislikes);
 
-        const parts=parseSummary(norm.summary, raw?.metadata?.resumen);
-        // si el user pegó el bloque con "Contexto\n{...}", intenta extraer JSON
-        if(!parts.contexto && typeof norm.summary==="string"){
-          const m = norm.summary.match(/\{[\s\S]*\}$/);
-          if(m){ try{ const obj=JSON.parse(m[0]); const p2=parseSummary(JSON.stringify(obj)); Object.assign(parts,p2); }catch{} }
-        }
-        setSummaryParts(parts);
+        setDoc(norm);
+        setLikes(norm.likes);
+        setDislikes(norm.dislikes);
+        setSummaryParts(parseSummary(norm.summary, norm.metaResumen));
       }catch(err){ if(err?.name!=="AbortError") setError(err); }
       finally{ setLoading(false); }
     })();
     return ()=>ac.abort();
   },[id,explicitEndpoint,useExplicit]);
 
-  // impacto
+  // Impacto
   useEffect(()=>{ if(!id||useExplicit) return;
     const ac=new AbortController();
     (async()=>{ try{ let ival=await fetchImpacto(id,ac.signal); if(typeof ival==="string") ival=await maybeInflateBase64Gzip(ival); setImpacto(ival??null);}catch{} })();
     return ()=>ac.abort();
   },[id,useExplicit]);
 
-  // comentarios
+  // Comentarios
   const loadComments=useCallback(async(page=1)=>{ if(!id||useExplicit) return;
     const data=await fetchComments(id,page,cLimit);
     setComments(data.items||[]); setCPage(data.page||1); setCPages(data.pages||0); setCTotal(data.total||0);
@@ -157,7 +163,7 @@ export default function BOEDetailPage(){
   const handleLike=useCallback(async()=>{ if(!id||useExplicit) return; try{ const r=await likeItem(id); setLikes(typeof r?.likes==="number"?r.likes:(v)=>(v??0)+1);}catch{} },[id,useExplicit]);
   const handleDislike=useCallback(async()=>{ if(!id||useExplicit) return; try{ const r=await dislikeItem(id); setDislikes(typeof r?.dislikes==="number"?r.dislikes:(v)=>(v??0)+1);}catch{} },[id,useExplicit]);
 
-  // post comentario
+  // Post comentario
   const [commentAuthor,setCommentAuthor]=useState("");
   const [commentText,setCommentText]=useState("");
   const onSubmitComment=useCallback(async(e)=>{ e.preventDefault(); if(!id||useExplicit) return;
@@ -177,133 +183,190 @@ export default function BOEDetailPage(){
   }
   if(error){
     return(<main className="mx-auto max-w-4xl p-4 md:p-6">
-      <button onClick={handleBack} className="text-sm text-blue-600 hover:underline">← Volver</button>
+      <button onClick={handleBack} className="inline-flex items-center gap-2 text-sm text-blue-600 hover:underline">
+        <ArrowLeftIcon className="h-4 w-4"/> Volver
+      </button>
       <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-4 text-red-800">
         <h1 className="text-lg font-semibold">No se pudo cargar el documento</h1>
         <p className="mt-1 text-sm">{String(error.message||error)}</p>
         <div className="mt-3 text-xs opacity-75">ID: {id}</div>
       </div></main>);
   }
-  if(!inflated) return null;
+  if(!doc) return null;
 
-  const { titulo_resumen, titulo, titulo_completo, section, departamento, epigrafe, identificador, control, created_at, url_pdf, sourceUrl, html, content } = inflated;
+  const {
+    titulo_resumen, titulo, titulo_completo, section, departamento, epigrafe,
+    identificador, control, created_at, url_pdf, sourceUrl, html, content
+  } = doc;
+
   const displayDate = created_at ? new Date(created_at).toLocaleDateString(undefined,{year:"numeric",month:"long",day:"2-digit"}) : null;
-  const longTitle = (titulo_completo || titulo || "").trim();
+  const longTitle = [titulo_completo, titulo].filter(Boolean).join("").trim();
 
-  // Impacto render
-  let impactoNode=null;
-  if(impacto){
-    let parsed=impacto;
-    if(typeof parsed==="string"){ try{ parsed=JSON.parse(parsed);}catch{} }
-    if(parsed && typeof parsed==="object"){
-      impactoNode=(<div className="space-y-3">
-        {Object.entries(parsed).map(([k,v])=>(
-          <div key={k} className="rounded-xl border p-4">
-            <h3 className="text-sm font-medium text-gray-700">{String(k)}</h3>
-            {Array.isArray(v)?(<ul className="mt-2 list-disc pl-5 text-sm text-gray-900">{v.map((x,i)=><li key={i} className="break-words">{String(x)}</li>)}</ul>)
-              :(<p className="mt-2 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(v)}</p>)}
-          </div>))}
-      </div>);
-    }else{ impactoNode=<p className="whitespace-pre-wrap text-gray-800">{String(impacto)}</p>; }
+  /* --------- Render Impacto en tarjetas con iconos + acordeón --------- */
+  const impactMapOrder = [
+    { key: "afectados", label: "Afectados", Icon: UserGroupIcon, dot: "bg-emerald-500" },
+    { key: "cambios_operativos", label: "Cambios operativos", Icon: ArrowPathIcon, dot: "bg-sky-500" },
+    { key: "riesgos_potenciales", label: "Riesgos potenciales", Icon: ExclamationTriangleIcon, dot: "bg-amber-500" },
+    { key: "beneficios_previstos", label: "Beneficios previstos", Icon: SparklesIcon, dot: "bg-violet-500" },
+    { key: "recomendaciones", label: "Recomendaciones", Icon: LightBulbIcon, dot: "bg-rose-500" },
+  ];
+
+  let impactoContent = null;
+  if (impacto) {
+    let parsed = impacto;
+    if (typeof parsed === "string") { try { parsed = JSON.parse(parsed); } catch {} }
+    if (parsed && typeof parsed === "object") {
+      const sections = impactMapOrder.filter(s => parsed[s.key]);
+      impactoContent = (
+        <div className="space-y-3">
+          {sections.map(({key,label,Icon,dot})=>{
+            const val = parsed[key];
+            return (
+              <div key={key} className="rounded-xl border p-4">
+                <div className="flex items-center gap-2">
+                  <span className={cx("h-2.5 w-2.5 rounded-full", dot)} />
+                  <Icon className="h-4 w-4 text-gray-600" />
+                  <h3 className="text-sm font-medium text-gray-700">{label}</h3>
+                </div>
+                {Array.isArray(val) ? (
+                  <ul className="mt-2 list-disc pl-5 text-sm text-gray-900">
+                    {val.map((x,i)=><li key={i} className="break-words">{String(x)}</li>)}
+                  </ul>
+                ) : (
+                  <p className="mt-2 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(val)}</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    } else {
+      impactoContent = <p className="whitespace-pre-wrap text-gray-800">{String(impacto)}</p>;
+    }
   }
 
   return (
     <main role="main" className="mx-auto max-w-5xl p-4 md:p-6">
       {/* Top bar */}
       <div className="mb-3 flex items-center justify-between">
-        <button onClick={handleBack} className="inline-flex items-center gap-1 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
-          <span aria-hidden>←</span> Volver atrás
+        <button onClick={handleBack} className="inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50">
+          <ArrowLeftIcon className="h-4 w-4"/> Volver atrás
         </button>
+        {url_pdf && (
+          <a
+            href={url_pdf} target="_blank" rel="noreferrer"
+            className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
+          >
+            <DocumentTextIcon className="h-4 w-4" /> Ver PDF
+          </a>
+        )}
       </div>
 
-      {/* Cabecera */}
+      {/* Cabecera  */}
       <div className="rounded-2xl border bg-white p-5 shadow-sm">
         <h1 className="text-2xl font-extrabold leading-snug text-gray-900">
           {titulo_resumen || titulo || "Documento BOE"}
         </h1>
-
         {longTitle && <p className="mt-2 text-gray-800 whitespace-pre-wrap">{longTitle}</p>}
 
-        {/* Metadatos en vertical (solo estos) */}
+        {/* Campos en vertical en el orden requerido */}
         <dl className="mt-4 space-y-2 text-sm">
           {section && (<div><dt className="text-gray-500">Sección</dt><dd className="text-gray-900">{section}</dd></div>)}
           {departamento && (<div><dt className="text-gray-500">Departamento</dt><dd className="text-gray-900">{departamento}</dd></div>)}
           {epigrafe && (<div><dt className="text-gray-500">Epígrafe</dt><dd className="text-gray-900">{epigrafe}</dd></div>)}
           {identificador && (<div><dt className="text-gray-500">Identificador</dt><dd className="text-gray-900 break-words">{identificador}</dd></div>)}
           {control && (<div><dt className="text-gray-500">Control</dt><dd className="text-gray-900 break-words">{control}</dd></div>)}
-          {displayDate && (<div><dt className="text-gray-500">Fecha publicación</dt><dd className="text-gray-900">{displayDate}</dd></div>)}
+          {created_at && (<div><dt className="text-gray-500">Fecha publicación</dt><dd className="text-gray-900">{displayDate}</dd></div>)}
         </dl>
 
-        {/* Botón PDF (siempre que exista alguna variante de url) */}
+        {/* CTA PDF dentro de cabecera también */}
         {url_pdf && (
           <div className="mt-4">
-            <a href={url_pdf} target="_blank" rel="noreferrer"
-               className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700">
-              Ver PDF
+            <a
+              href={url_pdf} target="_blank" rel="noreferrer"
+              className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
+            >
+              <DocumentTextIcon className="h-4 w-4" /> Ver PDF
             </a>
           </div>
         )}
       </div>
 
-      {/* Likes antes del Resumen */}
-      <div className="mt-4 flex items-center gap-2">
-        <button onClick={handleLike} className="rounded-xl border px-3 py-1.5 text-sm">👍 <span className="tabular-nums">{likes ?? 0}</span></button>
-        <button onClick={handleDislike} className="rounded-xl border px-3 py-1.5 text-sm">👎 <span className="tabular-nums">{dislikes ?? 0}</span></button>
-        {/* Doble puente al PDF aquí también por visibilidad */}
+      {/* Likes / Dislikes antes del Resumen */}
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <button onClick={handleLike}
+          className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-sm text-emerald-800 hover:bg-emerald-100">
+          <HandThumbUpIcon className="h-4 w-4"/> {likes}
+        </button>
+        <button onClick={handleDislike}
+          className="inline-flex items-center gap-2 rounded-full border border-rose-200 bg-rose-50 px-3 py-1.5 text-sm text-rose-800 hover:bg-rose-100">
+          <HandThumbDownIcon className="h-4 w-4"/> {dislikes}
+        </button>
         {url_pdf && (
-          <a href={url_pdf} target="_blank" rel="noreferrer"
-             className="ml-2 inline-flex items-center gap-2 rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700">
-            Ver PDF
+          <a
+            href={url_pdf} target="_blank" rel="noreferrer"
+            className="ml-1 inline-flex items-center gap-2 rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
+          >
+            <DocumentTextIcon className="h-4 w-4" /> Ver PDF
           </a>
         )}
       </div>
 
-      {/* Resumen (Contexto, Fechas clave, Conclusión) */}
+      {/* Resumen (acordeón) */}
       {(summaryParts.contexto || summaryParts.fechas || summaryParts.cambios || summaryParts.conclusion) && (
-        <section className="mt-5 rounded-2xl border bg-white p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-900">Resumen</h2>
+        <section className="mt-5">
+          <Disclosure defaultOpen>
+            {({open})=>(
+              <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+                <Disclosure.Button className="flex w-full items-center justify-between px-5 py-3 text-left">
+                  <div className="flex items-center gap-2">
+                    <DocumentTextIcon className="h-5 w-5 text-gray-600"/>
+                    <span className="text-base font-semibold text-gray-900">Resumen</span>
+                  </div>
+                  <ChevronDownIcon className={cx("h-5 w-5 text-gray-500 transition-transform", open && "rotate-180")} />
+                </Disclosure.Button>
+                <Disclosure.Panel className="border-t px-5 py-4">
+                  {summaryParts.contexto && (
+                    <div className="mt-1">
+                      <div className="flex items-center gap-2">
+                        <BookOpenIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">Contexto</h3>
+                      </div>
+                      <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.contexto}</p>
+                    </div>
+                  )}
 
-          {summaryParts.contexto && (
-            <div className="mt-3">
-              <h3 className="text-sm font-medium text-gray-700">Contexto</h3>
-              <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.contexto}</p>
-            </div>
-          )}
+                  {summaryParts.fechas && (
+                    <div className="mt-4">
+                      <div className="flex items-center gap-2">
+                        <CalendarDaysIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">Fechas clave</h3>
+                      </div>
+                      {Array.isArray(summaryParts.fechas) ? (
+                        <ul className="mt-1 list-disc pl-5 text-gray-800">
+                          {summaryParts.fechas.map((f,i)=><li key={i}>{String(f)}</li>)}
+                        </ul>
+                      ) : (
+                        <ul className="mt-1 list-disc pl-5 text-gray-800">
+                          {String(summaryParts.fechas).split(/\r?\n|\u2022|-/).map((line,i)=>{const t=line.trim(); return t?<li key={i}>{t}</li>:null;})}
+                        </ul>
+                      )}
+                    </div>
+                  )}
 
-          {summaryParts.cambios && (
-            <div className="mt-3">
-              <h3 className="text-sm font-medium text-gray-700">Cambios clave</h3>
-              {Array.isArray(summaryParts.cambios) ? (
-                <ul className="mt-1 list-disc pl-5 text-gray-800">
-                  {summaryParts.cambios.map((c,i)=><li key={i}>{String(c)}</li>)}
-                </ul>
-              ) : (
-                <p className="mt-1 whitespace-pre-wrap text-gray-800">{String(summaryParts.cambios)}</p>
-              )}
-            </div>
-          )}
-
-          {summaryParts.fechas && (
-            <div className="mt-3">
-              <h3 className="text-sm font-medium text-gray-700">Fechas clave</h3>
-              {Array.isArray(summaryParts.fechas) ? (
-                <ul className="mt-1 list-disc pl-5 text-gray-800">
-                  {summaryParts.fechas.map((f,i)=><li key={i}>{String(f)}</li>)}
-                </ul>
-              ) : (
-                <ul className="mt-1 list-disc pl-5 text-gray-800">
-                  {String(summaryParts.fechas).split(/\r?\n|\u2022|-/).map((line,i)=>{const t=line.trim(); return t?<li key={i}>{t}</li>:null;})}
-                </ul>
-              )}
-            </div>
-          )}
-
-          {summaryParts.conclusion && (
-            <div className="mt-3">
-              <h3 className="text-sm font-medium text-gray-700">Conclusión</h3>
-              <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.conclusion}</p>
-            </div>
-          )}
+                  {summaryParts.conclusion && (
+                    <div className="mt-4">
+                      <div className="flex items-center gap-2">
+                        <LightBulbIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">Conclusión</h3>
+                      </div>
+                      <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.conclusion}</p>
+                    </div>
+                  )}
+                </Disclosure.Panel>
+              </div>
+            )}
+          </Disclosure>
         </section>
       )}
 
@@ -320,15 +383,29 @@ export default function BOEDetailPage(){
         </article>
       </section>
 
-      {/* Impacto (si existe) */}
-      {impactoNode && (
-        <section className="mt-5 rounded-2xl border bg-white p-5 shadow-sm">
-          <h2 className="text-base font-semibold text-gray-900">Informe de Impacto</h2>
-          <div className="mt-3">{impactoNode}</div>
+      {/* Informe de Impacto (acordeón) */}
+      {impactoContent && (
+        <section className="mt-5">
+          <Disclosure>
+            {({open})=>(
+              <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+                <Disclosure.Button className="flex w-full items-center justify-between px-5 py-3 text-left">
+                  <div className="flex items-center gap-2">
+                    <SparklesIcon className="h-5 w-5 text-gray-600"/>
+                    <span className="text-base font-semibold text-gray-900">Informe de Impacto</span>
+                  </div>
+                  <ChevronDownIcon className={cx("h-5 w-5 text-gray-500 transition-transform", open && "rotate-180")} />
+                </Disclosure.Button>
+                <Disclosure.Panel className="border-t px-5 py-4">
+                  {impactoContent}
+                </Disclosure.Panel>
+              </div>
+            )}
+          </Disclosure>
         </section>
       )}
 
-      {/* Comentarios */}
+      {/* Comentarios (opcional, se mantiene funcional) */}
       {!useExplicit && (
         <section className="mt-6 rounded-2xl border bg-white p-5 shadow-sm">
           <h2 className="text-base font-semibold text-gray-900">Comentarios ({cTotal})</h2>
@@ -383,9 +460,9 @@ export default function BOEDetailPage(){
   );
 }
 
-// ===============
-// UI helpers
-// ===============
+/* ============================================================
+   UI helpers
+   ============================================================ */
 function CopyButton({ text }){
   const [copied,setCopied]=useState(false);
   const onCopy=useCallback(async()=>{ try{ await navigator.clipboard.writeText(text||""); setCopied(true); setTimeout(()=>setCopied(false),1000);}catch{} },[text]);
