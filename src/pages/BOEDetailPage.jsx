@@ -68,40 +68,45 @@ const looksLikeHTML = (s) => typeof s === "string" && /<\/?[a-z][\s\S]*>/i.test(
 
 // =====================
 // Fetch helpers (backend /api/items)
+// >>> IMPORTANTE: no anteponer "/api" aquí; deja que axios.baseURL lo ponga.
 // =====================
 async function fetchDetail(id, signal) {
-  const { data } = await api.get(`/api/items/${encodeURIComponent(id)}`, { signal });
+  const { data } = await api.get(`items/${encodeURIComponent(id)}`, { signal });
   return data;
 }
 async function fetchResumen(id, signal) {
   try {
-    const { data } = await api.get(`/api/items/${encodeURIComponent(id)}/resumen`, { signal });
+    const { data } = await api.get(`items/${encodeURIComponent(id)}/resumen`, { signal });
     return data?.resumen ?? null;
   } catch { return null; }
 }
 async function fetchImpacto(id, signal) {
   try {
-    const { data } = await api.get(`/api/items/${encodeURIComponent(id)}/impacto`, { signal });
+    const { data } = await api.get(`items/${encodeURIComponent(id)}/impacto`, { signal });
     return data?.impacto ?? null;
   } catch { return null; }
 }
 async function fetchComments(id, page = 1, limit = 10, signal) {
-  const { data } = await api.get(`/api/items/${encodeURIComponent(id)}/comments`, {
-    params: { page, limit },
-    signal,
-  });
-  return data || { items: [], page: 1, pages: 0, total: 0, limit };
+  try {
+    const { data } = await api.get(`items/${encodeURIComponent(id)}/comments`, {
+      params: { page, limit },
+      signal,
+    });
+    return data || { items: [], page: 1, pages: 0, total: 0, limit };
+  } catch {
+    return { items: [], page: 1, pages: 0, total: 0, limit };
+  }
 }
 async function postComment(id, payload) {
-  const { data } = await api.post(`/api/items/${encodeURIComponent(id)}/comments`, payload);
+  const { data } = await api.post(`items/${encodeURIComponent(id)}/comments`, payload);
   return data;
 }
 async function likeItem(id) {
-  const { data } = await api.post(`/api/items/${encodeURIComponent(id)}/like`);
+  const { data } = await api.post(`items/${encodeURIComponent(id)}/like`);
   return data;
 }
 async function dislikeItem(id) {
-  const { data } = await api.post(`/api/items/${encodeURIComponent(id)}/dislike`);
+  const { data } = await api.post(`items/${encodeURIComponent(id)}/dislike`);
   return data;
 }
 
@@ -150,6 +155,7 @@ export default function BOEDetailPage() {
       try {
         let raw;
         if (useExplicit) {
+          // NO baseURL + endpoint absoluto
           const { data } = await api.get(explicitEndpoint, { signal: ac.signal, baseURL: "" });
           raw = data;
         } else {
@@ -206,22 +212,26 @@ export default function BOEDetailPage() {
 
   // -------- Carga de resumen & impacto (lazy) --------
   useEffect(() => {
-    if (!id || useExplicit) return; // si llaman a un endpoint externo, no asumimos rutas derivadas
+    if (!id || useExplicit) return; // si endpoint externo, no asumimos rutas derivadas
     const ac = new AbortController();
     (async () => {
-      const [r, imp] = await Promise.allSettled([
-        fetchResumen(id, ac.signal),
-        fetchImpacto(id, ac.signal),
-      ]);
-      if (r.status === "fulfilled") {
-        let val = r.value;
-        if (typeof val === "string") val = await maybeInflateBase64Gzip(val);
-        setSummary(val ?? null);
-      }
-      if (imp.status === "fulfilled") {
-        let ival = imp.value;
-        if (typeof ival === "string") ival = await maybeInflateBase64Gzip(ival);
-        setImpacto(ival ?? null);
+      try {
+        const [r, imp] = await Promise.allSettled([
+          fetchResumen(id, ac.signal),
+          fetchImpacto(id, ac.signal),
+        ]);
+        if (r.status === "fulfilled") {
+          let val = r.value;
+          if (typeof val === "string") val = await maybeInflateBase64Gzip(val);
+          setSummary(val ?? null);
+        }
+        if (imp.status === "fulfilled") {
+          let ival = imp.value;
+          if (typeof ival === "string") ival = await maybeInflateBase64Gzip(ival);
+          setImpacto(ival ?? null);
+        }
+      } catch {
+        // no-op
       }
     })();
     return () => ac.abort();
@@ -230,14 +240,18 @@ export default function BOEDetailPage() {
   // -------- Carga de comentarios --------
   const loadComments = useCallback(async (page = 1) => {
     if (!id || useExplicit) return;
-    const ac = new AbortController();
-    const data = await fetchComments(id, page, cLimit, ac.signal);
-    setComments(data.items || []);
-    setCPage(data.page || 1);
-    setCPages(data.pages || 0);
-    setCTotal(data.total || 0);
-    return () => ac.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    try {
+      const data = await fetchComments(id, page, cLimit);
+      setComments(data.items || []);
+      setCPage(data.page || 1);
+      setCPages(data.pages || 0);
+      setCTotal(data.total || 0);
+    } catch {
+      setComments([]);
+      setCPage(1);
+      setCPages(0);
+      setCTotal(0);
+    }
   }, [id, useExplicit, cLimit]);
   useEffect(() => {
     loadComments(1);
