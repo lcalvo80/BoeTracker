@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# (Opcional pero útil si alguna wheel necesita compilar)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libffi-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -15,5 +16,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8000
-# Fuerza/echo de PORT para evitar 0.0.0.0:
-CMD ["sh", "-c", "PORT=${PORT:-8000}; echo PORT=$PORT; exec python -m hypercorn --bind 0.0.0.0:${PORT} --workers 1 app.asgi:app"]
+# Forzamos/mostramos PORT para evitar "0.0.0.0:" y arrancamos con WebSocket worker
+CMD ["sh", "-c", "PORT=${PORT:-8000}; echo PORT=$PORT; exec gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:${PORT} 'app:create_app()'"]
