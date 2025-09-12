@@ -133,14 +133,12 @@ def _parse_query_args(args):
     if "q" in data and data["q"] is not None:
         data["q"] = (str(data["q"]).strip() or None)
 
-    # 4) flags bool
-    #    incluye useRange (cómo interpretar 'fecha' exacta)
+    # 4) flags bool (incluye useRange)
     for flag in ("has_resumen", "has_impacto", "has_comments", "favoritos", "destacado", "useRange"):
         if flag in data:
             data[flag] = _safe_bool(data[flag])
 
     # 5) fechas (ISO)
-    #    normaliza fecha exacta y rango (fecha_desde/hasta)
     fecha_exacta = _safe_date(data.get("fecha"))
     fecha_desde = _safe_date(data.get("fecha_desde"))
     fecha_hasta = _safe_date(data.get("fecha_hasta"))
@@ -152,7 +150,6 @@ def _parse_query_args(args):
         data["fecha_hasta"] = fecha_exacta
         data.pop("fecha", None)
     else:
-        # si ya vinieron desde/hasta, usamos las normalizadas
         if fecha_desde:
             data["fecha_desde"] = fecha_desde
         else:
@@ -161,7 +158,6 @@ def _parse_query_args(args):
             data["fecha_hasta"] = fecha_hasta
         else:
             data.pop("fecha_hasta", None)
-        # si llega 'fecha' pero useRange True/None, ignórala (se usará el rango)
         data.pop("fecha", None)
 
     # 6) paginación
@@ -203,7 +199,7 @@ def api_items():
                 pages = (total + limit - 1) // limit
                 result["pages"] = pages
 
-        # Debug opcional (con cabecera y flag en config)
+        # Debug opcional
         if request.headers.get("X-Debug-Filters") == "1" and current_app.config.get("DEBUG_FILTERS_ENABLED", False):
             debug = {
                 "_debug": True,

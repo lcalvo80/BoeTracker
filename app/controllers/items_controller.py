@@ -109,7 +109,7 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
       - departamento | departamentos | departamento_codigo (CSV o array)
       - seccion      | secciones     | seccion_codigo      (CSV o array)
       - epigrafe     | epigrafes                            (CSV o array)
-      - q | q_adv (FTS si existe o ILIKE sobre titulo/resumen/contenido/CAST(informe_impacto AS TEXT))
+      - q | q_adv (FTS si existe o ILIKE sobre titulo(_resumen/_corto/_completo)/resumen/contenido/CAST(informe_impacto AS TEXT))
       - identificador (ILIKE)
       - control (ILIKE si existe columna)
     """
@@ -154,6 +154,9 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
     with get_db() as conn:
         # columnas disponibles
+        has_titulo_resumen = _col_exists(conn, "items", "titulo_resumen")
+        has_titulo_corto = _col_exists(conn, "items", "titulo_corto")
+        has_titulo_completo = _col_exists(conn, "items", "titulo_completo")
         has_created_at_date = _col_exists(conn, "items", "created_at_date")
         has_created_at = _col_exists(conn, "items", "created_at")
         has_control = _col_exists(conn, "items", "control")
@@ -228,6 +231,12 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
                 text_clauses = []
                 if has_titulo:
                     text_clauses.append(sql.SQL("i.titulo ILIKE %s")); args.append(like_val)
+                if has_titulo_resumen:
+                    text_clauses.append(sql.SQL("i.titulo_resumen ILIKE %s")); args.append(like_val)
+                if has_titulo_corto:
+                    text_clauses.append(sql.SQL("i.titulo_corto ILIKE %s")); args.append(like_val)
+                if has_titulo_completo:
+                    text_clauses.append(sql.SQL("i.titulo_completo ILIKE %s")); args.append(like_val)
                 if has_resumen:
                     text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
                 if has_contenido:
@@ -252,6 +261,9 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.id"),
             sql.SQL("i.identificador"),
             sql.SQL("i.titulo") if has_titulo else sql.SQL("NULL AS titulo"),
+            sql.SQL("i.titulo_resumen") if has_titulo_resumen else sql.SQL("NULL AS titulo_resumen"),
+            sql.SQL("i.titulo_corto") if has_titulo_corto else sql.SQL("NULL AS titulo_corto"),
+            sql.SQL("i.titulo_completo") if has_titulo_completo else sql.SQL("NULL AS titulo_completo"),
             sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
             # impacto normalizado: prioriza informe_impacto
             sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
@@ -332,7 +344,9 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
     with get_db() as conn, conn.cursor() as cur:
         base_cols = [
-            "id", "identificador", "titulo", "contenido", "resumen",
+            "id", "identificador",
+            "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
+            "contenido", "resumen",
             "departamento_codigo", "seccion_codigo", "epigrafe",
             "created_at", "likes", "dislikes", "control"
         ]
@@ -356,7 +370,8 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
     if "impacto" not in data and "informe_impacto" in data:
         data["impacto"] = data.get("informe_impacto")
 
-    for k in ("titulo", "resumen", "impacto", "likes", "dislikes", "control",
+    for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
+              "resumen", "impacto", "likes", "dislikes", "control",
               "departamento_codigo", "seccion_codigo", "epigrafe", "created_at"):
         data.setdefault(k, None)
 
