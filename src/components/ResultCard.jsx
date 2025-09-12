@@ -3,7 +3,7 @@ import React from "react";
 const MetaPill = ({ label, value }) => {
   if (!value || value === "—") return null;
   return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-gray-50 px-2 py-0.5 border border-gray-200 text-xs text-gray-700">
+    <span className="inline-flex items-center gap-1 rounded-md bg-gray-50 px-2 py-0.5 border border-gray-200 text-xs text-gray-700 w-fit">
       <span className="font-medium">{label}:</span>
       <span className="truncate">{String(value)}</span>
     </span>
@@ -12,8 +12,8 @@ const MetaPill = ({ label, value }) => {
 
 const looksLikeGzipBase64 = (s) => {
   if (!s || typeof s !== "string") return false;
-  if (/^H4sI[A-Za-z0-9+/=]{10,}$/.test(s)) return true; // típico GZIP+Base64
-  if (/^[A-Za-z0-9+/=]{50,}$/.test(s) && !/\s/.test(s)) return true; // base64 larga sin espacios
+  if (/^H4sI[A-Za-z0-9+/=]{10,}$/.test(s)) return true;
+  if (/^[A-Za-z0-9+/=]{50,}$/.test(s) && !/\s/.test(s)) return true;
   return false;
 };
 
@@ -23,15 +23,13 @@ const ResultCard = ({
   expanded = false,
   onToggle,
   onOpen,
-
-  // Getters opcionales
   getPublishedDate,
   getEpigrafe,
-  getItemTitle,     // título resumido
-  getFullTitle,     // título completo
-  getIdentifier,    // identificador
-  getSeccion,       // sección
-  getDepartamento,  // departamento
+  getItemTitle,
+  getFullTitle,
+  getIdentifier,
+  getSeccion,
+  getDepartamento,
 }) => {
   const fecha = getPublishedDate ? getPublishedDate(item) : "—";
 
@@ -46,7 +44,6 @@ const ResultCard = ({
        item?.titulo ??
        "—");
 
-  // Nota: NO caemos al resumen. Si no hay "completo", dejamos vacío.
   const tituloCompleto = getFullTitle
     ? getFullTitle(item)
     : (item?.titulo ??
@@ -79,7 +76,6 @@ const ResultCard = ({
        (Array.isArray(item?.epigrafes) ? item.epigrafes[0] : null) ??
        "—");
 
-  // Normalizador para comparar títulos y detectar duplicidades
   const norm = (s) => (s || "")
     .replace(/\s+/g, " ")
     .replace(/[·•\-–—]+/g, "-")
@@ -100,7 +96,6 @@ const ResultCard = ({
       aria-labelledby={`pub-${item?.id || identificador}-title`}
     >
       <div className="p-4 sm:p-5">
-        {/* Cabecera: Identificador + Fecha */}
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-600">
           <span className="font-mono text-[11px] text-gray-800">
             ID: {identificador || "—"}
@@ -109,7 +104,6 @@ const ResultCard = ({
           <span className="tabular-nums">{fecha}</span>
         </div>
 
-        {/* Título resumido en negrita (clic abre detalle) */}
         <button type="button" onClick={onOpen} className="mt-2 block text-left w-full">
           <h3
             id={`pub-${item?.id || identificador}-title`}
@@ -120,19 +114,17 @@ const ResultCard = ({
           </h3>
         </button>
 
-        {/* Metadatos: Sección → Departamento → Epígrafe */}
-        <div className="mt-2 flex flex-wrap items-center gap-2">
+        {/* 📌 Lista vertical de metadatos */}
+        <div className="mt-2 flex flex-col gap-1">
           <MetaPill label="Sección" value={seccion} />
           <MetaPill label="Departamento" value={departamento} />
           <MetaPill label="Epígrafe" value={epigrafe} />
         </div>
 
-        {/* Resumen breve si no es compacto y no parece base64/gzip */}
         {!compact && hasReadableResumen && (
           <p className="mt-3 text-sm text-gray-700 line-clamp-3">{item.resumen}</p>
         )}
 
-        {/* Acciones */}
         <div className="mt-3 flex items-center justify-between">
           <button
             type="button"
@@ -155,7 +147,6 @@ const ResultCard = ({
           )}
         </div>
 
-        {/* Desplegable: Detalles (solo si aporta algo) */}
         {expanded && shouldShowExpandable && (
           <div
             id={`rc-${identificador}-expand`}
