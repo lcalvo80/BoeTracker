@@ -1,4 +1,3 @@
-// src/components/ResultCard.jsx
 import React from "react";
 
 const MetaPill = ({ label, value }) => {
@@ -47,13 +46,13 @@ const ResultCard = ({
        item?.titulo ??
        "—");
 
+  // Nota: NO caemos al resumen. Si no hay "completo", dejamos vacío.
   const tituloCompleto = getFullTitle
     ? getFullTitle(item)
     : (item?.titulo ??
        item?.titulo_completo ??
        item?.title ??
-       tituloResumen ??
-       "—");
+       "");
 
   const seccion = getSeccion
     ? getSeccion(item)
@@ -79,6 +78,21 @@ const ResultCard = ({
        item?.epigrafe ??
        (Array.isArray(item?.epigrafes) ? item.epigrafes[0] : null) ??
        "—");
+
+  // Normalizador para comparar títulos y detectar duplicidades
+  const norm = (s) => (s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[·•\-–—]+/g, "-")
+    .trim()
+    .toLowerCase();
+
+  const sameTitle =
+    norm(tituloResumen) !== "—" &&
+    !!norm(tituloCompleto) &&
+    norm(tituloResumen) === norm(tituloCompleto);
+
+  const hasReadableResumen = !!(item?.resumen && !looksLikeGzipBase64(item.resumen));
+  const shouldShowExpandable = (!sameTitle && !!tituloCompleto) || hasReadableResumen;
 
   return (
     <article
@@ -114,7 +128,7 @@ const ResultCard = ({
         </div>
 
         {/* Resumen breve si no es compacto y no parece base64/gzip */}
-        {!compact && item?.resumen && !looksLikeGzipBase64(item.resumen) && (
+        {!compact && hasReadableResumen && (
           <p className="mt-3 text-sm text-gray-700 line-clamp-3">{item.resumen}</p>
         )}
 
@@ -128,25 +142,39 @@ const ResultCard = ({
             Abrir detalle
           </button>
 
-          <button
-            type="button"
-            onClick={onToggle}
-            className="text-sm text-gray-600 hover:text-gray-900"
-            aria-expanded={expanded}
-            aria-controls={`rc-${identificador}-expand`}
-          >
-            {expanded ? "Ocultar" : "Ver más"}
-          </button>
+          {shouldShowExpandable && (
+            <button
+              type="button"
+              onClick={onToggle}
+              className="text-sm text-gray-600 hover:text-gray-900"
+              aria-expanded={expanded}
+              aria-controls={`rc-${identificador}-expand`}
+            >
+              {expanded ? "Ocultar" : "Ver más"}
+            </button>
+          )}
         </div>
 
-        {/* Desplegable: Título completo */}
-        {expanded && (
+        {/* Desplegable: Detalles (solo si aporta algo) */}
+        {expanded && shouldShowExpandable && (
           <div
             id={`rc-${identificador}-expand`}
             className="mt-3 rounded-lg border border-gray-100 bg-gray-50 p-3 text-sm text-gray-800"
           >
-            <div className="font-medium text-gray-900 mb-1">Título completo</div>
-            <p className="leading-relaxed">{tituloCompleto}</p>
+            {!sameTitle && !!tituloCompleto && (
+              <>
+                <div className="font-medium text-gray-900 mb-1">Título completo</div>
+                <p className="leading-relaxed">{tituloCompleto}</p>
+              </>
+            )}
+
+            {hasReadableResumen && (
+              <>
+                {!sameTitle && !!tituloCompleto && <div className="h-3" />}
+                <div className="font-medium text-gray-900 mb-1">Resumen</div>
+                <p className="leading-relaxed">{item.resumen}</p>
+              </>
+            )}
           </div>
         )}
       </div>
