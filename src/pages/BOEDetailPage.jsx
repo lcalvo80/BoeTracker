@@ -1,6 +1,8 @@
+// src/pages/BOEDetailPage.jsx
 import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-
+import { getBoeById } from "../services/boeService";
+import api from "../services/http";
 
 /**
  * BOEDetailPage.jsx — "pako on-demand" version (actualizado)
@@ -93,10 +95,15 @@ export default function BOEDetailPage() {
       setLoading(true);
       setError(null);
       try {
-        const res = await fetch(apiUrl, { signal: ac.signal, headers: { Accept: "application/json" } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = await res.json();
-        setData(json);
+        // Si viene un endpoint absoluto por query param, respétalo (sin baseURL)
+        if (/^https?:\/\//i.test(apiUrl)) {
+          const { data: json } = await api.get(apiUrl, { signal: ac.signal, baseURL: "" });
+          setData(json);
+        } else {
+          // Caso normal: resolvemos contra el dominio del backend + /api
+          const json = await getBoeById(id, { signal: ac.signal });
+          setData(json);
+        }
       } catch (err) {
         if (err?.name !== "AbortError") {
           setError(err);
@@ -184,24 +191,21 @@ export default function BOEDetailPage() {
     html,
     metadata,
     epigrafe,
-    url_pdf,          // NUEVO: link PDF
-    full_title,       // NUEVO: posible título extendido
-    titulo_completo,  // NUEVO: alias posible
+    url_pdf,
+    full_title,
+    titulo_completo,
   } = inflated;
 
   const displayDate = date
     ? new Date(date).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "2-digit" })
     : null;
 
-  // “Título completo” preferido si existe
   const completeTitle = (full_title || titulo_completo || title || "").trim();
   const showCompleteTitleBlock = completeTitle && completeTitle !== (title || "").trim();
 
-  // Detección simple de “Informe de impacto”
   const isImpactReport =
     /impacto/i.test(section || "") || (metadata && /impacto/i.test(String(metadata?.tipo || "")));
 
-  // Picks comunes para informes de impacto
   const afectados = metadata?.afectados;
   const ambito = metadata?.ambito || metadata?.ámbito;
   const materias = metadata?.materias || metadata?.sectores || metadata?.materia;
@@ -246,7 +250,6 @@ export default function BOEDetailPage() {
           {title || "Documento BOE"}
         </h1>
 
-        {/* Epígrafe (subtítulo) */}
         {epigrafe && (
           <p className="text-sm text-gray-700">{epigrafe}</p>
         )}
@@ -257,7 +260,6 @@ export default function BOEDetailPage() {
         </div>
       </header>
 
-      {/* Título completo encima del resumen, si difiere del principal */}
       {showCompleteTitleBlock && (
         <section className="mt-6 rounded-2xl border bg-gray-50 p-4">
           <h2 className="mb-2 text-sm font-medium text-gray-700">Título completo</h2>
@@ -265,7 +267,6 @@ export default function BOEDetailPage() {
         </section>
       )}
 
-      {/* Resumen */}
       {summary && (
         <section className="mt-6 rounded-2xl border bg-gray-50 p-4">
           <h2 className="mb-2 text-sm font-medium text-gray-700">Resumen</h2>
@@ -273,7 +274,6 @@ export default function BOEDetailPage() {
         </section>
       )}
 
-      {/* Cuerpo principal */}
       <article className="prose prose-gray mt-6 max-w-none">
         {html ? (
           <div dangerouslySetInnerHTML={{ __html: html }} />
@@ -282,14 +282,12 @@ export default function BOEDetailPage() {
         )}
       </article>
 
-      {/* Metadatos / Informe de impacto */}
       {metadata && (
         <>
           {isImpactReport ? (
             <section className="mt-8">
               <h2 className="text-sm font-semibold text-gray-700">Informe de Impacto</h2>
 
-              {/* Afectados */}
               {afectados && (
                 <div className="mt-3 rounded-xl border p-4">
                   <h3 className="text-sm font-medium text-gray-700">Afectados</h3>
@@ -305,7 +303,6 @@ export default function BOEDetailPage() {
                 </div>
               )}
 
-              {/* Ámbito */}
               {ambito && (
                 <div className="mt-3 rounded-xl border p-4">
                   <h3 className="text-sm font-medium text-gray-700">Ámbito</h3>
@@ -313,7 +310,6 @@ export default function BOEDetailPage() {
                 </div>
               )}
 
-              {/* Materias / Sectores */}
               {materias && (
                 <div className="mt-3 rounded-xl border p-4">
                   <h3 className="text-sm font-medium text-gray-700">Materias / Sectores</h3>
@@ -330,7 +326,6 @@ export default function BOEDetailPage() {
               )}
             </section>
           ) : (
-            // Grid genérico solo si NO es informe de impacto
             <section className="mt-8">
               <h2 className="text-sm font-semibold text-gray-700">Metadatos</h2>
               <dl className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -346,7 +341,6 @@ export default function BOEDetailPage() {
         </>
       )}
 
-      {/* Acciones */}
       <div className="mt-8 flex flex-wrap items-center gap-2">
         <CopyButton text={html || content || ""} />
         {url_pdf && (

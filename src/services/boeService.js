@@ -26,7 +26,6 @@ function mapFilters(params = {}) {
 
 /** Normaliza las respuestas de filtros a un contrato estable en el frontend. */
 function normalizeFilters(raw = {}) {
-  // Acepta varios posibles nombres de campos y los estandariza
   const secciones =
     raw.secciones ??
     raw.sections ??
@@ -63,12 +62,21 @@ export async function getItems(params = {}, config = {}) {
   return data;
 }
 
-/** Detalle de un item por ID. */
+/** Detalle de un item por ID (colección items). */
 export async function getItemById(id, config = {}) {
   if (id === undefined || id === null || `${id}`.trim() === "") {
     throw new Error("getItemById requiere un id válido.");
   }
   const { data } = await api.get(`/items/${id}`, { ...config });
+  return data;
+}
+
+/** Detalle BOE por identificador oficial (endpoint dedicado). */
+export async function getBoeById(id, config = {}) {
+  if (id === undefined || id === null || `${id}`.trim() === "") {
+    throw new Error("getBoeById requiere un id válido.");
+  }
+  const { data } = await api.get(`/boe/${encodeURIComponent(id)}`, { ...config });
   return data;
 }
 
@@ -146,11 +154,7 @@ export async function getComments(id, params = {}, config = {}) {
   return [];
 }
 
-/** ================== Filtros (¡nuevo!) ================== */
-/**
- * Obtiene opciones de filtros para el buscador/listados.
- * Soporta varios endpoints del backend y normaliza la respuesta.
- */
+/** ================== Filtros ================== */
 export async function getFilterOptions(config = {}) {
   // 1) /filters
   try {
@@ -160,7 +164,7 @@ export async function getFilterOptions(config = {}) {
     const status = err?.response?.status;
     if (status && status !== 404) throw err;
   }
-  // 2) /filtros (alias en ES)
+  // 2) /filtros
   try {
     const { data } = await api.get("/filtros", { ...config });
     return normalizeFilters(data);
@@ -176,7 +180,7 @@ export async function getFilterOptions(config = {}) {
     const status = err?.response?.status;
     if (status && status !== 404) throw err;
   }
-  // 4) Valor por defecto para que el UI pueda renderizar
+  // 4) fallback vacío
   return normalizeFilters({
     secciones: [],
     departamentos: [],
@@ -185,95 +189,15 @@ export async function getFilterOptions(config = {}) {
   });
 }
 
-/* =================== Escritura/acciones =================== */
-
-/** Publica un comentario en un item. */
-export async function postComment(id, text, extra = {}, config = {}) {
-  if (id === undefined || id === null || `${id}`.trim() === "") {
-    throw new Error("postComment requiere un id válido.");
-  }
-  if (!text || `${text}`.trim() === "") {
-    throw new Error("postComment requiere un texto no vacío.");
-  }
-
-  const payload = { text, ...extra };
-
-  try {
-    const { data } = await api.post(`/items/${id}/comments`, payload, { ...config });
-    return data;
-  } catch (err) {
-    const status = err?.response?.status;
-    if (status && status !== 404) throw err;
-  }
-
-  const { data } = await api.post(`/items/${id}/comentarios`, payload, { ...config });
-  return data;
-}
-
-/** Marca like en un item. */
-export async function likeItem(id, config = {}) {
-  if (id === undefined || id === null || `${id}`.trim() === "") {
-    throw new Error("likeItem requiere un id válido.");
-  }
-
-  try {
-    const { data } = await api.post(`/items/${id}/like`, null, { ...config });
-    return data;
-  } catch (err) {
-    const status = err?.response?.status;
-    if (status && status !== 404) throw err;
-  }
-
-  try {
-    const { data } = await api.post(`/items/${id}/likes`, null, { ...config });
-    return data;
-  } catch (err) {
-    const status = err?.response?.status;
-    if (status && status !== 404) throw err;
-  }
-
-  const { data } = await api.patch(`/items/${id}`, { like: true }, { ...config });
-  return data;
-}
-
-/** Quita like / marca dislike en un item. */
-export async function dislikeItem(id, config = {}) {
-  if (id === undefined || id === null || `${id}`.trim() === "") {
-    throw new Error("dislikeItem requiere un id válido.");
-  }
-
-  try {
-    const { data } = await api.post(`/items/${id}/dislike`, null, { ...config });
-    return data;
-  } catch (err) {
-    const status = err?.response?.status;
-    if (status && status !== 404) throw err;
-  }
-
-  try {
-    const { data } = await api.delete(`/items/${id}/like`, { ...config });
-    return data;
-  } catch (err) {
-    const status = err?.response?.status;
-    if (status && status !== 404) throw err;
-  }
-
-  const { data } = await api.patch(`/items/${id}`, { like: false }, { ...config });
-  return data;
-}
-
-/* ========== Export organizado (cumple ESLint: no anonymous default) ========== */
-
+/* ========== Export organizado ========== */
 export const boeService = {
   getItems,
   getItemById,
+  getBoeById,
   getResumen,
   getImpacto,
   getComments,
-  getFilterOptions, // <-- añadido
-  postComment,
-  likeItem,
-  dislikeItem,
+  getFilterOptions,
 };
 
 export default boeService;
