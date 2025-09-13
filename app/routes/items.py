@@ -1,305 +1,801 @@
-# app/routes/items.py
-from flask import Blueprint, jsonify, request, current_app, make_response
-from datetime import datetime
+// src/pages/BOEDetailPage.jsx
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Disclosure } from "@headlessui/react";
+import {
+  ArrowLeftIcon,
+  ChevronDownIcon,
+  DocumentTextIcon,
+  HandThumbUpIcon,
+  HandThumbDownIcon,
+  CalendarDaysIcon,
+  LightBulbIcon,
+  BookOpenIcon,
+  UserGroupIcon,
+  ArrowPathIcon,
+  ExclamationTriangleIcon,
+  SparklesIcon,
+} from "@heroicons/react/24/outline";
+import api from "../services/http";
 
-from app.controllers.items_controller import (
-    get_filtered_items,
-    get_item_by_id,
-    get_item_resumen,
-    get_item_impacto,
-    like_item,
-    dislike_item,
-    list_departamentos,
-    list_secciones,
-    list_epigrafes,
-)
+/* ============================================================
+   Utilidades: base64 + gzip (pako on-demand)
+   ============================================================ */
+let pakoRef = null;
+async function getPako() {
+  if (!pakoRef) pakoRef = (await import("pako")).default;
+  return pakoRef;
+}
+function isProbablyBase64(s) {
+  return (
+    typeof s === "string" &&
+    s.length >= 8 &&
+    s.length % 4 === 0 &&
+    /^[A-Za-z0-9+/]+={0,2}$/.test(s)
+  );
+}
+function peekBase64Bytes(s, n = 2) {
+  try {
+    if (typeof window !== "undefined" && typeof atob === "function") {
+      const c = atob(s.slice(0, 4 * Math.ceil(n / 3)));
+      const o = new Uint8Array(c.length);
+      for (let i = 0; i < c.length; i++) o[i] = c.charCodeAt(i);
+      return o.slice(0, n);
+    } else if (typeof Buffer !== "undefined") {
+      return Buffer.from(s, "base64").subarray(0, n);
+    }
+  } catch {}
+  return new Uint8Array(0);
+}
+function isProbablyBase64Gzip(s) {
+  if (!isProbablyBase64(s)) return false;
+  const h = peekBase64Bytes(s, 2);
+  return h.length >= 2 && h[0] === 0x1f && h[1] === 0x8b;
+}
+function decodeBase64ToUint8(s) {
+  if (typeof window !== "undefined" && typeof atob === "function") {
+    const b = atob(s);
+    const o = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) o[i] = b.charCodeAt(i);
+    return o;
+  }
+  return new Uint8Array(Buffer.from(s, "base64"));
+}
+const maybeInflateBase64Gzip = async (s) => {
+  try {
+    if (!s || typeof s !== "string") return s;
+    if (!isProbablyBase64Gzip(s)) return s;
+    const bytes = decodeBase64ToUint8(s);
+    const p = await getPako();
+    return p.ungzip(bytes, { to: "string" }) || s;
+  } catch {
+    return s;
+  }
+};
+const looksLikeHTML = (s) => typeof s === "string" && /<\/?[a-z][\s\S]*>/i.test(s);
+const cx = (...c) => c.filter(Boolean).join(" ");
 
-bp = Blueprint("items", __name__)
-
-# ===== Helpers =====
-
-def _safe_int(v, d, mi=1, ma=100):
-    try:
-        n = int(v)
-        if n < mi: n = mi
-        if n > ma: n = ma
-        return n
-    except Exception:
-        return d
-
-def _safe_bool(v, default=None):
-    if v is None:
-        return default
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:  return True
-    if s in {"0", "false", "f", "no", "n", "off"}: return False
-    return default
-
-def _safe_date(v, default=None):
-    if not v:
-        return default
-    s = str(v).strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return default
-
-def _dedupe_preserve_order(seq):
-    seen, out = set(), []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-# claves multi-valor
-MULTI_KEYS_PLURALS = {"departamentos", "secciones", "epigrafes", "tags", "ids"}
-
-# normalización de nombres
-NORMALIZE_KEYS = {
-    # multi
-    "departamento": "departamentos", "departamentos": "departamentos",
-    "seccion": "secciones", "secciones": "secciones",
-    "epigrafe": "epigrafes", "epigrafes": "epigrafes",
-    "tag": "tags", "tags": "tags",
-    "id": "ids", "ids": "ids",
-    # FE alternativo (mapeos del front/service)
-    "seccion_codigo": "secciones",
-    "departamento_codigo": "departamentos",
-    # texto
-    "q": "q", "query": "q", "search": "q", "q_adv": "q",
-    # fechas
-    "fecha": "fecha",
-    "fecha_desde": "fecha_desde", "desde": "fecha_desde", "from": "fecha_desde", "date_from": "fecha_desde",
-    "fecha_hasta": "fecha_hasta", "hasta": "fecha_hasta", "to": "fecha_hasta", "date_to": "fecha_hasta",
-    "useRange": "useRange",
-    # flags
-    "has_resumen": "has_resumen",
-    "has_impacto": "has_impacto",
-    "has_comments": "has_comments",
-    "favoritos": "favoritos",
-    "destacado": "destacado",
-    # paginación/orden
-    "page": "page", "limit": "limit",
-    "sort_by": "sort_by", "sort_dir": "sort_dir",
+/* ============================================================
+   API helpers (axios.baseURL ya debe ser "/api")
+   ============================================================ */
+async function fetchDetail(id, signal) {
+  const { data } = await api.get(`items/${encodeURIComponent(id)}`, { signal });
+  return data;
+}
+async function fetchImpacto(id, signal) {
+  try {
+    const { data } = await api.get(`items/${encodeURIComponent(id)}/impacto`, {
+      signal,
+    });
+    return data?.impacto ?? null;
+  } catch {
+    return null;
+  }
+}
+async function fetchComments(id, page = 1, limit = 10, signal) {
+  try {
+    const { data } = await api.get(`items/${encodeURIComponent(id)}/comments`, {
+      params: { page, limit },
+      signal,
+    });
+    return data || { items: [], page: 1, pages: 0, total: 0, limit };
+  } catch {
+    return { items: [], page: 1, pages: 0, total: 0, limit };
+  }
+}
+async function postComment(id, payload) {
+  const { data } = await api.post(
+    `items/${encodeURIComponent(id)}/comments`,
+    payload
+  );
+  return data;
+}
+async function likeItem(id) {
+  const { data } = await api.post(`items/${encodeURIComponent(id)}/like`);
+  return data;
+}
+async function dislikeItem(id) {
+  const { data } = await api.post(`items/${encodeURIComponent(id)}/dislike`);
+  return data;
 }
 
-ALLOWED_SORT_BY = {
-    "created_at": "created_at",
-    "fecha": "fecha",
-    "updated_at": "updated_at",
-    "relevancia": "relevancia",
-    "relevance": "relevancia",
-    "titulo": "titulo",
+/* ============================================================
+   Resumen helpers: estructura Contexto/Fechas/Cambios/Conclusión
+   ============================================================ */
+function parseSummary(rawSummary, rawMetaResumen) {
+  // 1) Si viene estructurado en metadata.resumen
+  if (rawMetaResumen && typeof rawMetaResumen === "object") {
+    return {
+      contexto: rawMetaResumen.context ?? rawMetaResumen.contexto ?? null,
+      cambios: rawMetaResumen.key_changes ?? rawMetaResumen.cambios ?? null,
+      fechas: rawMetaResumen.key_dates_events ?? rawMetaResumen.fechas ?? null,
+      conclusion: rawMetaResumen.conclusion ?? null,
+    };
+  }
+  // 2) Si summary es JSON válido
+  if (typeof rawSummary === "string" && rawSummary.trim().startsWith("{")) {
+    try {
+      const obj = JSON.parse(rawSummary);
+      return {
+        contexto: obj.context ?? obj.contexto ?? null,
+        cambios: obj.key_changes ?? obj.cambios ?? null,
+        fechas: obj.key_dates_events ?? obj.fechas ?? null,
+        conclusion: obj.conclusion ?? null,
+      };
+    } catch {
+      /* fallback */
+    }
+  }
+  // 3) Fallback: todo a Contexto
+  return {
+    contexto:
+      typeof rawSummary === "string" && rawSummary.trim()
+        ? rawSummary.trim()
+        : null,
+    cambios: null,
+    fechas: null,
+    conclusion: null,
+  };
 }
-ALLOWED_SORT_DIR = {"asc", "desc"}
 
+/* ============================================================
+   Página
+   ============================================================ */
+export default function BOEDetailPage() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
-def _parse_query_args(args):
-    """
-    Parser robusto:
-    - Recorre args en orden con items(multi=True): k=a&k=b preserva el orden.
-    - Soporta k[]=a&k[]=b, k=a&k=b y k=a,b
-    - Para claves multi, agrega y deduplica preservando orden.
-    - Normaliza fechas, booleanos, paginación y ordenación.
-    - Acepta 'fecha' (exacta) y 'useRange' para convertir a [fecha_desde, fecha_hasta].
-    """
-    data = {}
+  const [doc, setDoc] = useState(null);
+  const [summaryParts, setSummaryParts] = useState({
+    contexto: null,
+    cambios: null,
+    fechas: null,
+    conclusion: null,
+  });
+  const [impacto, setImpacto] = useState(null);
 
-    # 1) recolecta y agrega
-    for raw_key, raw_val in args.items(multi=True):
-        key = raw_key[:-2] if raw_key.endswith("[]") else raw_key
-        norm = NORMALIZE_KEYS.get(key, key)
+  const [likes, setLikes] = useState(0);
+  const [dislikes, setDislikes] = useState(0);
 
-        if norm in MULTI_KEYS_PLURALS:
-            # split por comas para soportar k=a,b
-            parts = [p.strip() for p in str(raw_val).split(",") if p.strip() != ""]
-            prev = data.get(norm, [])
-            data[norm] = prev + parts
-        else:
-            data[norm] = raw_val
+  const [comments, setComments] = useState([]);
+  const [cPage, setCPage] = useState(1);
+  const [cPages, setCPages] = useState(0);
+  const [cTotal, setCTotal] = useState(0);
+  const [cLimit] = useState(10);
+  const [addingComment, setAddingComment] = useState(false);
 
-    # 2) dedupe para multi
-    for m in list(MULTI_KEYS_PLURALS):
-        if m in data:
-            data[m] = _dedupe_preserve_order(data[m])
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-    # 3) q string
-    if "q" in data and data["q"] is not None:
-        data["q"] = (str(data["q"]).strip() or None)
+  const controllerRef = useRef(null);
+  const explicitEndpoint = searchParams.get("endpoint");
+  const useExplicit = explicitEndpoint && /^https?:\/\//i.test(explicitEndpoint);
 
-    # 4) flags bool (incluye useRange)
-    for flag in ("has_resumen", "has_impacto", "has_comments", "favoritos", "destacado", "useRange"):
-        if flag in data:
-            data[flag] = _safe_bool(data[flag])
+  // Carga de detalle
+  useEffect(() => {
+    if (!id) return;
+    controllerRef.current?.abort?.();
+    const ac = new AbortController();
+    controllerRef.current = ac;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        let raw;
+        if (useExplicit) {
+          const { data } = await api.get(explicitEndpoint, {
+            signal: ac.signal,
+            baseURL: "",
+          });
+          raw = data;
+        } else {
+          raw = await fetchDetail(id, ac.signal);
+        }
 
-    # 5) fechas (ISO)
-    fecha_exacta = _safe_date(data.get("fecha"))
-    fecha_desde = _safe_date(data.get("fecha_desde"))
-    fecha_hasta = _safe_date(data.get("fecha_hasta"))
+        // Normaliza y garantiza nombres (no códigos)
+        const titulo_resumen = await maybeInflateBase64Gzip(
+          raw.titulo_resumen ?? ""
+        );
+        const titulo = await maybeInflateBase64Gzip(raw.titulo ?? raw.title ?? "");
+        const titulo_completo = await maybeInflateBase64Gzip(
+          raw.titulo_completo ?? ""
+        );
 
-    use_range = _safe_bool(data.get("useRange"), False)  # default=False
-    if use_range is False and fecha_exacta:
-        # modo fecha exacta: fuerza desde=hasta=fecha y limpia claves
-        data["fecha_desde"] = fecha_exacta
-        data["fecha_hasta"] = fecha_exacta
-        data.pop("fecha", None)
-    else:
-        if fecha_desde:
-            data["fecha_desde"] = fecha_desde
-        else:
-            data.pop("fecha_desde", None)
-        if fecha_hasta:
-            data["fecha_hasta"] = fecha_hasta
-        else:
-            data.pop("fecha_hasta", None)
-        data.pop("fecha", None)
+        const norm = {
+          identificador: raw.identificador ?? id,
+          titulo_resumen,
+          titulo,
+          titulo_completo,
+          summary: await maybeInflateBase64Gzip(raw.resumen ?? raw.summary ?? ""),
+          // Contenido eliminado del render, pero dejamos parseo por compatibilidad si se necesitara más adelante
+          content: await maybeInflateBase64Gzip(raw.contenido ?? raw.content ?? ""),
+          html: await maybeInflateBase64Gzip(raw.html ?? ""),
+          // Mostrar solo nombres (evitar *_codigo)
+          section_name:
+            raw.seccion_nombre ??
+            raw.seccion ??
+            null,
+          departamento_name:
+            raw.departamento_nombre ??
+            raw.departamento ??
+            null,
+          epigrafe_name: await maybeInflateBase64Gzip(
+            raw.epigrafe_nombre ?? raw.epigrafe ?? ""
+          ),
+          control: raw.control ?? null,
+          created_at: raw.created_at ?? raw.fecha ?? null,
+          // PDF + fuente
+          url_pdf: raw.url_pdf ?? raw.pdf_url ?? raw.pdf ?? raw.urlPdf ?? null,
+          sourceUrl: raw.sourceUrl ?? raw.url_boe ?? null,
+          likes: Number.isFinite(raw.likes) ? raw.likes : 0,
+          dislikes: Number.isFinite(raw.dislikes) ? raw.dislikes : 0,
+          metaResumen: raw?.metadata?.resumen || null,
+        };
 
-    # 6) paginación
-    data["page"]  = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
-    data["limit"] = _safe_int(data.get("limit", 12), 12, 1, 100)
+        setDoc(norm);
+        setLikes(norm.likes);
+        setDislikes(norm.dislikes);
+        setSummaryParts(parseSummary(norm.summary, norm.metaResumen));
+      } catch (err) {
+        if (err?.name !== "AbortError") setError(err);
+      } finally {
+        setLoading(false);
+      }
+    })();
+    return () => ac.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, explicitEndpoint, useExplicit]);
 
-    # 7) ordenación
-    raw_sort_by  = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
-    raw_sort_dir = str(data.get("sort_dir", "desc") or "desc").strip().lower()
-    data["sort_by"]  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
-    data["sort_dir"] = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
+  // Impacto
+  useEffect(() => {
+    if (!id || useExplicit) return;
+    const ac = new AbortController();
+    (async () => {
+      try {
+        let ival = await fetchImpacto(id, ac.signal);
+        if (typeof ival === "string") ival = await maybeInflateBase64Gzip(ival);
+        setImpacto(ival ?? null);
+      } catch {}
+    })();
+    return () => ac.abort();
+  }, [id, useExplicit]);
 
-    return data
+  // Comentarios
+  const loadComments = useCallback(
+    async (page = 1) => {
+      if (!id || useExplicit) return;
+      const data = await fetchComments(id, page, cLimit);
+      setComments(data.items || []);
+      setCPage(data.page || 1);
+      setCPages(data.pages || 0);
+      setCTotal(data.total || 0);
+    },
+    [id, useExplicit, cLimit]
+  );
+  useEffect(() => {
+    loadComments(1);
+  }, [loadComments]);
 
+  const handleBack = useCallback(() => {
+    if (window.history.length > 1) navigate(-1);
+    else navigate("/", { replace: true });
+  }, [navigate]);
 
-def _json_with_cache(payload, status=200, max_age=3600):
-    resp = make_response(jsonify(payload), status)
-    if max_age and status == 200:
-        resp.headers["Cache-Control"] = f"public, max-age={max_age}"
-    return resp
+  const handleLike = useCallback(async () => {
+    if (!id || useExplicit) return;
+    try {
+      const r = await likeItem(id);
+      setLikes(typeof r?.likes === "number" ? r.likes : (v) => (v ?? 0) + 1);
+    } catch {}
+  }, [id, useExplicit]);
 
-# ===== Rutas =====
+  const handleDislike = useCallback(async () => {
+    if (!id || useExplicit) return;
+    try {
+      const r = await dislikeItem(id);
+      setDislikes(
+        typeof r?.dislikes === "number" ? r.dislikes : (v) => (v ?? 0) + 1
+      );
+    } catch {}
+  }, [id, useExplicit]);
 
-# Listado
-@bp.route("", methods=["GET"])
-def api_items():
-    try:
-        parsed = _parse_query_args(request.args)
+  // Post comentario
+  const [commentAuthor, setCommentAuthor] = useState("");
+  const [commentText, setCommentText] = useState("");
+  const onSubmitComment = useCallback(
+    async (e) => {
+      e.preventDefault();
+      if (!id || useExplicit) return;
+      const text = commentText.trim();
+      if (!text) return;
+      setAddingComment(true);
+      try {
+        const created = await postComment(id, {
+          text,
+          author: commentAuthor.trim() || undefined,
+        });
+        setCommentText("");
+        setCommentAuthor("");
+        setComments((p) => [created, ...p]);
+        setCTotal((t) => t + 1);
+      } catch {
+      } finally {
+        setAddingComment(false);
+      }
+    },
+    [id, useExplicit, commentText, commentAuthor]
+  );
 
-        # Llamamos SIEMPRE al controller (para que los tests puedan monkeypatchear)
-        result = get_filtered_items(parsed)
+  if (loading) {
+    return (
+      <main className="mx-auto max-w-5xl p-4 md:p-6">
+        <div className="animate-pulse space-y-4" aria-busy>
+          <div className="h-5 w-24 rounded bg-gray-200" />
+          <div className="h-8 w-3/4 rounded bg-gray-200" />
+          <div className="h-6 w-1/2 rounded bg-gray-200" />
+          <div className="h-72 w-full rounded bg-gray-200" />
+        </div>
+      </main>
+    );
+  }
+  if (error) {
+    return (
+      <main className="mx-auto max-w-4xl p-4 md:p-6">
+        <button
+          onClick={handleBack}
+          className="inline-flex items-center gap-2 text-sm text-blue-600 hover:underline"
+        >
+          <ArrowLeftIcon className="h-4 w-4" /> Volver
+        </button>
+        <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-4 text-red-800">
+          <h1 className="text-lg font-semibold">No se pudo cargar el documento</h1>
+          <p className="mt-1 text-sm">{String(error.message || error)}</p>
+          <div className="mt-3 text-xs opacity-75">ID: {id}</div>
+        </div>
+      </main>
+    );
+  }
+  if (!doc) return null;
 
-        # Asegura 'pages' si el controller no lo aporta
-        if isinstance(result, dict):
-            total = result.get("total", 0) or 0
-            limit = result.get("limit", parsed.get("limit", 12)) or 12
-            pages = result.get("pages")
-            if pages is None and limit:
-                pages = (total + limit - 1) // limit
-                result["pages"] = pages
+  const {
+    titulo_resumen,
+    titulo,
+    titulo_completo,
+    section_name,
+    departamento_name,
+    epigrafe_name,
+    identificador,
+    control,
+    created_at,
+    url_pdf,
+    sourceUrl,
+  } = doc;
 
-        # Debug opcional
-        if request.headers.get("X-Debug-Filters") == "1" and current_app.config.get("DEBUG_FILTERS_ENABLED", False):
-            debug = {
-                "_debug": True,
-                "raw_query": request.query_string.decode("utf-8", errors="ignore"),
-                "parsed_filters": parsed,
-            }
-            if isinstance(result, dict):
-                result = {**result, **debug}
-            else:
-                result = {"data": result, **debug}
+  const displayDate = created_at
+    ? new Date(created_at).toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "long",
+        day: "2-digit",
+      })
+    : null;
+  const longTitle = [titulo_completo, titulo].filter(Boolean).join("").trim();
 
-        return jsonify(result), 200
+  /* --------- Render Impacto en tarjetas con iconos + acordeón --------- */
+  const impactMapOrder = [
+    {
+      key: "afectados",
+      label: "Afectados",
+      Icon: UserGroupIcon,
+      dot: "bg-emerald-500",
+    },
+    {
+      key: "cambios_operativos",
+      label: "Cambios operativos",
+      Icon: ArrowPathIcon,
+      dot: "bg-sky-500",
+    },
+    {
+      key: "riesgos_potenciales",
+      label: "Riesgos potenciales",
+      Icon: ExclamationTriangleIcon,
+      dot: "bg-amber-500",
+    },
+    {
+      key: "beneficios_previstos",
+      label: "Beneficios previstos",
+      Icon: SparklesIcon,
+      dot: "bg-violet-500",
+    },
+    {
+      key: "recomendaciones",
+      label: "Recomendaciones",
+      Icon: LightBulbIcon,
+      dot: "bg-rose-500",
+    },
+  ];
 
-    except Exception:
-        current_app.logger.exception("items list failed")
-        page  = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
-        limit = _safe_int(request.args.get("limit", 12), 12, 1, 100)
-        raw_sort_by  = (request.args.get("sort_by") or "created_at").strip().lower()
-        raw_sort_dir = (request.args.get("sort_dir") or "desc").strip().lower()
-        sort_by  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
-        sort_dir = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
+  let impactoContent = null;
+  if (impacto) {
+    let parsed = impacto;
+    if (typeof parsed === "string") {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {}
+    }
+    if (parsed && typeof parsed === "object") {
+      const sections = impactMapOrder.filter((s) => parsed[s.key]);
+      impactoContent = (
+        <div className="space-y-3">
+          {sections.map(({ key, label, Icon, dot }) => {
+            const val = parsed[key];
+            return (
+              <div key={key} className="rounded-xl border p-4">
+                <div className="flex items-center gap-2">
+                  <span className={cx("h-2.5 w-2.5 rounded-full", dot)} />
+                  <Icon className="h-4 w-4 text-gray-600" />
+                  <h3 className="text-sm font-medium text-gray-700">{label}</h3>
+                </div>
+                {Array.isArray(val) ? (
+                  <ul className="mt-2 list-disc pl-5 text-sm text-gray-900">
+                    {val.map((x, i) => (
+                      <li key={i} className="break-words">
+                        {String(x)}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-2 whitespace-pre-wrap break-words text-sm text-gray-900">
+                    {String(val)}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    } else {
+      impactoContent = (
+        <p className="whitespace-pre-wrap text-gray-800">{String(impacto)}</p>
+      );
+    }
+  }
 
-        return jsonify({
-            "items": [],
-            "page": page,
-            "limit": limit,
-            "total": 0,
-            "pages": 0,
-            "sort_by": sort_by,
-            "sort_dir": sort_dir,
-        }), 200
+  return (
+    <main role="main" className="mx-auto max-w-5xl p-4 md:p-6">
+      {/* Top bar */}
+      <div className="mb-3 flex items-center justify-between">
+        <button
+          onClick={handleBack}
+          className="inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+        >
+          <ArrowLeftIcon className="h-4 w-4" /> Volver atrás
+        </button>
+        {/* Se elimina el PDF duplicado en top bar */}
+      </div>
 
+      {/* Cabecera */}
+      <div className="rounded-2xl border bg-white p-5 shadow-sm">
+        <h1 className="text-2xl font-extrabold leading-snug text-gray-900">
+          {titulo_resumen || titulo || "Documento BOE"}
+        </h1>
+        {longTitle && (
+          <p className="mt-2 whitespace-pre-wrap text-gray-800">{longTitle}</p>
+        )}
 
-# Detalle
-@bp.route("/<identificador>", methods=["GET"])
-def api_item_by_id(identificador):
-    data = get_item_by_id(identificador)
-    if not data:
-        return jsonify({"detail": "Not found"}), 404
-    return jsonify(data), 200
+        {/* Metadatos visuales (solo nombres) */}
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          {section_name && (
+            <span className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs font-medium text-gray-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />
+              Sección: {section_name}
+            </span>
+          )}
+          {epigrafe_name && (
+            <span className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs font-medium text-gray-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-indigo-500" />
+              Epígrafe: {epigrafe_name}
+            </span>
+          )}
+          {departamento_name && (
+            <span className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs font-medium text-gray-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+              Departamento: {departamento_name}
+            </span>
+          )}
+        </div>
 
-@bp.route("/<identificador>/resumen", methods=["GET"])
-def api_resumen(identificador):
-    return jsonify(get_item_resumen(identificador)), 200
+        {/* Detalles secundarios */}
+        <dl className="mt-4 grid gap-y-2 text-sm md:grid-cols-3">
+          {identificador && (
+            <div>
+              <dt className="text-gray-500">Identificador</dt>
+              <dd className="break-words text-gray-900">{identificador}</dd>
+            </div>
+          )}
+          {control && (
+            <div>
+              <dt className="text-gray-500">Control</dt>
+              <dd className="break-words text-gray-900">{control}</dd>
+            </div>
+          )}
+          {created_at && (
+            <div>
+              <dt className="text-gray-500">Fecha publicación</dt>
+              <dd className="text-gray-900">{displayDate}</dd>
+            </div>
+          )}
+        </dl>
+      </div>
 
-@bp.route("/<identificador>/impacto", methods=["GET"])
-def api_impacto(identificador):
-    return jsonify(get_item_impacto(identificador)), 200
+      {/* Likes / Dislikes + Acciones principales */}
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <button
+          onClick={handleLike}
+          className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-sm text-emerald-800 hover:bg-emerald-100"
+        >
+          <HandThumbUpIcon className="h-4 w-4" /> {likes}
+        </button>
+        <button
+          onClick={handleDislike}
+          className="inline-flex items-center gap-2 rounded-full border border-rose-200 bg-rose-50 px-3 py-1.5 text-sm text-rose-800 hover:bg-rose-100"
+        >
+          <HandThumbDownIcon className="h-4 w-4" /> {dislikes}
+        </button>
 
-# Reacciones
-@bp.route("/<identificador>/like", methods=["POST"])
-def api_like(identificador):
-    return jsonify(like_item(identificador)), 200
+        {url_pdf && (
+          <a
+            href={url_pdf}
+            target="_blank"
+            rel="noreferrer"
+            className="ml-1 inline-flex items-center gap-2 rounded-xl bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
+          >
+            <DocumentTextIcon className="h-4 w-4" /> Ver PDF
+          </a>
+        )}
 
-@bp.route("/<identificador>/dislike", methods=["POST"])
-def api_dislike(identificador):
-    return jsonify(dislike_item(identificador)), 200
+        {sourceUrl && (
+          <a
+            href={sourceUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-sm hover:bg-gray-50"
+          >
+            Abrir en BOE
+          </a>
+        )}
+      </div>
 
-# Catálogos (cache)
-@bp.route("/departamentos", methods=["GET"])
-def api_departamentos():
-    try:
-        data = list_departamentos()
-        return _json_with_cache(data, 200, max_age=3600)
-    except Exception:
-        current_app.logger.exception("departamentos failed")
-        return _json_with_cache([], 200, max_age=60)
+      {/* Resumen (acordeón) */}
+      {(summaryParts.contexto ||
+        summaryParts.fechas ||
+        summaryParts.cambios ||
+        summaryParts.conclusion) && (
+        <section className="mt-5">
+          <Disclosure defaultOpen>
+            {({ open }) => (
+              <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+                <Disclosure.Button className="flex w-full items-center justify-between px-5 py-3 text-left">
+                  <div className="flex items-center gap-2">
+                    <DocumentTextIcon className="h-5 w-5 text-gray-600" />
+                    <span className="text-base font-semibold text-gray-900">
+                      Resumen
+                    </span>
+                  </div>
+                  <ChevronDownIcon
+                    className={cx(
+                      "h-5 w-5 text-gray-500 transition-transform",
+                      open && "rotate-180"
+                    )}
+                  />
+                </Disclosure.Button>
+                <Disclosure.Panel className="border-t px-5 py-4">
+                  {summaryParts.contexto && (
+                    <div className="mt-1">
+                      <div className="flex items-center gap-2">
+                        <BookOpenIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">
+                          Contexto
+                        </h3>
+                      </div>
+                      <p className="mt-1 whitespace-pre-wrap text-gray-800">
+                        {summaryParts.contexto}
+                      </p>
+                    </div>
+                  )}
 
-@bp.route("/secciones", methods=["GET"])
-def api_secciones():
-    try:
-        data = list_secciones()
-        return _json_with_cache(data, 200, max_age=3600)
-    except Exception:
-        current_app.logger.exception("secciones failed")
-        return _json_with_cache([], 200, max_age=60)
+                  {summaryParts.fechas && (
+                    <div className="mt-4">
+                      <div className="flex items-center gap-2">
+                        <CalendarDaysIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">
+                          Fechas clave
+                        </h3>
+                      </div>
+                      {Array.isArray(summaryParts.fechas) ? (
+                        <ul className="mt-1 list-disc pl-5 text-gray-800">
+                          {summaryParts.fechas.map((f, i) => (
+                            <li key={i}>{String(f)}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <ul className="mt-1 list-disc pl-5 text-gray-800">
+                          {String(summaryParts.fechas)
+                            .split(/\r?\n|\u2022|-/)
+                            .map((line, i) => {
+                              const t = line.trim();
+                              return t ? <li key={i}>{t}</li> : null;
+                            })}
+                        </ul>
+                      )}
+                    </div>
+                  )}
 
-@bp.route("/epigrafes", methods=["GET"])
-def api_epigrafes():
-    try:
-        data = list_epigrafes()
-        return _json_with_cache(data, 200, max_age=3600)
-    except Exception:
-        current_app.logger.exception("epigrafes failed")
-        return _json_with_cache([], 200, max_age=60)
+                  {summaryParts.cambios && (
+                    <div className="mt-4">
+                      <div className="flex items-center gap-2">
+                        <ArrowPathIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">
+                          Cambios clave
+                        </h3>
+                      </div>
+                      {Array.isArray(summaryParts.cambios) ? (
+                        <ul className="mt-1 list-disc pl-5 text-gray-800">
+                          {summaryParts.cambios.map((c, i) => (
+                            <li key={i}>{String(c)}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-1 whitespace-pre-wrap text-gray-800">
+                          {String(summaryParts.cambios)}
+                        </p>
+                      )}
+                    </div>
+                  )}
 
-# ===== Endpoint de eco/diagnóstico explícito (solo DEV) =====
-@bp.route("/_debug/echo", methods=["GET"])
-def api_items_echo():
-    """
-    /api/items/_debug/echo?departamentos=a&departamentos=b&secciones=I,II...
-    Devuelve cómo interpreta el backend los filtros.
-    Requiere DEBUG_FILTERS_ENABLED=True.
-    """
-    if not current_app.config.get("DEBUG_FILTERS_ENABLED", False):
-        return jsonify({"detail": "Debug endpoint disabled"}), 404
+                  {summaryParts.conclusion && (
+                    <div className="mt-4">
+                      <div className="flex items-center gap-2">
+                        <LightBulbIcon className="h-4 w-4 text-gray-600" />
+                        <h3 className="text-sm font-medium text-gray-700">
+                          Conclusión
+                        </h3>
+                      </div>
+                      <p className="mt-1 whitespace-pre-wrap text-gray-800">
+                        {summaryParts.conclusion}
+                      </p>
+                    </div>
+                  )}
+                </Disclosure.Panel>
+              </div>
+            )}
+          </Disclosure>
+        </section>
+      )}
 
-    parsed = _parse_query_args(request.args)
-    return jsonify({
-        "_debug": True,
-        "raw_query": request.query_string.decode("utf-8", errors="ignore"),
-        "parsed_filters": parsed,
-    }), 200
+      {/* Informe de Impacto (acordeón) */}
+      {impactoContent && (
+        <section className="mt-5">
+          <Disclosure>
+            {({ open }) => (
+              <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+                <Disclosure.Button className="flex w-full items-center justify-between px-5 py-3 text-left">
+                  <div className="flex items-center gap-2">
+                    <SparklesIcon className="h-5 w-5 text-gray-600" />
+                    <span className="text-base font-semibold text-gray-900">
+                      Informe de Impacto
+                    </span>
+                  </div>
+                  <ChevronDownIcon
+                    className={cx(
+                      "h-5 w-5 text-gray-500 transition-transform",
+                      open && "rotate-180"
+                    )}
+                  />
+                </Disclosure.Button>
+                <Disclosure.Panel className="border-t px-5 py-4">
+                  {impactoContent}
+                </Disclosure.Panel>
+              </div>
+            )}
+          </Disclosure>
+        </section>
+      )}
+
+      {/* Comentarios */}
+      {!useExplicit && (
+        <section className="mt-6 rounded-2xl border bg-white p-5 shadow-sm">
+          <h2 className="text-base font-semibold text-gray-900">
+            Comentarios ({cTotal})
+          </h2>
+          <form onSubmit={onSubmitComment} className="mt-3 grid gap-2 md:grid-cols-3">
+            <input
+              type="text"
+              placeholder="Autor (opcional)"
+              value={commentAuthor}
+              onChange={(e) => setCommentAuthor(e.target.value)}
+              className="rounded-xl border px-3 py-2 text-sm md:col-span-1"
+            />
+            <input
+              type="text"
+              placeholder="Escribe un comentario…"
+              value={commentText}
+              onChange={(e) => setCommentText(e.target.value)}
+              className="rounded-xl border px-3 py-2 text-sm md:col-span-2"
+              required
+            />
+            <div className="md:col-span-3">
+              <button
+                type="submit"
+                disabled={addingComment}
+                className="rounded-xl bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                {addingComment ? "Enviando…" : "Publicar"}
+              </button>
+            </div>
+          </form>
+
+          <div className="mt-4 space-y-3">
+            {comments.length === 0 ? (
+              <p className="text-sm text-gray-600">Aún no hay comentarios.</p>
+            ) : (
+              comments.map((c) => (
+                <div key={c.id} className="rounded-xl border p-3">
+                  <div className="text-xs text-gray-500">
+                    {c.author || "Anónimo"} ·{" "}
+                    {c.created_at ? new Date(c.created_at).toLocaleString() : ""}
+                  </div>
+                  <p className="mt-1 whitespace-pre-wrap text-sm text-gray-900">
+                    {c.text || c.content}
+                  </p>
+                </div>
+              ))
+            )}
+          </div>
+
+          {cPages > 1 && (
+            <div className="mt-4 flex items-center gap-2">
+              <button
+                onClick={() => loadComments(Math.max(1, cPage - 1))}
+                disabled={cPage <= 1}
+                className="rounded-xl border px-3 py-1.5 text-sm disabled:opacity-50"
+              >
+                ← Anteriores
+              </button>
+              <div className="text-xs text-gray-600">
+                Página {cPage} / {cPages}
+              </div>
+              <button
+                onClick={() => loadComments(Math.min(cPages, cPage + 1))}
+                disabled={cPage >= cPages}
+                className="rounded-xl border px-3 py-1.5 text-sm disabled:opacity-50"
+              >
+                Siguientes →
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+    </main>
+  );
+}

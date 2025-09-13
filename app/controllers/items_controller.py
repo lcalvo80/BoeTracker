@@ -222,7 +222,6 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         _use_fts_rank = False
         if q_adv and len(q_adv) >= 2:
             if _fts_available(conn):
-                # i.fts @@ plainto_tsquery('spanish', %s)
                 where_sql_parts.append(sql.SQL("i.fts @@ plainto_tsquery(%s, %s)"))
                 args.extend([_ts_lang(conn), q_adv])
                 _use_fts_rank = True
@@ -271,14 +270,26 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.departamento_codigo"),
             sql.SQL("i.seccion_codigo"),
             sql.SQL("i.epigrafe"),
-            sql.SQL("i.created_at") if has_created_at else (
-                sql.SQL("i.created_at_date AS created_at") if has_created_at_date else sql.SQL("NULL AS created_at")
+            sql.SQL("i.created_at") if _col_exists(conn, "items", "created_at") else (
+                sql.SQL("i.created_at_date AS created_at") if _col_exists(conn, "items", "created_at_date") else sql.SQL("NULL AS created_at")
             ),
             sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
             sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
             sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
         ]
         joins: List[sql.SQL] = []
+
+        # catálogos disponibles
+        dep_table = None
+        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
+            if _lookup_table_exists(conn, t):
+                dep_table = t
+                break
+        sec_table = None
+        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
+            if _lookup_table_exists(conn, t):
+                sec_table = t
+                break
 
         if dep_table:
             select_cols.append(sql.SQL("d.nombre AS departamento_nombre"))
@@ -294,7 +305,6 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
         # ORDER BY (soporta relevancia con FTS)
         if sort_by == "relevancia" and _use_fts_rank:
-            # ORDER BY ts_rank(i.fts, plainto_tsquery('spanish', %s)) [ASC|DESC]
             order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s)) ")
             order_params: List[Any] = [_ts_lang(conn), q_adv]
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
@@ -342,7 +352,14 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 # ====================== Detalle & derivados ======================
 
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
+    """
+    Devuelve el detalle del item con:
+      - nombres de catálogo (departamento_nombre, seccion_nombre)
+      - impacto normalizado como 'impacto'
+      - URLs normalizadas como 'url_pdf' y 'sourceUrl'
+    """
     with get_db() as conn, conn.cursor() as cur:
+        # columnas existentes
         base_cols = [
             "id", "identificador",
             "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
@@ -352,27 +369,67 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         ]
         existing_cols = [c for c in base_cols if _col_exists(conn, "items", c)]
 
-        sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
-        # impacto normalizado
+        # Impacto normalizado
+        impacto_expr = None
         if _col_exists(conn, "items", "informe_impacto"):
-            sel_parts.append("i.informe_impacto AS impacto")
+            impacto_expr = "i.informe_impacto AS impacto"
         elif _col_exists(conn, "items", "impacto"):
-            sel_parts.append("i.impacto")
+            impacto_expr = "i.impacto AS impacto"
+
+        # URL PDF priorizando el primer campo existente
+        url_pdf_expr = None
+        for cand in ("url_pdf", "pdf_url", "pdf", "urlPdf"):
+            if _col_exists(conn, "items", cand):
+                url_pdf_expr = f"i.{cand} AS url_pdf"
+                break
+
+        # URL fuente (BOE) priorizando el primer campo existente
+        source_url_expr = None
+        for cand in ("sourceUrl", "url_boe"):
+            if _col_exists(conn, "items", cand):
+                source_url_expr = f"i.{cand} AS sourceUrl"
+                break
+
+        # catálogos disponibles
+        dep_table = None
+        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
+            if _lookup_table_exists(conn, t):
+                dep_table = t
+                break
+        sec_table = None
+        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
+            if _lookup_table_exists(conn, t):
+                sec_table = t
+                break
+
+        sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
+        if impacto_expr:    sel_parts.append(impacto_expr)
+        if url_pdf_expr:    sel_parts.append(url_pdf_expr)
+        if source_url_expr: sel_parts.append(source_url_expr)
+        if dep_table:       sel_parts.append("d.nombre AS departamento_nombre")
+        if sec_table:       sel_parts.append("s.nombre AS seccion_nombre")
 
         sel = ", ".join(sel_parts) or "i.identificador"
-        cur.execute(f"SELECT {sel} FROM items i WHERE identificador = %s LIMIT 1", (identificador,))
+
+        join_sql: List[str] = []
+        if dep_table:
+            join_sql.append(f'LEFT JOIN {dep_table} d ON d.codigo = i.departamento_codigo')
+        if sec_table:
+            join_sql.append(f'LEFT JOIN {sec_table} s ON s.codigo = i.seccion_codigo')
+        joins = " ".join(join_sql)
+
+        cur.execute(f"SELECT {sel} FROM items i {joins} WHERE i.identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
         if not row:
             return None
         names = [desc.name for desc in cur.description]
         data = dict(zip(names, row))
 
-    if "impacto" not in data and "informe_impacto" in data:
-        data["impacto"] = data.get("informe_impacto")
-
+    # Defaults y consistencia
     for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
-              "resumen", "impacto", "likes", "dislikes", "control",
-              "departamento_codigo", "seccion_codigo", "epigrafe", "created_at"):
+              "contenido", "resumen", "impacto", "likes", "dislikes", "control",
+              "departamento_codigo", "seccion_codigo", "epigrafe", "created_at",
+              "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"):
         data.setdefault(k, None)
 
     return data
