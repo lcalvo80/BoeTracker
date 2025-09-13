@@ -6,13 +6,25 @@ import { getItems, getFilterOptions } from "../services/boeService";
 import TagMultiSelect from "../components/TagMultiSelect";
 import ResultCard from "../components/ResultCard";
 import Section from "../components/ui/Section";
+import CalendarTheme from "../components/ui/CalendarTheme";
 
 const ITEMS_PER_PAGE = 12;
 
-const toIsoDate = (d) =>
+/** =========================================
+ *  Utilidades de fecha (evitar problemas TZ)
+ *  - Trabajamos en el estado con strings "YYYY-MM-DD"
+ *  - Convertimos Date <-> string sin introducir UTC
+ * ==========================================*/
+const toYmdMadrid = (d) =>
   d instanceof Date && !isNaN(d)
-    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" })
-    : null;
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // "YYYY-MM-DD"
+    : "";
+
+const ymdToLocalDate = (s) => {
+  if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d); // Local time sin desplazamiento
+};
 
 const formatDateEsLong = (dateObj) =>
   new Intl.DateTimeFormat("es-ES", {
@@ -104,15 +116,16 @@ const BOEPage = () => {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // 🔁 Estado de filtros: fechas como strings "YYYY-MM-DD"
   const [filters, setFilters] = useState({
     q_adv: "",
     identificador: "",
     secciones: [],
     departamentos: [],
     epigrafes: [],
-    fecha: null,
-    fecha_desde: null,
-    fecha_hasta: null,
+    fecha: "", // exacta
+    fecha_desde: "", // rango desde
+    fecha_hasta: "", // rango hasta
     useRange: false,
   });
 
@@ -149,10 +162,6 @@ const BOEPage = () => {
       fecha, fecha_desde, fecha_hasta, useRange,
     } = filters;
 
-    const fecha_iso = fecha ? toIsoDate(fecha) : undefined;
-    const fecha_desde_iso = fecha_desde ? toIsoDate(fecha_desde) : undefined;
-    const fecha_hasta_iso = fecha_hasta ? toIsoDate(fecha_hasta) : undefined;
-
     return {
       q: q_adv?.trim() || undefined,
       identificador: identificador?.trim() || undefined,
@@ -160,9 +169,9 @@ const BOEPage = () => {
       departamentos,
       epigrafes,
       useRange,
-      fecha: !useRange ? fecha_iso : undefined,
-      fecha_desde: useRange ? fecha_desde_iso : undefined,
-      fecha_hasta: useRange ? fecha_hasta_iso : undefined,
+      fecha: !useRange && fecha ? fecha : undefined,
+      fecha_desde: useRange && fecha_desde ? fecha_desde : undefined,
+      fecha_hasta: useRange && fecha_hasta ? fecha_hasta : undefined,
       page: currentPage,
       limit: ITEMS_PER_PAGE,
       sort_by: "created_at",
@@ -246,9 +255,9 @@ const BOEPage = () => {
       secciones: [],
       departamentos: [],
       epigrafes: [],
-      fecha: null,
-      fecha_desde: null,
-      fecha_hasta: null,
+      fecha: "",
+      fecha_desde: "",
+      fecha_hasta: "",
       useRange: false,
     });
     setCurrentPage(1);
@@ -284,8 +293,8 @@ const BOEPage = () => {
                   ...p,
                   useRange: idx === 1,
                   ...(idx === 1
-                    ? { fecha: null }
-                    : { fecha_desde: null, fecha_hasta: null }),
+                    ? { fecha: "" }
+                    : { fecha_desde: "", fecha_hasta: "" }),
                 }))
               }
               className={`px-3 py-1.5 text-xs rounded-md transition ${
@@ -305,10 +314,12 @@ const BOEPage = () => {
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 lg:px-8">
+      {/* Tema/estilos del calendario encapsulados en un componente */}
+      <CalendarTheme />
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Sidebar filtros */}
         <aside className="lg:col-span-5">
-          {/* 🔧 Menos espacio vertical: space-y-3 (antes 4) */}
           <div className="sticky top-6 space-y-3 bg-white rounded-2xl shadow-sm p-6 border border-gray-100">
             <div className="flex justify-between items-center">
               <h2 className="text-lg font-bold">Filtros</h2>
@@ -320,8 +331,7 @@ const BOEPage = () => {
               </button>
             </div>
 
-            {/* Sección de búsqueda sin título "Búsqueda" */}
-            {/* 🔧 Menos espacio interno: space-y-2 */}
+            {/* Búsqueda */}
             <Section defaultOpen>
               <div className="space-y-2">
                 <div>
@@ -369,7 +379,7 @@ const BOEPage = () => {
               </div>
             </Section>
 
-            {/* Taxonomías sin título "Taxonomías" */}
+            {/* Taxonomías */}
             <Section defaultOpen>
               <div className="space-y-2">
                 <TagMultiSelect
@@ -399,60 +409,79 @@ const BOEPage = () => {
               </div>
             </Section>
 
+            {/* Fecha */}
             <Section title="Fecha" defaultOpen={false}>
               <div className="space-y-2">
                 <DateModeToggle />
-                {!filters.useRange ? (
-                  <div>
-                    <label className="text-sm font-medium text-gray-700 mb-0.5 block">
-                      Fecha de creación (exacta)
-                    </label>
-                    <div className="rounded-2xl border border-gray-100 p-2 shadow-inner">
-                      <Calendar
-                        onChange={(date) =>
-                          setFilters((prev) => ({ ...prev, fecha: date }))
-                        }
-                        value={filters.fecha}
-                        className="w-full"
-                        tileClassName="text-sm"
-                      />
-                    </div>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 gap-2">
-                    <div>
-                      <label className="text-sm font-medium text-gray-700 mb-0.5 block">
-                        Desde
-                      </label>
-                      <input
-                        type="date"
-                        className={inputBase}
-                        value={filters.fecha_desde ? toIsoDate(filters.fecha_desde) : ""}
-                        onChange={(e) =>
+
+                <div className="rounded-2xl border border-gray-100 p-2 shadow-inner">
+                  {!filters.useRange ? (
+                    <Calendar
+                      locale="es-ES"
+                      className="boe-calendar w-full"
+                      value={filters.fecha ? ymdToLocalDate(filters.fecha) : null}
+                      onChange={(date) => {
+                        setFilters((prev) => ({
+                          ...prev,
+                          fecha: date ? toYmdMadrid(date) : "",
+                        }));
+                        setCurrentPage(1);
+                      }}
+                      maxDetail="month"
+                      next2Label={null}
+                      prev2Label={null}
+                      showNeighboringMonth={false}
+                      tileClassName="text-sm"
+                    />
+                  ) : (
+                    <Calendar
+                      locale="es-ES"
+                      className="boe-calendar w-full"
+                      selectRange
+                      value={
+                        filters.fecha_desde && filters.fecha_hasta
+                          ? [
+                              ymdToLocalDate(filters.fecha_desde),
+                              ymdToLocalDate(filters.fecha_hasta),
+                            ]
+                          : filters.fecha_desde
+                          ? [
+                              ymdToLocalDate(filters.fecha_desde),
+                              ymdToLocalDate(filters.fecha_desde),
+                            ]
+                          : null
+                      }
+                      onChange={(val) => {
+                        if (Array.isArray(val)) {
+                          const [start, end] = val;
                           setFilters((prev) => ({
                             ...prev,
-                            fecha_desde: e.target.value ? new Date(e.target.value) : null,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium text-gray-700 mb-0.5 block">
-                        Hasta
-                      </label>
-                      <input
-                        type="date"
-                        className={inputBase}
-                        value={filters.fecha_hasta ? toIsoDate(filters.fecha_hasta) : ""}
-                        onChange={(e) =>
+                            fecha_desde: start ? toYmdMadrid(start) : "",
+                            fecha_hasta: end ? toYmdMadrid(end) : "",
+                          }));
+                        } else {
                           setFilters((prev) => ({
                             ...prev,
-                            fecha_hasta: e.target.value ? new Date(e.target.value) : null,
-                          }))
+                            fecha_desde: val ? toYmdMadrid(val) : "",
+                            fecha_hasta: "",
+                          }));
                         }
-                      />
-                    </div>
-                  </div>
+                        setCurrentPage(1);
+                      }}
+                      maxDetail="month"
+                      next2Label={null}
+                      prev2Label={null}
+                      showNeighboringMonth={false}
+                      tileClassName="text-sm"
+                    />
+                  )}
+                </div>
+
+                {filters.useRange && (
+                  <p className="text-xs text-gray-500">
+                    Rango: {filters.fecha_desde || "—"}
+                    {filters.fecha_hasta ? ` → ${filters.fecha_hasta}` : ""}
+                  </p>
                 )}
               </div>
             </Section>
@@ -492,7 +521,6 @@ const BOEPage = () => {
           ) : loading ? (
             <div className="p-6 text-gray-600">Cargando...</div>
           ) : items?.length > 0 ? (
-            /* Compacto: multicolumna; Completo: 1 columna */
             <div
               className={
                 compactMode
@@ -508,7 +536,11 @@ const BOEPage = () => {
                   expanded={expandedIds.includes(item.id)}
                   onToggle={(e) => toggleExpanded(e, item.id)}
                   onOpen={() =>
-                    navigate(`/item/${encodeURIComponent(item.identificador)}`)
+                    navigate(
+                      `/item/${encodeURIComponent(
+                        item.identificador ?? item.id ?? ""
+                      )}`
+                    )
                   }
                   getPublishedDate={getPublishedDate}
                   getEpigrafe={getEpigrafe}
