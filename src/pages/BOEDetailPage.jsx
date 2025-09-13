@@ -31,6 +31,38 @@ const maybeInflateBase64Gzip=async(s)=>{try{if(!s||typeof s!=="string")return s;
 const cx=(...c)=>c.filter(Boolean).join(" ");
 
 /* ============================================================
+   Componente reutilizable: sección plegable tipo “tarjeta”
+   ============================================================ */
+function FoldableSection({ label, Icon, dot, children, defaultOpen = true }) {
+  return (
+    <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
+      <Disclosure defaultOpen={defaultOpen}>
+        {({ open }) => (
+          <>
+            <Disclosure.Button className="flex w-full items-center justify-between px-5 py-3 text-left">
+              <div className="flex items-center gap-2">
+                <span className={cx("h-2.5 w-2.5 rounded-full", dot)} />
+                {Icon && <Icon className="h-4 w-4 text-gray-600" />}
+                <span className="text-sm font-medium text-gray-700">{label}</span>
+              </div>
+              <ChevronDownIcon
+                className={cx(
+                  "h-5 w-5 text-gray-500 transition-transform",
+                  open && "rotate-180"
+                )}
+              />
+            </Disclosure.Button>
+            <Disclosure.Panel className="border-t px-5 py-4">
+              {children}
+            </Disclosure.Panel>
+          </>
+        )}
+      </Disclosure>
+    </div>
+  );
+}
+
+/* ============================================================
    API helpers (axios.baseURL ya debe ser "/api")
    ============================================================ */
 async function fetchDetail(id, signal){const {data}=await api.get(`items/${encodeURIComponent(id)}`,{signal});return data;}
@@ -209,6 +241,37 @@ export default function BOEDetailPage(){
     { key: "recomendaciones", label: "Recomendaciones", Icon: LightBulbIcon, dot: "bg-rose-500" },
   ];
 
+  // === Mapeo para secciones de resumen con mismo look & feel
+  const summaryMapOrder = [
+    { key: "contexto", label: "Contexto", Icon: BookOpenIcon, dot: "bg-blue-500" },
+    { key: "fechas", label: "Fechas clave", Icon: CalendarDaysIcon, dot: "bg-indigo-500" },
+    { key: "cambios", label: "Cambios clave", Icon: ArrowPathIcon, dot: "bg-sky-500" },
+    { key: "conclusion", label: "Conclusión", Icon: LightBulbIcon, dot: "bg-amber-500" },
+  ];
+
+  // === Render helpers para contenido de sección
+  const renderArrayOrText = (val) => {
+    if (Array.isArray(val)) {
+      return (
+        <ul className="mt-1 list-disc pl-5 text-sm text-gray-900">
+          {val.map((x,i)=><li key={i} className="break-words">{String(x)}</li>)}
+        </ul>
+      );
+    }
+    return <p className="mt-1 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(val)}</p>;
+  };
+
+  const renderDates = (val) => {
+    if (Array.isArray(val)) return renderArrayOrText(val);
+    const parts = String(val).split(/\r?\n|\u2022|-/);
+    return (
+      <ul className="mt-1 list-disc pl-5 text-sm text-gray-900">
+        {parts.map((line,i)=>{ const t=line.trim(); return t?<li key={i}>{t}</li>:null; })}
+      </ul>
+    );
+  };
+
+  // === Construcción contenido de Impacto (con tarjeta plegable por sección)
   let impactoContent = null;
   if (impacto) {
     let parsed = impacto;
@@ -220,20 +283,9 @@ export default function BOEDetailPage(){
           {sections.map(({key,label,Icon,dot})=>{
             const val = parsed[key];
             return (
-              <div key={key} className="rounded-xl border p-4">
-                <div className="flex items-center gap-2">
-                  <span className={cx("h-2.5 w-2.5 rounded-full", dot)} />
-                  <Icon className="h-4 w-4 text-gray-600" />
-                  <h3 className="text-sm font-medium text-gray-700">{label}</h3>
-                </div>
-                {Array.isArray(val) ? (
-                  <ul className="mt-2 list-disc pl-5 text-sm text-gray-900">
-                    {val.map((x,i)=><li key={i} className="break-words">{String(x)}</li>)}
-                  </ul>
-                ) : (
-                  <p className="mt-2 text-sm text-gray-900 whitespace-pre-wrap break-words">{String(val)}</p>
-                )}
-              </div>
+              <FoldableSection key={key} label={label} Icon={Icon} dot={dot}>
+                {renderArrayOrText(val)}
+              </FoldableSection>
             );
           })}
         </div>
@@ -328,7 +380,7 @@ export default function BOEDetailPage(){
         )}
       </div>
 
-      {/* Resumen (acordeón) */}
+      {/* Resumen (acordeón principal) */}
       {(summaryParts.contexto || summaryParts.fechas || summaryParts.cambios || summaryParts.conclusion) && (
         <section className="mt-5">
           <Disclosure defaultOpen>
@@ -342,59 +394,24 @@ export default function BOEDetailPage(){
                   <ChevronDownIcon className={cx("h-5 w-5 text-gray-500 transition-transform", open && "rotate-180")} />
                 </Disclosure.Button>
                 <Disclosure.Panel className="border-t px-5 py-4">
-                  {summaryParts.contexto && (
-                    <div className="mt-1">
-                      <div className="flex items-center gap-2">
-                        <BookOpenIcon className="h-4 w-4 text-gray-600" />
-                        <h3 className="text-sm font-medium text-gray-700">Contexto</h3>
-                      </div>
-                      <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.contexto}</p>
-                    </div>
-                  )}
-
-                  {summaryParts.fechas && (
-                    <div className="mt-4">
-                      <div className="flex items-center gap-2">
-                        <CalendarDaysIcon className="h-4 w-4 text-gray-600" />
-                        <h3 className="text-sm font-medium text-gray-700">Fechas clave</h3>
-                      </div>
-                      {Array.isArray(summaryParts.fechas) ? (
-                        <ul className="mt-1 list-disc pl-5 text-gray-800">
-                          {summaryParts.fechas.map((f,i)=><li key={i}>{String(f)}</li>)}
-                        </ul>
-                      ) : (
-                        <ul className="mt-1 list-disc pl-5 text-gray-800">
-                          {String(summaryParts.fechas).split(/\r?\n|\u2022|-/).map((line,i)=>{const t=line.trim(); return t?<li key={i}>{t}</li>:null;})}
-                        </ul>
-                      )}
-                    </div>
-                  )}
-
-                  {summaryParts.cambios && (
-                    <div className="mt-4">
-                      <div className="flex items-center gap-2">
-                        <ArrowPathIcon className="h-4 w-4 text-gray-600" />
-                        <h3 className="text-sm font-medium text-gray-700">Cambios clave</h3>
-                      </div>
-                      {Array.isArray(summaryParts.cambios) ? (
-                        <ul className="mt-1 list-disc pl-5 text-gray-800">
-                          {summaryParts.cambios.map((c,i)=><li key={i}>{String(c)}</li>)}
-                        </ul>
-                      ) : (
-                        <p className="mt-1 whitespace-pre-wrap text-gray-800">{String(summaryParts.cambios)}</p>
-                      )}
-                    </div>
-                  )}
-
-                  {summaryParts.conclusion && (
-                    <div className="mt-4">
-                      <div className="flex items-center gap-2">
-                        <LightBulbIcon className="h-4 w-4 text-gray-600" />
-                        <h3 className="text-sm font-medium text-gray-700">Conclusión</h3>
-                      </div>
-                      <p className="mt-1 whitespace-pre-wrap text-gray-800">{summaryParts.conclusion}</p>
-                    </div>
-                  )}
+                  <div className="space-y-3">
+                    {summaryMapOrder
+                      .filter(({key}) => summaryParts[key])
+                      .map(({key,label,Icon,dot}) => {
+                        const val = summaryParts[key];
+                        return (
+                          <FoldableSection
+                            key={key}
+                            label={label}
+                            Icon={Icon}
+                            dot={dot}
+                            defaultOpen
+                          >
+                            {key === "fechas" ? renderDates(val) : renderArrayOrText(val)}
+                          </FoldableSection>
+                        );
+                      })}
+                  </div>
                 </Disclosure.Panel>
               </div>
             )}
@@ -402,7 +419,7 @@ export default function BOEDetailPage(){
         </section>
       )}
 
-      {/* Informe de Impacto (acordeón) */}
+      {/* Informe de Impacto (acordeón principal) */}
       {impactoContent && (
         <section className="mt-5">
           <Disclosure>
