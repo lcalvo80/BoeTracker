@@ -143,7 +143,7 @@ def _parse_query_args(args):
     fecha_desde = _safe_date(data.get("fecha_desde"))
     fecha_hasta = _safe_date(data.get("fecha_hasta"))
 
-    use_range = data.get("useRange", None)
+    use_range = _safe_bool(data.get("useRange"), False)  # default=False
     if use_range is False and fecha_exacta:
         # modo fecha exacta: fuerza desde=hasta=fecha y limpia claves
         data["fecha_desde"] = fecha_exacta
