@@ -38,7 +38,8 @@ const App = () => {
 
       <Navbar />
 
-      <main id="content" className="main-content min-h-screen">
+      {/* Compensar la altura del navbar fijo (h-16 = 64px) */}
+      <main id="content" className="main-content min-h-screen pt-16">
         <Suspense fallback={<Loader />}>
           <Routes>
             <Route path="/" element={<Home />} />
