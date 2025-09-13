@@ -341,7 +341,7 @@ const BOEPage = () => {
             </div>
 
             {/* Búsqueda */}
-            <Section defaultOpen>
+            <Section title="Búsqueda" defaultOpen>
               <div className="space-y-2">
                 <div>
                   <label className="text-sm font-medium text-gray-800 mb-0.5 block">
@@ -389,7 +389,7 @@ const BOEPage = () => {
             </Section>
 
             {/* Taxonomías */}
-            <Section defaultOpen>
+            <Section title="Taxonomía" defaultOpen>
               <div className="space-y-2">
                 <TagMultiSelect
                   label="Sección"
