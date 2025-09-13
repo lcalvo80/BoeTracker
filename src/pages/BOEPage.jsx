@@ -88,9 +88,10 @@ const getDepartamento = (item) =>
   (Array.isArray(item?.departamentos) ? item.departamentos[0] : null) ??
   "—";
 
+// 🔧 Tono neutro y menos llamativo en focus (gris)
 const inputBase =
   "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm placeholder:text-gray-400 " +
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/60 disabled:opacity-50";
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-400/50 disabled:opacity-50";
 
 const BOEPage = () => {
   const navigate = useNavigate();
@@ -307,7 +308,8 @@ const BOEPage = () => {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Sidebar filtros */}
         <aside className="lg:col-span-5">
-          <div className="sticky top-6 space-y-4 bg-white rounded-2xl shadow-sm p-6 border border-gray-100">
+          {/* 🔧 Menos espacio vertical: space-y-3 (antes 4) */}
+          <div className="sticky top-6 space-y-3 bg-white rounded-2xl shadow-sm p-6 border border-gray-100">
             <div className="flex justify-between items-center">
               <h2 className="text-lg font-bold">Filtros</h2>
               <button
@@ -319,10 +321,11 @@ const BOEPage = () => {
             </div>
 
             {/* Sección de búsqueda sin título "Búsqueda" */}
+            {/* 🔧 Menos espacio interno: space-y-2 */}
             <Section defaultOpen>
-              <div className="space-y-3">
+              <div className="space-y-2">
                 <div>
-                  <label className="text-sm font-medium text-gray-800 mb-1 block">
+                  <label className="text-sm font-medium text-gray-800 mb-0.5 block">
                     Búsqueda avanzada
                   </label>
                   <input
@@ -338,7 +341,7 @@ const BOEPage = () => {
                     className={inputBase}
                     placeholder='Escribe lo que buscas. Ej.: ayudas vivienda, "contrato menor"'
                   />
-                  <p className="mt-2 text-xs text-gray-500">
+                  <p className="mt-1 text-xs text-gray-500">
                     Usa comillas para frase exacta y{" "}
                     <code className="rounded bg-gray-100 px-1 py-0.5">-palabra</code>{" "}
                     para excluir.
@@ -346,7 +349,7 @@ const BOEPage = () => {
                 </div>
 
                 <div>
-                  <label className="text-sm font-medium text-gray-700 mb-1 block">
+                  <label className="text-sm font-medium text-gray-700 mb-0.5 block">
                     Identificador
                   </label>
                   <input
@@ -368,7 +371,7 @@ const BOEPage = () => {
 
             {/* Taxonomías sin título "Taxonomías" */}
             <Section defaultOpen>
-              <div className="space-y-3">
+              <div className="space-y-2">
                 <TagMultiSelect
                   label="Sección"
                   options={seccionOpts}
@@ -397,11 +400,11 @@ const BOEPage = () => {
             </Section>
 
             <Section title="Fecha" defaultOpen={false}>
-              <div className="space-y-3">
+              <div className="space-y-2">
                 <DateModeToggle />
                 {!filters.useRange ? (
                   <div>
-                    <label className="text-sm font-medium text-gray-700 mb-1 block">
+                    <label className="text-sm font-medium text-gray-700 mb-0.5 block">
                       Fecha de creación (exacta)
                     </label>
                     <div className="rounded-2xl border border-gray-100 p-2 shadow-inner">
@@ -416,9 +419,9 @@ const BOEPage = () => {
                     </div>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 gap-3">
+                  <div className="grid grid-cols-1 gap-2">
                     <div>
-                      <label className="text-sm font-medium text-gray-700 mb-1 block">
+                      <label className="text-sm font-medium text-gray-700 mb-0.5 block">
                         Desde
                       </label>
                       <input
@@ -434,7 +437,7 @@ const BOEPage = () => {
                       />
                     </div>
                     <div>
-                      <label className="text-sm font-medium text-gray-700 mb-1 block">
+                      <label className="text-sm font-medium text-gray-700 mb-0.5 block">
                         Hasta
                       </label>
                       <input
@@ -571,7 +574,7 @@ const BOEPage = () => {
                     onClick={() => setCurrentPage(page)}
                     className={`px-3 py-1 text-sm border rounded ${
                       page === currentPage
-                        ? "bg-blue-600 text-white"
+                        ? "bg-gray-800 text-white"
                         : "text-gray-700 hover:bg-gray-100"
                     }`}
                     aria-current={page === currentPage ? "page" : undefined}

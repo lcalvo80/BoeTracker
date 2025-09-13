@@ -7,8 +7,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - onChange: (string[]) => void
  * - label: string
  * - placeholder?: string
- * - showCode?: boolean (default true) -> Si false, NO muestra " (COD)" junto al nombre.
- * - Nota: ahora las opciones aparecen en un dropdown al enfocar/teclear.
+ * - showCode?: boolean (default true)
  */
 const TagMultiSelect = ({
   label,
@@ -55,9 +54,7 @@ const TagMultiSelect = ({
     const q = query.trim().toLowerCase();
     if (!q) return normalizedOptions;
     return normalizedOptions.filter(
-      (o) =>
-        o.label.toLowerCase().includes(q) ||
-        o.value.toLowerCase().includes(q)
+      (o) => o.label.toLowerCase().includes(q) || o.value.toLowerCase().includes(q)
     );
   }, [normalizedOptions, query]);
 
@@ -91,7 +88,7 @@ const TagMultiSelect = ({
   return (
     <div ref={wrapRef} className="relative">
       {label && (
-        <label className="text-sm font-medium text-gray-700 mb-1 block">
+        <label className="text-sm font-medium text-gray-700 mb-0.5 block">
           {label}
         </label>
       )}
@@ -99,7 +96,7 @@ const TagMultiSelect = ({
       {/* Input de búsqueda + botón chevron */}
       <div
         className={`flex items-center gap-2 rounded-lg border bg-white px-3 py-2 text-sm ${
-          open ? "border-blue-400 ring-2 ring-blue-600/30" : "border-gray-300"
+          open ? "border-gray-300 ring-2 ring-gray-300/40" : "border-gray-300"
         }`}
         onClick={() => {
           setOpen(true);
@@ -124,7 +121,7 @@ const TagMultiSelect = ({
         <button
           type="button"
           aria-label={open ? "Cerrar opciones" : "Abrir opciones"}
-          className="shrink-0 rounded-md p-1 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/50"
+          className="shrink-0 rounded-md p-1 hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300/60"
           onClick={(e) => {
             e.stopPropagation();
             setOpen((v) => !v);
@@ -143,13 +140,13 @@ const TagMultiSelect = ({
         </button>
       </div>
 
-      {/* Chips seleccionados */}
+      {/* Chips seleccionados (neutros) */}
       {selectedObjects?.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1.5">
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
           {selectedObjects.map((opt) => (
             <span
               key={opt.value}
-              className="inline-flex items-center gap-1 rounded-full bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 text-xs"
+              className="inline-flex items-center gap-1 rounded-full bg-gray-100 text-gray-800 border border-gray-300 px-2 py-0.5 text-xs"
             >
               <span className="truncate max-w-[16rem]">
                 {renderOptionText(opt)}
@@ -157,15 +154,11 @@ const TagMultiSelect = ({
               <button
                 type="button"
                 onClick={() => remove(opt.value)}
-                className="rounded-full hover:bg-blue-100 p-0.5"
+                className="rounded-full hover:bg-gray-200 p-0.5"
                 aria-label={`Quitar ${opt.label}`}
                 title="Quitar"
               >
-                <svg
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                  className="h-3.5 w-3.5"
-                >
+                <svg viewBox="0 0 20 20" fill="currentColor" className="h-3.5 w-3.5">
                   <path
                     fillRule="evenodd"
                     d="M10 8.586l3.182-3.182a1 1 0 111.414 1.414L11.414 10l3.182 3.182a1 1 0 01-1.414 1.414L10 11.414l-3.182 3.182a1 1 0 01-1.414-1.414L8.586 10 5.404 6.818a1 1 0 111.414-1.414L10 8.586z"
@@ -178,10 +171,10 @@ const TagMultiSelect = ({
         </div>
       )}
 
-      {/* Dropdown de opciones */}
+      {/* Dropdown de opciones: borde y realce suaves (mismo tono que ayuda) */}
       {open && (
         <div
-          className="absolute z-20 mt-1 w-full max-h-56 overflow-auto rounded-lg border border-gray-200 bg-white shadow-lg"
+          className="absolute z-20 mt-1 w-full max-h-56 overflow-auto rounded-lg border border-gray-200 bg-white shadow-md"
           role="listbox"
         >
           {filtered.length === 0 ? (
@@ -195,18 +188,18 @@ const TagMultiSelect = ({
                   type="button"
                   onClick={() => toggle(opt.value)}
                   className={`w-full text-left px-3 py-2 text-sm hover:bg-gray-50 focus-visible:outline-none ${
-                    active ? "bg-blue-50" : "bg-white"
+                    active ? "bg-gray-100" : "bg-white"
                   }`}
                   role="option"
-                  aria-selected={active}  // ✅ correcto para role="option"
+                  aria-selected={active}
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="truncate">{renderOptionText(opt)}</span>
+                    <span className="truncate text-gray-800">{renderOptionText(opt)}</span>
                     {active && (
                       <svg
                         viewBox="0 0 20 20"
                         fill="currentColor"
-                        className="h-4 w-4 text-blue-600 shrink-0"
+                        className="h-4 w-4 text-gray-600 shrink-0"
                       >
                         <path
                           fillRule="evenodd"
