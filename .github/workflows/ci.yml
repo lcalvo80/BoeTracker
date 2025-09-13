@@ -7,17 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       from_date:
-        description: "Fecha inicio (YYYY-MM-DD)"
+        description: "Fecha inicio (YYYY-MM-DD o YYYYMMDD)"
         required: false
         type: string
         default: ""
       to_date:
-        description: "Fecha fin (YYYY-MM-DD)"
+        description: "Fecha fin (YYYY-MM-DD o YYYYMMDD)"
         required: false
         type: string
         default: ""
 
-# Evita que un nuevo push cancele el run en curso
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -43,23 +42,19 @@ jobs:
           --health-retries=5
 
     env:
-      # Secrets
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-      # Inputs de fechas (solo existen en workflow_dispatch)
       FROM_DATE: ${{ github.event.inputs.from_date }}
       TO_DATE: ${{ github.event.inputs.to_date }}
 
-      # Mejor logging en CI
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-      # Tunables de OpenAI en CI (puedes ajustarlos sin tocar código)
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
-      # OPENAI_MODEL: "gpt-4o-mini"  # opcional: override global
+      # OPENAI_MODEL: "gpt-4o-mini"
 
     steps:
       - name: Checkout repo
@@ -96,7 +91,7 @@ jobs:
           echo "PostgreSQL no respondió a tiempo." >&2
           exit 1
 
-      - name: Ejecutar actualización del BOE (con keep-alive)
+      - name: Ejecutar actualización del BOE (keep-alive + normalización)
         shell: bash
         run: |
           set -euo pipefail
@@ -106,11 +101,22 @@ jobs:
           KA_PID=$!
           trap "kill $KA_PID" EXIT
 
-          # Construir args condicionalmente (evita pasar flags vacíos)
+          # Normaliza YYYYMMDD -> YYYY-MM-DD
+          norm_date() {
+            local s="${1:-}"
+            if [[ "$s" =~ ^[0-9]{8}$ ]]; then
+              echo "${s:0:4}-${s:4:2}-${s:6:2}"
+            else
+              echo "$s"
+            fi
+          }
+
+          FROM_NORM="$(norm_date "${FROM_DATE:-}")"
+          TO_NORM="$(norm_date "${TO_DATE:-}")"
+
           ARGS=()
-          if [[ -n "${FROM_DATE:-}" ]]; then ARGS+=(--from "$FROM_DATE"); fi
-          if [[ -n "${TO_DATE:-}" ]]; then ARGS+=(--to "$TO_DATE"); fi
+          if [[ -n "${FROM_NORM}" ]]; then ARGS+=(--from "$FROM_NORM"); fi
+          if [[ -n "${TO_NORM}" ]]; then ARGS+=(--to "$TO_NORM"); fi
 
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
-          # Forzar flush línea a línea
           stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"
