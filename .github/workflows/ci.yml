@@ -4,10 +4,27 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: "Fecha inicio (YYYY-MM-DD)"
+        required: false
+        type: string
+        default: ""
+      to_date:
+        description: "Fecha fin (YYYY-MM-DD)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     services:
       postgres:
@@ -19,14 +36,18 @@ jobs:
           POSTGRES_PASSWORD: test_password
           POSTGRES_DB: test_db
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="pg_isready -U test_user -d test_db"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
 
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}  # ✅ IMPORTANTE
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      FROM_DATE: ${{ github.event.inputs.from_date }}
+      TO_DATE: ${{ github.event.inputs.to_date }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repo
@@ -35,15 +56,40 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.11
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system deps (psql)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Esperar a que PostgreSQL esté listo
+        env:
+          PGPASSWORD: test_password
         run: |
-          echo "Esperando a que PostgreSQL esté listo..."
-          sleep 10
+          for i in {1..30}; do
+            if psql -h localhost -U test_user -d test_db -c "select 1" >/dev/null 2>&1; then
+              echo "PostgreSQL listo."
+              exit 0
+            fi
+            echo "Esperando PostgreSQL ($i/30)..."
+            sleep 2
+          done
+          echo "PostgreSQL no respondió a tiempo." >&2
+          exit 1
 
       - name: Ejecutar actualización del BOE
-        run: python update_boe.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [[ -n "${FROM_DATE:-}" ]]; then ARGS+=(--from "$FROM_DATE"); fi
+          if [[ -n "${TO_DATE:-}" ]]; then ARGS+=(--to "$TO_DATE"); fi
+          echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
+          python update_boe.py "${ARGS[@]:-}"

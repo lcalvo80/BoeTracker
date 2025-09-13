@@ -3,21 +3,25 @@ import os
 import json
 import time
 import logging
+from typing import Optional
 
 from utils.helpers import extract_section, clean_code_block
 
-# --- Parámetros de robustez ---
-_OPENAI_TIMEOUT = 30           # segundos por request
-_OPENAI_MAX_RETRIES = 3        # reintentos de aplicación (además de los internos del SDK)
-_OPENAI_BACKOFF_BASE = 1.5     # factor base para backoff exponencial (1.5, 2, 3, ...)
+# --- Parámetros configurables por entorno (útiles en CI) ---
+_OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "45"))        # segundos por request
+_OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3")) # reintentos de aplicación
+_OPENAI_BACKOFF_BASE = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")             # modelo por defecto
 
-def _sleep_with_retry_after(exc, attempt):
+
+def _sleep_with_retry_after(exc: Exception, attempt: int) -> None:
     """
-    Respeta Retry-After si existe (429), si no aplica backoff exponencial.
+    Respeta Retry-After si existe (429) y si no aplica backoff exponencial.
+    attempt es 1-based en los logs para legibilidad.
     """
     retry_after = None
     try:
-        # SDK v1 expone response en e.response si es APIError
+        # SDK v1 expone response.headers si es APIStatusError
         retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
     except Exception:
         pass
@@ -26,49 +30,77 @@ def _sleep_with_retry_after(exc, attempt):
         try:
             delay = float(retry_after)
         except ValueError:
-            delay = ( _OPENAI_BACKOFF_BASE ** attempt )
+            delay = (_OPENAI_BACKOFF_BASE ** attempt)
     else:
-        delay = ( _OPENAI_BACKOFF_BASE ** attempt )
+        delay = (_OPENAI_BACKOFF_BASE ** attempt)
 
-    delay = min(delay, 20.0)  # tapa superior razonable
-    logging.warning(f"⏳ Backoff {attempt}: durmiendo {delay:.1f}s...")
+    delay = min(delay, 20.0)  # tapa superior razonable para CI
+    logging.warning(f"⏳ Backoff intento {attempt}: durmiendo {delay:.1f}s...")
     time.sleep(delay)
 
-def _chat_completion_with_retry(client, *, messages, model="gpt-4o", max_tokens=600, temperature=0.2):
+
+def _chat_completion_with_retry(
+    client,
+    *,
+    messages,
+    model: Optional[str] = None,
+    max_tokens: int = 600,
+    temperature: float = 0.2,
+):
     """
     Envoltorio robusto para una única llamada a chat.completions.create
     - Reintenta en 429/5xx y timeouts.
-    - Respeta Retry-After.
+    - Respeta Retry-After si existe.
     - Propaga errores no recuperables.
     """
+    # Intento de importar clases de error del SDK v1 (si existen)
+    try:
+        from openai import APITimeoutError, APIConnectionError, RateLimitError, APIStatusError
+    except Exception:
+        APITimeoutError = APIConnectionError = RateLimitError = APIStatusError = tuple()  # type: ignore
+
+    use_model = model or _OPENAI_MODEL
     last_err = None
+
     for attempt in range(_OPENAI_MAX_RETRIES + 1):
         try:
             return client.chat.completions.create(
-                model=model,
+                model=use_model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
         except Exception as e:
             last_err = e
-            # Clasifica errores recuperables (timeout, 429, 5xx)
+            # status_code si lo expone el SDK v1
             code = getattr(getattr(e, "response", None), "status_code", None)
-            is_timeout = isinstance(e, TimeoutError) or "timeout" in str(e).lower()
-            is_rate_or_5xx = code in (429, 500, 502, 503, 504)
+
+            # Clasificar errores recuperables (timeout + 429/5xx)
+            # Usamos heurística por texto además de clases del SDK.
+            msg = str(e).lower()
+            is_timeout = (
+                isinstance(e, (APITimeoutError,)) or
+                "timeout" in msg or "timed out" in msg
+            )
+            is_rate_or_5xx = (code in (429, 500, 502, 503, 504))
 
             if attempt < _OPENAI_MAX_RETRIES and (is_rate_or_5xx or is_timeout):
-                logging.warning(f"⚠️ OpenAI call failed (attempt {attempt}/{_OPENAI_MAX_RETRIES}) code={code}: {e}")
+                logging.warning(
+                    f"⚠️ OpenAI call falló (intento {attempt}/{_OPENAI_MAX_RETRIES}) "
+                    f"code={code} model={use_model}: {e}"
+                )
                 _sleep_with_retry_after(e, attempt + 1)
                 continue
 
             # No recuperable o sin intentos restantes
-            logging.error(f"❌ OpenAI call error (final): code={code} {e}")
+            logging.error(f"❌ OpenAI call error (final): code={code} model={use_model} {e}")
             raise
-    # Si llegara aquí (no debería), relanza último error
+
+    # Si por alguna razón cae aquí, relanza el último error
     raise last_err  # pragma: no cover
 
-def get_openai_responses(title, content):
+
+def get_openai_responses(title: str, content: str):
     """
     Mantiene la firma original y las 3 llamadas:
     - título resumido
@@ -77,15 +109,26 @@ def get_openai_responses(title, content):
 
     Devuelve:
     (titulo_resumen: str, resumen_json: str, impacto_json: str)
-    """
-    import openai
 
-    # Cliente v1 con timeout y reintentos internos del SDK (suma a nuestros reintentos de aplicación)
-    client = openai.OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        timeout=_OPENAI_TIMEOUT,
-        max_retries=0  # desactivamos los internos; controlamos nosotros
-    )
+    Comportamiento ante errores: captura excepciones y devuelve strings JSON vacíos,
+    sin interrumpir el proceso (ideal para CI).
+    """
+    try:
+        import openai
+    except Exception as e:
+        logging.error(f"❌ No se pudo importar el SDK de OpenAI: {e}")
+        return "", json.dumps({}, ensure_ascii=False), json.dumps({}, ensure_ascii=False)
+
+    # Cliente v1 con timeout; desactivamos reintentos internos para controlar nosotros
+    try:
+        client = openai.OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=_OPENAI_TIMEOUT,
+            max_retries=0,
+        )
+    except Exception as e:
+        logging.error(f"❌ No se pudo inicializar el cliente de OpenAI: {e}")
+        return "", json.dumps({}, ensure_ascii=False), json.dumps({}, ensure_ascii=False)
 
     try:
         # -------------------------
@@ -97,14 +140,20 @@ def get_openai_responses(title, content):
             f"{title}"
         )
         title_messages = [
-            {"role": "system", "content": "Resumes títulos del BOE de forma clara y accesible para el público general. Devuelve solo el texto del título, sin comillas ni markdown."},
+            {
+                "role": "system",
+                "content": (
+                    "Resumes títulos del BOE de forma clara y accesible para el público general. "
+                    "Devuelve solo el texto del título, sin comillas ni markdown."
+                ),
+            },
             {"role": "user", "content": title_prompt},
         ]
 
         title_resp = _chat_completion_with_retry(
             client,
             messages=title_messages,
-            model="gpt-4o",
+            model=os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL),
             max_tokens=50,
             temperature=0.3,
         )
@@ -112,7 +161,7 @@ def get_openai_responses(title, content):
         titulo_resumen = titulo_resumen.rstrip(".").strip()
 
         # -------------------------
-        # 2) RESUMEN ESTRUCTURADO (texto plano con encabezados)
+        # 2) RESUMEN ESTRUCTURADO
         # -------------------------
         resumen_prompt = f"""
 Actúa como un experto asistente legal especializado en analizar publicaciones oficiales como el Boletín Oficial del Estado (BOE).
@@ -146,7 +195,7 @@ Contenido:
         resumen_resp = _chat_completion_with_retry(
             client,
             messages=resumen_messages,
-            model="gpt-4o",
+            model=os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL),
             max_tokens=900,
             temperature=0.2,
         )
@@ -155,16 +204,20 @@ Contenido:
         resumen_json = {
             "context": extract_section(resumen_text, "Contexto") or "",
             "key_changes": [
-                line.strip() for line in (extract_section(resumen_text, "Cambios clave") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(resumen_text, "Cambios clave") or "").split("\n")
+                if line.strip()
             ],
             "key_dates_events": [
-                line.strip() for line in (extract_section(resumen_text, "Fechas clave") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(resumen_text, "Fechas clave") or "").split("\n")
+                if line.strip()
             ],
             "conclusion": extract_section(resumen_text, "Conclusión") or "",
         }
 
         # -------------------------
-        # 3) IMPACTO LEGISLATIVO (texto plano con encabezados)
+        # 3) IMPACTO LEGISLATIVO
         # -------------------------
         impacto_prompt = f"""
 Actúa como un analista legislativo con experiencia en la evaluación de normativas oficiales publicadas en el Boletín Oficial del Estado (BOE).
@@ -199,7 +252,7 @@ Contenido:
         impacto_resp = _chat_completion_with_retry(
             client,
             messages=impacto_messages,
-            model="gpt-4o",
+            model=os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL),
             max_tokens=900,
             temperature=0.2,
         )
@@ -207,29 +260,40 @@ Contenido:
 
         impacto_json = {
             "afectados": [
-                line.strip() for line in (extract_section(impacto_text, "Afectados") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(impacto_text, "Afectados") or "").split("\n")
+                if line.strip()
             ],
             "cambios_operativos": [
-                line.strip() for line in (extract_section(impacto_text, "Cambios operativos") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(impacto_text, "Cambios operativos") or "").split("\n")
+                if line.strip()
             ],
             "riesgos_potenciales": [
-                line.strip() for line in (extract_section(impacto_text, "Riesgos potenciales") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(impacto_text, "Riesgos potenciales") or "").split("\n")
+                if line.strip()
             ],
             "beneficios_previstos": [
-                line.strip() for line in (extract_section(impacto_text, "Beneficios previstos") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(impacto_text, "Beneficios previstos") or "").split("\n")
+                if line.strip()
             ],
             "recomendaciones": [
-                line.strip() for line in (extract_section(impacto_text, "Recomendaciones") or "").split("\n") if line.strip()
+                line.strip()
+                for line in (extract_section(impacto_text, "Recomendaciones") or "").split("\n")
+                if line.strip()
             ],
         }
 
         # Devuelve exactamente como antes
         return (
-            titulo_resumen,
+            (titulo_resumen or "").strip(),
             json.dumps(resumen_json, ensure_ascii=False),
             json.dumps(impacto_json, ensure_ascii=False),
         )
 
     except Exception as e:
+        # Cualquier error aquí no debe romper el pipeline
         logging.error(f"❌ Error con OpenAI: {e}")
         return "", json.dumps({}, ensure_ascii=False), json.dumps({}, ensure_ascii=False)

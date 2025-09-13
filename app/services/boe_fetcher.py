@@ -8,9 +8,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-headers = {"Accept": "application/xml"}
-#BASE_URL = "https://boe.es/datosabiertos/api/boe/sumario/{date}"
-BASE_URL = "https://boe.es/datosabiertos/api/boe/sumario/20250909"
+headers = {
+    "Accept": "application/xml",
+    "User-Agent": "boe-updater/1.0 (+github actions)"
+}
+BASE_URL = "https://boe.es/datosabiertos/api/boe/sumario/{date}"
 
 # Configura una sesión con reintentos a nivel de transporte (DNS/reset/5xx idempotentes)
 def _build_session(total_retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
