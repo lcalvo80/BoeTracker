@@ -10,20 +10,19 @@ import CalendarTheme from "../components/ui/CalendarTheme";
 
 const ITEMS_PER_PAGE = 12;
 
-/** =========================================
- *  Utilidades de fecha (evitar problemas TZ)
- *  - Trabajamos en el estado con strings "YYYY-MM-DD"
- *  - Convertimos Date <-> string sin introducir UTC
- * ==========================================*/
+/** ========= Utilidades fecha (evitar TZ) =========
+ *  - Estado con strings "YYYY-MM-DD"
+ *  - Date <-> string sin UTC para no desplazar días
+ */
 const toYmdMadrid = (d) =>
   d instanceof Date && !isNaN(d)
-    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" }) // "YYYY-MM-DD"
+    ? d.toLocaleDateString("sv-SE", { timeZone: "Europe/Madrid" })
     : "";
 
 const ymdToLocalDate = (s) => {
   if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
   const [y, m, d] = s.split("-").map(Number);
-  return new Date(y, m - 1, d); // Local time sin desplazamiento
+  return new Date(y, m - 1, d);
 };
 
 const formatDateEsLong = (dateObj) =>
@@ -74,7 +73,6 @@ const getItemTitle = (item) => {
 const getIdentificador = (item) =>
   item?.identificador ?? item?.id ?? item?.boe_id ?? "—";
 
-// IMPORTANTE: no hacer fallback al resumen. Si no hay título completo, devolvemos "".
 const getFullTitle = (item) => {
   const t =
     item?.titulo ??
@@ -100,10 +98,10 @@ const getDepartamento = (item) =>
   (Array.isArray(item?.departamentos) ? item.departamentos[0] : null) ??
   "—";
 
-// 🔧 Tono neutro y menos llamativo en focus (gris)
+// Inputs: tono neutro y foco suave
 const inputBase =
   "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm placeholder:text-gray-400 " +
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-400/50 disabled:opacity-50";
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/50 disabled:opacity-50";
 
 const BOEPage = () => {
   const navigate = useNavigate();
@@ -116,16 +114,16 @@ const BOEPage = () => {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  // 🔁 Estado de filtros: fechas como strings "YYYY-MM-DD"
+  // Fechas como strings
   const [filters, setFilters] = useState({
     q_adv: "",
     identificador: "",
     secciones: [],
     departamentos: [],
     epigrafes: [],
-    fecha: "", // exacta
-    fecha_desde: "", // rango desde
-    fecha_hasta: "", // rango hasta
+    fecha: "",         // exacta
+    fecha_desde: "",   // rango desde
+    fecha_hasta: "",   // rango hasta
     useRange: false,
   });
 
@@ -168,7 +166,7 @@ const BOEPage = () => {
       secciones,
       departamentos,
       epigrafes,
-      useRange,
+      useRange, // <- necesario para que el BE interprete “fecha” como exacta
       fecha: !useRange && fecha ? fecha : undefined,
       fecha_desde: useRange && fecha_desde ? fecha_desde : undefined,
       fecha_hasta: useRange && fecha_hasta ? fecha_hasta : undefined,
@@ -312,9 +310,20 @@ const BOEPage = () => {
     </div>
   );
 
+  // Etiquetas “Lun, Mar, …” y “septiembre de 2025” consistentes
+  const fmtShortWeekday = (locale, date) =>
+    new Intl.DateTimeFormat("es-ES", { weekday: "short" })
+      .format(date)
+      .replace(".", "")
+      .slice(0, 3); // “lun, mar, …”
+
+  const fmtMonthYear = (locale, date) =>
+    new Intl.DateTimeFormat("es-ES", { month: "long", year: "numeric" })
+      .format(date);
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 lg:px-8">
-      {/* Tema/estilos del calendario encapsulados en un componente */}
+      {/* Estilos del calendario (aislado en componente) */}
       <CalendarTheme />
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
@@ -428,10 +437,15 @@ const BOEPage = () => {
                         setCurrentPage(1);
                       }}
                       maxDetail="month"
+                      minDetail="month"
                       next2Label={null}
                       prev2Label={null}
+                      prevLabel="‹"
+                      nextLabel="›"
                       showNeighboringMonth={false}
                       tileClassName="text-sm"
+                      formatShortWeekday={fmtShortWeekday}
+                      formatMonthYear={fmtMonthYear}
                     />
                   ) : (
                     <Calendar
@@ -469,10 +483,15 @@ const BOEPage = () => {
                         setCurrentPage(1);
                       }}
                       maxDetail="month"
+                      minDetail="month"
                       next2Label={null}
                       prev2Label={null}
+                      prevLabel="‹"
+                      nextLabel="›"
                       showNeighboringMonth={false}
                       tileClassName="text-sm"
+                      formatShortWeekday={fmtShortWeekday}
+                      formatMonthYear={fmtMonthYear}
                     />
                   )}
                 </div>
@@ -606,7 +625,7 @@ const BOEPage = () => {
                     onClick={() => setCurrentPage(page)}
                     className={`px-3 py-1 text-sm border rounded ${
                       page === currentPage
-                        ? "bg-gray-800 text-white"
+                        ? "bg-blue-700 text-white border-blue-700"
                         : "text-gray-700 hover:bg-gray-100"
                     }`}
                     aria-current={page === currentPage ? "page" : undefined}
