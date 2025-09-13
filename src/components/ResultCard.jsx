@@ -90,15 +90,15 @@ const ResultCard = ({
 
   const hasReadableResumen = !!(item?.resumen && !looksLikeGzipBase64(item.resumen));
 
-  // Ahora el expandible principal solo controla el "Resumen" (no el título completo).
+  // El expandible principal solo controla el "Resumen" (no el título completo).
   const shouldShowExpandable = hasReadableResumen;
 
   return (
     <article
-      className="group rounded-2xl border border-gray-100 bg-white shadow-sm hover:shadow-md transition"
+      className={`group rounded-2xl border border-gray-100 bg-white shadow-sm hover:shadow-md transition ${compact ? "text-sm" : ""}`}
       aria-labelledby={`pub-${item?.id || identificador}-title`}
     >
-      <div className="p-4 sm:p-5">
+      <div className={`${compact ? "p-3 sm:p-3" : "p-4 sm:p-5"}`}>
         {/* Cabecera: Identificador + Fecha */}
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-600">
           <span className="font-mono text-[11px] text-gray-800">
@@ -112,15 +112,15 @@ const ResultCard = ({
         <button type="button" onClick={onOpen} className="mt-2 block text-left w-full">
           <h3
             id={`pub-${item?.id || identificador}-title`}
-            className="text-gray-900 font-semibold text-base sm:text-lg leading-snug line-clamp-2"
+            className={`text-gray-900 font-semibold ${compact ? "text-sm sm:text-base line-clamp-1" : "text-base sm:text-lg line-clamp-2"} leading-snug`}
             title={tituloResumen}
           >
             {tituloResumen}
           </h3>
         </button>
 
-        {/* ⬇️ Desplegable inmediato para ver el TÍTULO COMPLETO */}
-        {!sameTitle && !!tituloCompleto && (
+        {/* TÍTULO COMPLETO (oculto en compacto para máxima densidad) */}
+        {!compact && !sameTitle && !!tituloCompleto && (
           <details className="mt-2 group/open">
             <summary
               className="list-none cursor-pointer text-sm text-gray-600 hover:text-gray-900 select-none inline-flex items-center gap-1"
@@ -146,29 +146,36 @@ const ResultCard = ({
           </details>
         )}
 
-        {/* Lista vertical de metadatos */}
-        <div className="mt-2 flex flex-col gap-1">
-          <MetaPill label="Sección" value={seccion} />
-          <MetaPill label="Departamento" value={departamento} />
-          <MetaPill label="Epígrafe" value={epigrafe} />
-        </div>
+        {/* Metadatos: ocultar en compacto para aumentar densidad */}
+        {!compact && (
+          <div className="mt-2 flex flex-col gap-1">
+            <MetaPill label="Sección" value={seccion} />
+            <MetaPill label="Departamento" value={departamento} />
+            <MetaPill label="Epígrafe" value={epigrafe} />
+          </div>
+        )}
 
         {/* Resumen breve si no es compacto */}
         {!compact && hasReadableResumen && (
           <p className="mt-3 text-sm text-gray-700 line-clamp-3">{item.resumen}</p>
         )}
 
-        {/* Acciones (el botón ahora solo controla el bloque de Resumen) */}
+        {/* Acciones */}
         <div className="mt-3 flex items-center justify-between">
+          {/* Botón primario moderno */}
           <button
             type="button"
             onClick={onOpen}
-            className="text-sm text-blue-700 hover:text-blue-900 underline"
+            className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600/50"
           >
-            Abrir detalle
+            Ver detalle
+            <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
+              <path d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 111.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" />
+            </svg>
           </button>
 
-          {shouldShowExpandable && (
+          {/* En compacto ocultamos el expandible (resumen) para ganar densidad */}
+          {!compact && shouldShowExpandable && (
             <button
               type="button"
               onClick={onToggle}
@@ -182,17 +189,13 @@ const ResultCard = ({
         </div>
 
         {/* Expandible principal: SOLO Resumen (si existe) */}
-        {expanded && shouldShowExpandable && (
+        {expanded && !compact && shouldShowExpandable && (
           <div
             id={`rc-${identificador}-expand`}
             className="mt-3 rounded-lg border border-gray-100 bg-gray-50 p-3 text-sm text-gray-800"
           >
-            {hasReadableResumen && (
-              <>
-                <div className="font-medium text-gray-900 mb-1">Resumen</div>
-                <p className="leading-relaxed">{item.resumen}</p>
-              </>
-            )}
+            <div className="font-medium text-gray-900 mb-1">Resumen</div>
+            <p className="leading-relaxed">{item.resumen}</p>
           </div>
         )}
       </div>

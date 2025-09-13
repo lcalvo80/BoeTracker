@@ -390,24 +390,27 @@ const BOEPage = () => {
             <Section title="Taxonomías" defaultOpen>
               <div className="space-y-3">
                 <TagMultiSelect
-                  label="Sección (múltiple)"
+                  label="Sección"
                   options={seccionOpts}
                   values={filters.secciones}
                   onChange={setSecciones}
+                  showCode={false}
                   placeholder="Escribe para filtrar secciones..."
                 />
                 <TagMultiSelect
-                  label="Departamento (múltiple)"
+                  label="Departamento"
                   options={departamentoOpts}
                   values={filters.departamentos}
                   onChange={setDepartamentos}
+                  showCode={false}
                   placeholder="Escribe para filtrar departamentos..."
                 />
                 <TagMultiSelect
-                  label="Epígrafe (múltiple)"
+                  label="Epígrafe"
                   options={epigrafeOpts}
                   values={filters.epigrafes}
                   onChange={setEpigrafes}
+                  showCode={false}
                   placeholder="Escribe para filtrar epígrafes..."
                 />
               </div>
@@ -506,13 +509,24 @@ const BOEPage = () => {
           ) : loading ? (
             <div className="p-6 text-gray-600">Cargando...</div>
           ) : items?.length > 0 ? (
-            // ⬇️ Siempre 1 tarjeta por fila
-            <div className="grid grid-cols-1 gap-4">
+            /* Compacto: multicolumna; Completo: 1 columna */
+            <div
+              className={
+                compactMode
+                  ? "grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3"
+                  : "grid grid-cols-1 gap-4"
+              }
+            >
               {items.map((item) => (
                 <ResultCard
                   key={item.id}
                   item={item}
-                  compact={compactMode}
+                  compact={!!compactMode}
+                  expanded={expandedIds.includes(item.id)}
+                  onToggle={(e) => toggleExpanded(e, item.id)}
+                  onOpen={() =>
+                    navigate(`/item/${encodeURIComponent(item.identificador)}`)
+                  }
                   getPublishedDate={getPublishedDate}
                   getEpigrafe={getEpigrafe}
                   getItemTitle={getItemTitle}
@@ -520,11 +534,6 @@ const BOEPage = () => {
                   getIdentifier={getIdentificador}
                   getSeccion={getSeccion}
                   getDepartamento={getDepartamento}
-                  expanded={expandedIds.includes(item.id)}
-                  onToggle={(e) => toggleExpanded(e, item.id)}
-                  onOpen={() =>
-                    navigate(`/item/${encodeURIComponent(item.identificador)}`)
-                  }
                 />
               ))}
             </div>
