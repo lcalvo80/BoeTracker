@@ -98,7 +98,9 @@ const TagMultiSelect = ({
 
       {/* Input de búsqueda + botón chevron */}
       <div
-        className={`flex items-center gap-2 rounded-lg border bg-white px-3 py-2 text-sm ${open ? "border-blue-400 ring-2 ring-blue-600/30" : "border-gray-300"}`}
+        className={`flex items-center gap-2 rounded-lg border bg-white px-3 py-2 text-sm ${
+          open ? "border-blue-400 ring-2 ring-blue-600/30" : "border-gray-300"
+        }`}
         onClick={() => {
           setOpen(true);
           inputRef.current?.focus();
@@ -132,7 +134,9 @@ const TagMultiSelect = ({
           <svg
             viewBox="0 0 20 20"
             fill="currentColor"
-            className={`h-4 w-4 text-gray-500 transition-transform ${open ? "rotate-180" : ""}`}
+            className={`h-4 w-4 text-gray-500 transition-transform ${
+              open ? "rotate-180" : ""
+            }`}
           >
             <path d="M5.23 7.21a.75.75 0 011.06.02L10 11.185l3.71-3.954a.75.75 0 111.08 1.04l-4.24 4.52a.75.75 0 01-1.08 0l-4.24-4.52a.75.75 0 01.02-1.06z" />
           </svg>
@@ -157,7 +161,11 @@ const TagMultiSelect = ({
                 aria-label={`Quitar ${opt.label}`}
                 title="Quitar"
               >
-                <svg viewBox="0 0 20 20" fill="currentColor" className="h-3.5 w-3.5">
+                <svg
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  className="h-3.5 w-3.5"
+                >
                   <path
                     fillRule="evenodd"
                     d="M10 8.586l3.182-3.182a1 1 0 111.414 1.414L11.414 10l3.182 3.182a1 1 0 01-1.414 1.414L10 11.414l-3.182 3.182a1 1 0 01-1.414-1.414L8.586 10 5.404 6.818a1 1 0 111.414-1.414L10 8.586z"
@@ -189,8 +197,8 @@ const TagMultiSelect = ({
                   className={`w-full text-left px-3 py-2 text-sm hover:bg-gray-50 focus-visible:outline-none ${
                     active ? "bg-blue-50" : "bg-white"
                   }`}
-                  aria-pressed={active}
                   role="option"
+                  aria-selected={active}  // ✅ correcto para role="option"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="truncate">{renderOptionText(opt)}</span>

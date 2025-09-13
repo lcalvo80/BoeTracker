@@ -106,7 +106,6 @@ const BOEPage = () => {
   const [filters, setFilters] = useState({
     q_adv: "",
     identificador: "",
-    control: "",
     secciones: [],
     departamentos: [],
     epigrafes: [],
@@ -144,7 +143,7 @@ const BOEPage = () => {
 
   const queryParams = useMemo(() => {
     const {
-      q_adv, identificador, control,
+      q_adv, identificador,
       secciones, departamentos, epigrafes,
       fecha, fecha_desde, fecha_hasta, useRange,
     } = filters;
@@ -156,7 +155,6 @@ const BOEPage = () => {
     return {
       q: q_adv?.trim() || undefined,
       identificador: identificador?.trim() || undefined,
-      control: control?.trim() || undefined,
       secciones,
       departamentos,
       epigrafes,
@@ -244,7 +242,6 @@ const BOEPage = () => {
     setFilters({
       q_adv: "",
       identificador: "",
-      control: "",
       secciones: [],
       departamentos: [],
       epigrafes: [],
@@ -308,7 +305,7 @@ const BOEPage = () => {
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 lg:px-8">
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Sidebar filtros (más ancho) */}
+        {/* Sidebar filtros */}
         <aside className="lg:col-span-5">
           <div className="sticky top-6 space-y-4 bg-white rounded-2xl shadow-sm p-6 border border-gray-100">
             <div className="flex justify-between items-center">
@@ -321,7 +318,8 @@ const BOEPage = () => {
               </button>
             </div>
 
-            <Section title="Búsqueda" defaultOpen>
+            {/* Sección de búsqueda sin título "Búsqueda" */}
+            <Section defaultOpen>
               <div className="space-y-3">
                 <div>
                   <label className="text-sm font-medium text-gray-800 mb-1 block">
@@ -365,29 +363,11 @@ const BOEPage = () => {
                     placeholder="Buscar por identificador"
                   />
                 </div>
-
-                <div>
-                  <label className="text-sm font-medium text-gray-700 mb-1 block">
-                    Control
-                  </label>
-                  <input
-                    type="text"
-                    name="control"
-                    onChange={handleTextChange}
-                    onCompositionStart={() => setIsComposing(true)}
-                    onCompositionEnd={(e) => {
-                      setIsComposing(false);
-                      debouncedTextChange("control", e.target.value);
-                    }}
-                    value={filters.control}
-                    className={inputBase}
-                    placeholder="Buscar por control"
-                  />
-                </div>
               </div>
             </Section>
 
-            <Section title="Taxonomías" defaultOpen>
+            {/* Taxonomías sin título "Taxonomías" */}
+            <Section defaultOpen>
               <div className="space-y-3">
                 <TagMultiSelect
                   label="Sección"
@@ -603,12 +583,12 @@ const BOEPage = () => {
               {currentPage < totalPages - 2 && (
                 <>
                   <span className="px-1 text-sm text-gray-400">...</span>
-                <button
-                  onClick={() => setCurrentPage(totalPages)}
-                  className="px-3 py-1 text-sm border rounded hover:bg-gray-100"
-                >
-                  {totalPages}
-                </button>
+                  <button
+                    onClick={() => setCurrentPage(totalPages)}
+                    className="px-3 py-1 text-sm border rounded hover:bg-gray-100"
+                  >
+                    {totalPages}
+                  </button>
                 </>
               )}
 
