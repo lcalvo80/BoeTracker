@@ -308,8 +308,8 @@ const BOEPage = () => {
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 lg:px-8">
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Sidebar filtros */}
-        <aside className="lg:col-span-4">
+        {/* Sidebar filtros (más ancho) */}
+        <aside className="lg:col-span-5">
           <div className="sticky top-6 space-y-4 bg-white rounded-2xl shadow-sm p-6 border border-gray-100">
             <div className="flex justify-between items-center">
               <h2 className="text-lg font-bold">Filtros</h2>
@@ -477,7 +477,7 @@ const BOEPage = () => {
         </aside>
 
         {/* Resultados */}
-        <section className="lg:col-span-8 space-y-6">
+        <section className="lg:col-span-7 space-y-6">
           <div className="flex justify-between items-center">
             <h2 className="text-2xl font-bold">Publicaciones encontradas</h2>
 
@@ -603,12 +603,12 @@ const BOEPage = () => {
               {currentPage < totalPages - 2 && (
                 <>
                   <span className="px-1 text-sm text-gray-400">...</span>
-                  <button
-                    onClick={() => setCurrentPage(totalPages)}
-                    className="px-3 py-1 text-sm border rounded hover:bg-gray-100"
-                  >
-                    {totalPages}
-                  </button>
+                <button
+                  onClick={() => setCurrentPage(totalPages)}
+                  className="px-3 py-1 text-sm border rounded hover:bg-gray-100"
+                >
+                  {totalPages}
+                </button>
                 </>
               )}
 
