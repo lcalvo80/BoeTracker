@@ -17,6 +17,7 @@ on:
         type: string
         default: ""
 
+# Evita que un nuevo push cancele el run en curso
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -24,7 +25,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     services:
       postgres:
@@ -42,12 +43,23 @@ jobs:
           --health-retries=5
 
     env:
+      # Secrets
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # Inputs de fechas (solo existen en workflow_dispatch)
       FROM_DATE: ${{ github.event.inputs.from_date }}
       TO_DATE: ${{ github.event.inputs.to_date }}
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+      # Mejor logging en CI
       PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+      # Tunables de OpenAI en CI (puedes ajustarlos sin tocar código)
+      OPENAI_TIMEOUT: "45"
+      OPENAI_MAX_RETRIES: "3"
+      OPENAI_BACKOFF_BASE: "1.5"
+      # OPENAI_MODEL: "gpt-4o-mini"  # opcional: override global
 
     steps:
       - name: Checkout repo
@@ -84,12 +96,21 @@ jobs:
           echo "PostgreSQL no respondió a tiempo." >&2
           exit 1
 
-      - name: Ejecutar actualización del BOE
+      - name: Ejecutar actualización del BOE (con keep-alive)
         shell: bash
         run: |
           set -euo pipefail
+
+          # Keep-alive para evitar "no output" >10 min
+          ( while true; do echo "💓 runner activo $(date -u +%H:%M:%S)"; sleep 60; done ) &
+          KA_PID=$!
+          trap "kill $KA_PID" EXIT
+
+          # Construir args condicionalmente (evita pasar flags vacíos)
           ARGS=()
           if [[ -n "${FROM_DATE:-}" ]]; then ARGS+=(--from "$FROM_DATE"); fi
           if [[ -n "${TO_DATE:-}" ]]; then ARGS+=(--to "$TO_DATE"); fi
+
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
-          python update_boe.py "${ARGS[@]:-}"
+          # Forzar flush línea a línea
+          stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"

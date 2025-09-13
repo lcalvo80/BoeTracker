@@ -3,6 +3,7 @@ import os
 import json
 import time
 import logging
+import random
 from typing import Optional
 
 from utils.helpers import extract_section, clean_code_block
@@ -12,16 +13,22 @@ _OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "45"))        # segundos por r
 _OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3")) # reintentos de aplicación
 _OPENAI_BACKOFF_BASE = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
 _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")             # modelo por defecto
+_OPENAI_BUDGET_SECS = float(os.getenv("OPENAI_BUDGET_SECS", "120"))  # presupuesto de tiempo por get_openai_responses
+_OPENAI_DISABLE = os.getenv("OPENAI_DISABLE", "0") == "1"       # atajo para desactivar llamadas en CI
+
+# Modelos específicos por tarea (opcionales)
+_MODEL_TITLE = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
+_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL)
+_MODEL_IMPACT = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
 
 
 def _sleep_with_retry_after(exc: Exception, attempt: int) -> None:
     """
-    Respeta Retry-After si existe (429) y si no aplica backoff exponencial.
+    Respeta Retry-After si existe (429) y si no aplica backoff exponencial + jitter.
     attempt es 1-based en los logs para legibilidad.
     """
     retry_after = None
     try:
-        # SDK v1 expone response.headers si es APIStatusError
         retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
     except Exception:
         pass
@@ -34,7 +41,10 @@ def _sleep_with_retry_after(exc: Exception, attempt: int) -> None:
     else:
         delay = (_OPENAI_BACKOFF_BASE ** attempt)
 
-    delay = min(delay, 20.0)  # tapa superior razonable para CI
+    # Jitter aleatorio suave para evitar sincronía entre workers
+    delay = delay * (0.85 + 0.3 * random.random())
+    delay = max(0.5, min(delay, 20.0))  # [0.5s, 20s] en CI
+
     logging.warning(f"⏳ Backoff intento {attempt}: durmiendo {delay:.1f}s...")
     time.sleep(delay)
 
@@ -46,12 +56,14 @@ def _chat_completion_with_retry(
     model: Optional[str] = None,
     max_tokens: int = 600,
     temperature: float = 0.2,
+    deadline_ts: Optional[float] = None,  # presupuesto de tiempo absoluto en epoch segundos
 ):
     """
     Envoltorio robusto para una única llamada a chat.completions.create
     - Reintenta en 429/5xx y timeouts.
     - Respeta Retry-After si existe.
-    - Propaga errores no recuperables.
+    - Respeta un presupuesto de tiempo total (deadline_ts) si se define.
+    - Propaga errores no recuperables si no hay más reintentos.
     """
     # Intento de importar clases de error del SDK v1 (si existen)
     try:
@@ -63,6 +75,13 @@ def _chat_completion_with_retry(
     last_err = None
 
     for attempt in range(_OPENAI_MAX_RETRIES + 1):
+        # Verificar presupuesto de tiempo antes de llamar
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            logging.error("⏰ Presupuesto de tiempo agotado antes de invocar OpenAI.")
+            if last_err:
+                raise last_err
+            raise TimeoutError("Presupuesto de tiempo agotado")
+
         try:
             return client.chat.completions.create(
                 model=use_model,
@@ -72,11 +91,9 @@ def _chat_completion_with_retry(
             )
         except Exception as e:
             last_err = e
-            # status_code si lo expone el SDK v1
             code = getattr(getattr(e, "response", None), "status_code", None)
 
             # Clasificar errores recuperables (timeout + 429/5xx)
-            # Usamos heurística por texto además de clases del SDK.
             msg = str(e).lower()
             is_timeout = (
                 isinstance(e, (APITimeoutError,)) or
@@ -84,6 +101,7 @@ def _chat_completion_with_retry(
             )
             is_rate_or_5xx = (code in (429, 500, 502, 503, 504))
 
+            # Si aún queda tiempo y reintentos, aplicar backoff
             if attempt < _OPENAI_MAX_RETRIES and (is_rate_or_5xx or is_timeout):
                 logging.warning(
                     f"⚠️ OpenAI call falló (intento {attempt}/{_OPENAI_MAX_RETRIES}) "
@@ -96,8 +114,31 @@ def _chat_completion_with_retry(
             logging.error(f"❌ OpenAI call error (final): code={code} model={use_model} {e}")
             raise
 
-    # Si por alguna razón cae aquí, relanza el último error
     raise last_err  # pragma: no cover
+
+
+def _make_client():
+    try:
+        import openai
+    except Exception as e:
+        logging.error(f"❌ No se pudo importar el SDK de OpenAI: {e}")
+        return None
+
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logging.error("❌ OPENAI_API_KEY no está definido.")
+            return None
+
+        client = openai.OpenAI(
+            api_key=api_key,
+            timeout=_OPENAI_TIMEOUT,  # por-request
+            max_retries=0,            # controlamos nosotros los reintentos
+        )
+        return client
+    except Exception as e:
+        logging.error(f"❌ No se pudo inicializar el cliente de OpenAI: {e}")
+        return None
 
 
 def get_openai_responses(title: str, content: str):
@@ -113,22 +154,17 @@ def get_openai_responses(title: str, content: str):
     Comportamiento ante errores: captura excepciones y devuelve strings JSON vacíos,
     sin interrumpir el proceso (ideal para CI).
     """
-    try:
-        import openai
-    except Exception as e:
-        logging.error(f"❌ No se pudo importar el SDK de OpenAI: {e}")
+    # Opción para desactivar por completo desde CI sin tocar código
+    if _OPENAI_DISABLE:
+        logging.warning("⚠️ OPENAI_DISABLE=1: se omiten llamadas a OpenAI.")
         return "", json.dumps({}, ensure_ascii=False), json.dumps({}, ensure_ascii=False)
 
-    # Cliente v1 con timeout; desactivamos reintentos internos para controlar nosotros
-    try:
-        client = openai.OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            timeout=_OPENAI_TIMEOUT,
-            max_retries=0,
-        )
-    except Exception as e:
-        logging.error(f"❌ No se pudo inicializar el cliente de OpenAI: {e}")
+    client = _make_client()
+    if client is None:
         return "", json.dumps({}, ensure_ascii=False), json.dumps({}, ensure_ascii=False)
+
+    start_ts = time.time()
+    deadline_ts = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
 
     try:
         # -------------------------
@@ -153,9 +189,10 @@ def get_openai_responses(title: str, content: str):
         title_resp = _chat_completion_with_retry(
             client,
             messages=title_messages,
-            model=os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL),
+            model=_MODEL_TITLE,
             max_tokens=50,
             temperature=0.3,
+            deadline_ts=deadline_ts,
         )
         titulo_resumen = (title_resp.choices[0].message.content or "").strip()
         titulo_resumen = titulo_resumen.rstrip(".").strip()
@@ -195,9 +232,10 @@ Contenido:
         resumen_resp = _chat_completion_with_retry(
             client,
             messages=resumen_messages,
-            model=os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL),
+            model=_MODEL_SUMMARY,
             max_tokens=900,
             temperature=0.2,
+            deadline_ts=deadline_ts,
         )
         resumen_text = clean_code_block((resumen_resp.choices[0].message.content or "").strip())
 
@@ -252,9 +290,10 @@ Contenido:
         impacto_resp = _chat_completion_with_retry(
             client,
             messages=impacto_messages,
-            model=os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL),
+            model=_MODEL_IMPACT,
             max_tokens=900,
             temperature=0.2,
+            deadline_ts=deadline_ts,
         )
         impacto_text = clean_code_block((impacto_resp.choices[0].message.content or "").strip())
 
