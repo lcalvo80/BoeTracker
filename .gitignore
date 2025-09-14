@@ -1,23 +1,74 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# ==== Python / Flask ====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
 
-# testing
-/coverage
+# Logs
+*.log
+*.out
+*.err
 
-# production
-/build
+# Database / cache
+*.sqlite3
+*.db
+instance/
+.mypy_cache/
+.pytest_cache/
 
+# ==== Node / React ====
+node_modules/
+# production build
+build/
+dist/
 # misc
-.DS_Store
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
+
+# ==== Env & Secrets ====
+.env
+.env.local
+.env.*.local
+*.secret
+*.key
+
+# ==== Archives (evitar subir zips >100MB) ====
+*.zip
+*.tar
+*.gz
+
+# ==== IDE / Editor ====
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+.DS_Store
+Thumbs.db
+
+# ==== Coverage / Tests ====
+.coverage
+htmlcov/
+.coverage.*
+.cache/
+.jest/
+jest-coverage/
+coverage/
+
+# ==== Railway ====
+.railway/
