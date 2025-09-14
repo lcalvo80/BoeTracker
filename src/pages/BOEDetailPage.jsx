@@ -18,7 +18,7 @@ import {
 } from "@heroicons/react/24/outline";
 import api from "../services/http";
 
-/* ============================================================
+/* ==========================================================
    Utilidades: base64 + gzip (pako on-demand)
    ============================================================ */
 let pakoRef = null;
