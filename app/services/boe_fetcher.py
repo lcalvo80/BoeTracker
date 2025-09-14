@@ -108,7 +108,7 @@ def fetch_boe_xml(date_obj: Optional[Union[str, date, datetime]] = None) -> Opti
             )
             return None
 
-        # Validación de contenido
+        # Validación de contenid
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if "xml" not in ctype and not resp.content.strip().startswith(b"<"):
             logging.error(
