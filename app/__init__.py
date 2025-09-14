@@ -5,11 +5,28 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
 from urllib.parse import parse_qs
+from dotenv import load_dotenv  # <-- carga .env en local
 
 def create_app(config: dict | None = None):
+    # ================= Env & App =================
+    load_dotenv()  # no afecta en prod si ya tienes envs
     app = Flask(__name__)
 
     # ================= App Config =================
+    # Valores útiles para servicios (Clerk/Stripe) disponibles vía current_app.config
+    app.config.update(
+        FRONTEND_URL=os.getenv("FRONTEND_URL", "http://localhost:5173"),
+        # Clerk
+        CLERK_PUBLISHABLE_KEY=os.getenv("CLERK_PUBLISHABLE_KEY", ""),
+        CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
+        CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
+        CLERK_WEBHOOK_SECRET=os.getenv("CLERK_WEBHOOK_SECRET", ""),
+        # Stripe
+        STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
+        STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
+        PRICE_PRO_MONTHLY_ID=os.getenv("PRICE_PRO_MONTHLY_ID", ""),
+        PRICE_ENTERPRISE_SEAT_ID=os.getenv("PRICE_ENTERPRISE_SEAT_ID", ""),
+    )
     if config:
         app.config.update(config)
 
@@ -27,18 +44,33 @@ def create_app(config: dict | None = None):
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
 
-    # ================= Blueprints =================
+    # ================= Blueprints existentes =================
     # Ajusta estos imports a tu estructura real
     from app.routes.items import bp as items_bp
     from app.routes.comments import bp as comments_bp
     from app.routes.compat import bp as compat_bp  # alias para FE
 
-    # Rutas canónicas
+    # Rutas canónicas existentes
     app.register_blueprint(items_bp,    url_prefix="/api/items")
-    # Otros endpoints existentes montados en /api
     app.register_blueprint(comments_bp, url_prefix="/api")
-    # Compatibilidad con el FE actual: /api/filters, /api/filtros, /api/meta/filters, /api/boe/<id>
     app.register_blueprint(compat_bp,   url_prefix="/api")
+
+    # ================= Nuevos Blueprints: Billing & Webhooks =================
+    # Montamos bajo /api para que CORS los permita sin cambios.
+    # /api/billing/checkout, /api/billing/portal
+    # /api/webhooks/stripe  (y opcional /api/webhooks/clerk)
+    try:
+        from app.routes.billing import bp as billing_bp
+        app.register_blueprint(billing_bp, url_prefix="/api/billing")
+    except Exception:
+        # Si aún no existe el módulo, no rompemos el arranque.
+        app.logger.info("Billing blueprint no encontrado (app.routes.billing).")
+
+    try:
+        from app.routes.webhooks import bp as webhooks_bp
+        app.register_blueprint(webhooks_bp, url_prefix="/api/webhooks")
+    except Exception:
+        app.logger.info("Webhooks blueprint no encontrado (app.routes.webhooks).")
 
     # ================= Healthcheck =================
     @app.route("/api/health", methods=["GET"])

@@ -1,1 +1,79 @@
+# ==== Python / Flask ====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+*.out
+*.err
+
+# Database / cache
+*.sqlite3
+*.db
+instance/
+.mypy_cache/
+.pytest_cache/
+
+# ==== Node / React ====
+# dependencies
+node_modules/
+# production build
+build/
+dist/
+# misc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==== Env & Secrets ====
 .env
+.env.*.local
+.env.local
+*.secret
+*.key
+
+# ==== IDE / Editor ====
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+.DS_Store
+Thumbs.db
+
+# ==== Coverage / Tests ====
+.coverage
+htmlcov/
+.coverage.*
+.cache/
+.jest/
+jest-coverage/
+coverage/
+
+# ==== Others ====
+# railway specific local files (if any)
+.railway/
+
+# ==== Optional: Frontend specific ====
+# Mac cache files
+*.DS_Store
+# generated lock files (if you prefer to not commit them)
+# yarn.lock
+# package-lock.json
+# pnpm-lock.yaml

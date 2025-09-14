@@ -8,3 +8,7 @@ gunicorn
 flask-sock
 gevent
 gevent-websocket
+stripe
+httpx
+python-jose[cryptography]
+svix
