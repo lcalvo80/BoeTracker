@@ -1,4 +1,3 @@
-// src/index.js
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { ClerkProvider } from "@clerk/clerk-react";
@@ -7,7 +6,7 @@ import "./styles/base/variables.css";
 import "./styles/base/global.css";
 import "./index.css"; // Tailwind incluido
 
-// Publishable Key de Clerk (desde .env)
+// Publishable Key de Clerk (desde .env - CRA)
 const PUBLISHABLE_KEY = process.env.REACT_APP_CLERK_PUBLISHABLE_KEY;
 
 if (!PUBLISHABLE_KEY) {

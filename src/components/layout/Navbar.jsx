@@ -5,7 +5,8 @@ import {
   SignedIn,
   SignedOut,
   UserButton,
-  useClerk
+  useClerk,
+  OrganizationSwitcher,
 } from "@clerk/clerk-react";
 
 const Navbar = () => {
@@ -66,6 +67,7 @@ const Navbar = () => {
           </SignedOut>
 
           <SignedIn>
+            <OrganizationSwitcher />
             <Link
               to="/account"
               className="px-3 py-2 text-sm font-medium rounded-md bg-gray-100 text-gray-900 hover:bg-gray-200"
@@ -135,7 +137,8 @@ const Navbar = () => {
               >
                 Mi cuenta
               </Link>
-              <div className="py-2">
+              <div className="py-2 flex items-center justify-between">
+                <OrganizationSwitcher />
                 <UserButton afterSignOutUrl="/" />
               </div>
             </SignedIn>
