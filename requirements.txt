@@ -12,3 +12,4 @@ stripe
 httpx
 python-jose[cryptography]
 svix
+hypercorn[trio]

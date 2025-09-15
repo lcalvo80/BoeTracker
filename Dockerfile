@@ -1,20 +1,37 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# (Opcional pero útil si alguna wheel necesita compilar)
+# Dependencias del sistema:
+# - libpq5 si usas psycopg2-binary no hace falta compilar; si usas psycopg2 normal, añade libpq-dev y gcc
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libffi-dev && \
-    rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
+# Si usas psycopg2 (no binary), descomenta:
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     build-essential \
+#     libpq-dev \
+#     && rm -rf /var/lib/apt/lists/*
+
+# Requisitos
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
+# App
 COPY . .
 
+# (Opcional) usuario no-root
+RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Documentativo
 EXPOSE 8000
-# Forzamos/mostramos PORT para evitar "0.0.0.0:" y arrancamos con WebSocket worker
+
+# Railway inyecta PORT; mantenemos fallback a 8000 para local
+# Gunicorn con gevent-websocket
 CMD ["sh", "-c", "PORT=${PORT:-8000}; echo PORT=$PORT; exec gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:${PORT} 'app:create_app()'"]
