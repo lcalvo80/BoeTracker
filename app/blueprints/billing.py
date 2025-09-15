@@ -1,63 +1,62 @@
-from fastapi import APIRouter, Depends, Request, HTTPException
-from pydantic import BaseModel
-from app.auth.clerk_verify import get_auth
-from app.core.config import settings
-from app.services import stripe_svc, clerk_svc
-import stripe, httpx, os
+from flask import Blueprint, request, jsonify, g, current_app
+import stripe
+from app.services.auth import require_auth
+from app.services import clerk_svc, stripe_svc
 
-router = APIRouter(prefix="/billing", tags=["billing"])
+bp = Blueprint("billing", __name__)
 
-class CheckoutPayload(BaseModel):
-    price_id: str
-    is_org: bool = False
-    quantity: int | None = None
+def _resolve_customer_id(is_org: bool, user_id: str, org_id: str | None):
+    if is_org and org_id:
+        org = clerk_svc.get_org(org_id)
+        return (org.get("private_metadata") or {}).get("billing", {}).get("stripeCustomerId")
+    else:
+        user = clerk_svc.get_user(user_id)
+        return (user.get("private_metadata") or {}).get("billing", {}).get("stripeCustomerId")
 
-async def resolve_customer_id(is_org: bool, user_id: str, org_id: str|None):
-    # Lee metadata desde Clerk
-    async with httpx.AsyncClient() as c:
-        if is_org:
-            r = await c.get(f"https://api.clerk.com/v1/organizations/{org_id}", headers={"Authorization": f"Bearer {os.getenv('CLERK_SECRET_KEY')}"})
-            r.raise_for_status()
-            data = r.json()
-            return data.get("private_metadata", {}).get("billing", {}).get("stripeCustomerId")
-        else:
-            r = await c.get(f"https://api.clerk.com/v1/users/{user_id}", headers={"Authorization": f"Bearer {os.getenv('CLERK_SECRET_KEY')}"})
-            r.raise_for_status()
-            data = r.json()
-            return data.get("private_metadata", {}).get("billing", {}).get("stripeCustomerId")
+@bp.post("/checkout")
+@require_auth()
+def checkout():
+    stripe_svc.init_stripe()
+    body = request.get_json() or {}
+    price_id = body.get("price_id")
+    is_org = bool(body.get("is_org"))
+    quantity = int(body.get("quantity") or 1)
 
-@router.post("/checkout")
-async def checkout(body: CheckoutPayload, req: Request):
-    auth = await get_auth(req, jwks_url=settings.CLERK_JWKS_URL)
-    customer_id = await resolve_customer_id(body.is_org, auth["user_id"], auth["org_id"])
+    user_id = g.clerk["user_id"]
+    org_id = g.clerk.get("org_id")
+
+    customer_id = _resolve_customer_id(is_org, user_id, org_id)
     if not customer_id:
-        # crea customer en Stripe
         customer = stripe.Customer.create(
-            metadata={"clerk_user_id": auth["user_id"], "clerk_org_id": auth["org_id"] or ""},
+            metadata={"clerk_user_id": user_id, "clerk_org_id": org_id or ""},
         )
         customer_id = customer["id"]
-        if body.is_org and auth["org_id"]:
-            await clerk_svc.update_org_metadata(auth["org_id"], private={"billing": {"stripeCustomerId": customer_id}})
+        if is_org and org_id:
+            clerk_svc.update_org_metadata(org_id, private={"billing": {"stripeCustomerId": customer_id}})
         else:
-            await clerk_svc.update_user_metadata(auth["user_id"], private={"billing": {"stripeCustomerId": customer_id}})
+            clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer_id}})
 
     session = stripe_svc.create_checkout_session(
         customer_id=customer_id,
-        price_id=body.price_id,
-        quantity=body.quantity or 1,
-        meta={"clerk_user_id": auth["user_id"], "clerk_org_id": auth["org_id"] or "", "plan_scope": "org" if body.is_org else "user"},
-        success_url=f"{settings.FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{settings.FRONTEND_URL}/billing/cancel",
+        price_id=price_id,
+        quantity=quantity,
+        meta={"clerk_user_id": user_id, "clerk_org_id": org_id or "", "plan_scope": "org" if (is_org and org_id) else "user"},
+        success_url=f"{current_app.config['FRONTEND_URL']}/settings/billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{current_app.config['FRONTEND_URL']}/pricing?status=cancel",
     )
-    return {"checkout_url": session.url}
+    return jsonify({"checkout_url": session.url})
 
-@router.post("/portal")
-async def portal(req: Request):
-    auth = await get_auth(req, jwks_url=settings.CLERK_JWKS_URL)
-    # Para simplificar, tomamos siempre el customer del usuario (o de la org activa si hay org_id)
-    is_org = bool(auth["org_id"])
-    customer_id = await resolve_customer_id(is_org, auth["user_id"], auth["org_id"])
+@bp.post("/portal")
+@require_auth()
+def portal():
+    stripe_svc.init_stripe()
+    user_id = g.clerk["user_id"]
+    org_id = g.clerk.get("org_id")
+    is_org = bool(org_id)
+
+    customer_id = _resolve_customer_id(is_org, user_id, org_id)
     if not customer_id:
-        raise HTTPException(400, "Customer not found")
-    portal = stripe_svc.create_billing_portal(customer_id, f"{settings.FRONTEND_URL}/settings/billing")
-    return {"portal_url": portal.url}
+        return jsonify({"error": "customer_not_found"}), 400
+
+    portal = stripe_svc.create_billing_portal(customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing")
+    return jsonify({"portal_url": portal.url})
