@@ -32,16 +32,17 @@ def create_app(config: dict | None = None):
 
     # ================= CORS (solo /api/*) =================
     # Define FRONTEND_ORIGIN en Railway con el dominio exacto del frontend
-    # ej: https://boefrontend-production.up.railway.app
+    # ej: https://boefrontend-production.up.railway.app  (sin / final)
     FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
     CORS(
         app,
-        resources={r"/api/*": {"origins": [FRONTEND_ORIGIN]}},
+        resources={r"/api/.*": {"origins": FRONTEND_ORIGIN}},  # <- regex correcto
         supports_credentials=True,
         allow_headers=["Content-Type", "Authorization", "X-Debug-Filters"],
         expose_headers=["X-Total-Count"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        max_age=86400,
     )
 
     # ================= Blueprints existentes =================
@@ -62,20 +63,26 @@ def create_app(config: dict | None = None):
     try:
         from app.routes.billing import bp as billing_bp
         app.register_blueprint(billing_bp, url_prefix="/api/billing")
-    except Exception:
-        # Si aún no existe el módulo, no rompemos el arranque.
-        app.logger.info("Billing blueprint no encontrado (app.routes.billing).")
+    except Exception as e:
+        app.logger.info(f"Billing blueprint no encontrado (app.routes.billing): {e}")
 
     try:
         from app.routes.webhooks import bp as webhooks_bp
         app.register_blueprint(webhooks_bp, url_prefix="/api/webhooks")
-    except Exception:
-        app.logger.info("Webhooks blueprint no encontrado (app.routes.webhooks).")
+    except Exception as e:
+        app.logger.info(f"Webhooks blueprint no encontrado (app.routes.webhooks): {e}")
 
     # ================= Healthcheck =================
     @app.route("/api/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok"}), 200
+
+    # ================= Preflight universal /api (cinturón y tirantes) =================
+    @app.route("/api/<path:_any>", methods=["OPTIONS"])
+    def api_options(_any):
+        # flask-cors debería responder automáticamente; este 204 asegura
+        # que el proxy/WAF no bloquee los preflights.
+        return ("", 204)
 
     # ================= WebSocket =================
     # Tu frontend conectará a wss://<backend>.railway.app/ws
