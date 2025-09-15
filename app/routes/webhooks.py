@@ -1,3 +1,4 @@
+# app/routes/webhooks.py
 from flask import Blueprint, request, jsonify, current_app
 from app.services import clerk_svc
 from app.services.stripe_svc import init_stripe, set_subscription_quantity
@@ -69,7 +70,7 @@ def stripe_webhook():
 
     return jsonify({"ok": True})
 
-# -------- (Opcional) Webhook de Clerk para seats enterprise ----------
+# (Opcional) Webhook de Clerk para seats enterprise
 try:
     from svix.webhooks import Webhook
     @bp.post("/clerk")

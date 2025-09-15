@@ -1,3 +1,4 @@
+# app/routes/billing.py
 from flask import Blueprint, request, jsonify, g, current_app
 import stripe
 from app.services.auth import require_auth
@@ -19,11 +20,11 @@ def checkout():
     stripe_svc.init_stripe()
     body = request.get_json() or {}
     price_id = body.get("price_id")
-    is_org = bool(body.get("is_org"))
+    is_org   = bool(body.get("is_org"))
     quantity = int(body.get("quantity") or 1)
 
     user_id = g.clerk["user_id"]
-    org_id = g.clerk.get("org_id")
+    org_id  = g.clerk.get("org_id")
 
     customer_id = _resolve_customer_id(is_org, user_id, org_id)
     if not customer_id:
@@ -51,8 +52,8 @@ def checkout():
 def portal():
     stripe_svc.init_stripe()
     user_id = g.clerk["user_id"]
-    org_id = g.clerk.get("org_id")
-    is_org = bool(org_id)
+    org_id  = g.clerk.get("org_id")
+    is_org  = bool(org_id)
 
     customer_id = _resolve_customer_id(is_org, user_id, org_id)
     if not customer_id:
