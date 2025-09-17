@@ -4,11 +4,12 @@ from flask import Blueprint, request, jsonify, g, current_app
 from app.services.auth import require_auth
 from app.services import clerk_svc, stripe_svc
 import stripe
+import logging
 
 bp = Blueprint("billing", __name__)
+log = logging.getLogger(__name__)
 
 def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -> str:
-    """Devuelve el Stripe Customer ID para usuario/org; lo crea y persiste si falta."""
     stripe_svc.init_stripe()
 
     if is_org and org_id:
@@ -18,7 +19,6 @@ def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -
         if customer_id:
             return customer_id
 
-        # Crear customer para la organización
         name = org.get("name") or f"Org {org_id}"
         customer = stripe.Customer.create(
             name=name,
@@ -36,7 +36,7 @@ def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -
     if customer_id:
         return customer_id
 
-    # Best-effort email/name
+    # e-mail / nombre best-effort
     email = None
     try:
         email = user.get("email_address") or user.get("email")
@@ -63,23 +63,34 @@ def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -
     )
     return customer.id
 
+
 @bp.route("/checkout", methods=["POST", "OPTIONS"])
 @require_auth()
 def checkout():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    stripe_svc.init_stripe()
+    try:
+        stripe_svc.init_stripe()
+    except Exception as e:
+        log.exception("Stripe init error")
+        return jsonify({"error": "stripe_init_failed", "detail": str(e)}), 500
 
-    data = request.get_json(silent=True) or {}
-    price_id: str | None = data.get("price_id") or None
-    is_org: bool = bool(data.get("is_org"))
-    quantity: int = int(data.get("quantity") or 1)
+    try:
+        data = request.get_json(silent=True) or {}
+        price_id: str | None = data.get("price_id") or None
+        is_org: bool = bool(data.get("is_org"))
+        quantity: int = max(int(data.get("quantity") or 1), 1)
+    except Exception:
+        return jsonify({"error": "invalid_payload"}), 400
 
-    user_id: str = g.clerk["user_id"]
-    org_id: str | None = g.clerk.get("org_id") if is_org else None
+    try:
+        user_id: str = g.clerk["user_id"]
+        org_id: str | None = g.clerk.get("org_id") if is_org else None
+    except Exception:
+        return jsonify({"error": "auth_context_missing"}), 401
 
-    # Precios por defecto desde la config si no llegan del frontend
+    # Por defecto desde config si no llega price_id
     if not price_id:
         price_id = current_app.config.get(
             "PRICE_ENTERPRISE_SEAT_ID" if is_org else "PRICE_PRO_MONTHLY_ID"
@@ -87,27 +98,43 @@ def checkout():
     if not price_id:
         return jsonify({"error": "missing_price_id"}), 400
 
-    customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
+    try:
+        customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
+        success_url = f"{current_app.config['FRONTEND_URL']}/pricing?status=success"
+        cancel_url  = f"{current_app.config['FRONTEND_URL']}/pricing?status=cancel"
 
-    success_url = f"{current_app.config['FRONTEND_URL']}/pricing?status=success"
-    cancel_url  = f"{current_app.config['FRONTEND_URL']}/pricing?status=cancel"
+        meta = {
+            "plan_scope": "org" if is_org else "user",
+            "clerk_user_id": user_id,
+            "clerk_org_id": org_id or "",
+        }
 
-    meta = {
-        "plan_scope": "org" if is_org else "user",
-        "clerk_user_id": user_id,
-        "clerk_org_id": org_id or "",
-    }
+        session = stripe_svc.create_checkout_session(
+            customer_id=customer_id,
+            price_id=price_id,
+            quantity=quantity,
+            meta=meta,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+        return jsonify({"checkout_url": session.url})
+    except stripe.error.InvalidRequestError as e:
+        # Ej: price_id inválido/mismatch con modo test/live
+        log.exception("Stripe invalid request")
+        return jsonify({"error": "stripe_invalid_request", "detail": str(e)}), 400
+    except stripe.error.AuthenticationError as e:
+        log.exception("Stripe auth error (API key)")
+        return jsonify({"error": "stripe_auth_error", "detail": str(e)}), 401
+    except stripe.error.APIConnectionError as e:
+        log.exception("Stripe connection error")
+        return jsonify({"error": "stripe_connection_error", "detail": str(e)}), 502
+    except stripe.error.RateLimitError as e:
+        log.warning("Stripe rate limit")
+        return jsonify({"error": "stripe_rate_limited", "detail": str(e)}), 429
+    except Exception as e:
+        log.exception("Unhandled error in /billing/checkout")
+        return jsonify({"error": "internal_error", "detail": str(e)}), 500
 
-    session = stripe_svc.create_checkout_session(
-        customer_id=customer_id,
-        price_id=price_id,
-        quantity=quantity if quantity > 0 else 1,
-        meta=meta,
-        success_url=success_url,
-        cancel_url=cancel_url,
-    )
-
-    return jsonify({"checkout_url": session.url})
 
 @bp.route("/portal", methods=["POST", "OPTIONS"])
 @require_auth()
@@ -115,13 +142,20 @@ def portal():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    stripe_svc.init_stripe()
-    user_id: str = g.clerk["user_id"]
-    org_id: str | None = g.clerk.get("org_id")
-    is_org: bool = bool(org_id)
+    try:
+        stripe_svc.init_stripe()
+    except Exception as e:
+        return jsonify({"error": "stripe_init_failed", "detail": str(e)}), 500
 
-    customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
-    portal = stripe_svc.create_billing_portal(
-        customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing"
-    )
-    return jsonify({"portal_url": portal.url})
+    try:
+        user_id: str = g.clerk["user_id"]
+        org_id: str | None = g.clerk.get("org_id")
+        is_org: bool = bool(org_id)
+
+        customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
+        portal = stripe_svc.create_billing_portal(
+            customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing"
+        )
+        return jsonify({"portal_url": portal.url})
+    except Exception as e:
+        return jsonify({"error": "internal_error", "detail": str(e)}), 500

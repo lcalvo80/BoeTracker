@@ -7,14 +7,15 @@ from flask import current_app
 def init_stripe():
     key = os.getenv("STRIPE_SECRET_KEY") or current_app.config.get("STRIPE_SECRET_KEY")
     if not key:
-        raise RuntimeError("Falta STRIPE_SECRET_KEY")
+        raise RuntimeError("STRIPE_SECRET_KEY is empty/missing")
     stripe.api_key = key
 
 def create_checkout_session(*, customer_id: str, price_id: str, quantity: int, meta: dict, success_url: str, cancel_url: str):
-    """
-    Crea una Checkout Session de tipo subscription.
-    Incluye metadata en subscription_data para que llegue a la Subscription.
-    """
+    if not price_id:
+        raise ValueError("Missing price_id")
+    if not success_url or not cancel_url:
+        raise ValueError("Missing success_url/cancel_url")
+
     return stripe.checkout.Session.create(
         customer=customer_id,
         mode="subscription",
@@ -35,7 +36,8 @@ def create_billing_portal(customer_id: str, return_url: str):
     )
 
 def set_subscription_quantity(subscription_item_id: str, quantity: int):
-    """
-    Para billing por asientos (org): ajusta la cantidad del item.
-    """
-    stripe.SubscriptionItem.modify(subscription_item_id, quantity=max(int(quantity), 1), proration_behavior="always_invoice")
+    stripe.SubscriptionItem.modify(
+        subscription_item_id,
+        quantity=max(int(quantity), 1),
+        proration_behavior="always_invoice",
+    )
