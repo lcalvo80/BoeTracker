@@ -1,63 +1,116 @@
 # app/routes/billing.py
+from __future__ import annotations
 from flask import Blueprint, request, jsonify, g, current_app
-import stripe
 from app.services.auth import require_auth
 from app.services import clerk_svc, stripe_svc
+import stripe
+import typing as t
 
 bp = Blueprint("billing", __name__)
 
-def _resolve_customer_id(is_org: bool, user_id: str, org_id: str | None):
+def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -> str:
+    """Devuelve el Stripe Customer ID para usuario/org; lo crea y persiste si falta."""
+    stripe_svc.init_stripe()
+
     if is_org and org_id:
         org = clerk_svc.get_org(org_id)
-        return (org.get("private_metadata") or {}).get("billing", {}).get("stripeCustomerId")
-    else:
-        user = clerk_svc.get_user(user_id)
-        return (user.get("private_metadata") or {}).get("billing", {}).get("stripeCustomerId")
+        billing = (org.get("private_metadata") or {}).get("billing", {}) or {}
+        customer_id = billing.get("stripeCustomerId")
+        if customer_id:
+            return customer_id
+
+        # Crear customer para la organización
+        name = org.get("name") or f"Org {org_id}"
+        customer = stripe.Customer.create(
+            name=name,
+            metadata={"clerk_org_id": org_id},
+        )
+        clerk_svc.update_org_metadata(org_id, private={"billing": {**billing, "stripeCustomerId": customer.id}})
+        return customer.id
+
+    # scope usuario
+    user = clerk_svc.get_user(user_id)
+    billing = (user.get("private_metadata") or {}).get("billing", {}) or {}
+    customer_id = billing.get("stripeCustomerId")
+    if customer_id:
+        return customer_id
+
+    # Best-effort email/name
+    email = None
+    try:
+        email = user.get("email_address") or user.get("email")
+        if not email:
+            peid = user.get("primary_email_address_id")
+            if peid:
+                for e in (user.get("email_addresses") or []):
+                    if e.get("id") == peid:
+                        email = e.get("email_address")
+                        break
+    except Exception:
+        pass
+
+    name = (user.get("first_name") or "") + " " + (user.get("last_name") or "")
+    name = name.strip() or user_id
+
+    customer = stripe.Customer.create(
+        email=email,
+        name=name,
+        metadata={"clerk_user_id": user_id},
+    )
+    clerk_svc.update_user_metadata(user_id, private={"billing": {**billing, "stripeCustomerId": customer.id}})
+    return customer.id
 
 @bp.post("/checkout")
 @require_auth()
 def checkout():
     stripe_svc.init_stripe()
-    body = request.get_json() or {}
-    price_id = body.get("price_id")
-    is_org   = bool(body.get("is_org"))
-    quantity = int(body.get("quantity") or 1)
 
-    user_id = g.clerk["user_id"]
-    org_id  = g.clerk.get("org_id")
+    data = request.get_json(silent=True) or {}
+    price_id: str | None = data.get("price_id") or None
+    is_org: bool = bool(data.get("is_org"))
+    quantity: int = int(data.get("quantity") or 1)
 
-    customer_id = _resolve_customer_id(is_org, user_id, org_id)
-    if not customer_id:
-        customer = stripe.Customer.create(
-            metadata={"clerk_user_id": user_id, "clerk_org_id": org_id or ""},
+    user_id: str = g.clerk["user_id"]
+    org_id: str | None = g.clerk.get("org_id") if is_org else None
+
+    # Precios por defecto desde la config si no llegan del frontend
+    if not price_id:
+        price_id = current_app.config.get(
+            "PRICE_ENTERPRISE_SEAT_ID" if is_org else "PRICE_PRO_MONTHLY_ID"
         )
-        customer_id = customer["id"]
-        if is_org and org_id:
-            clerk_svc.update_org_metadata(org_id, private={"billing": {"stripeCustomerId": customer_id}})
-        else:
-            clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer_id}})
+    if not price_id:
+        return jsonify({"error": "missing_price_id"}), 400
+
+    customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
+
+    success_url = f"{current_app.config['FRONTEND_URL']}/pricing?status=success"
+    cancel_url  = f"{current_app.config['FRONTEND_URL']}/pricing?status=cancel"
+
+    meta = {
+        "plan_scope": "org" if is_org else "user",
+        "clerk_user_id": user_id,
+        "clerk_org_id": org_id or "",
+    }
 
     session = stripe_svc.create_checkout_session(
         customer_id=customer_id,
         price_id=price_id,
-        quantity=quantity,
-        meta={"clerk_user_id": user_id, "clerk_org_id": org_id or "", "plan_scope": "org" if (is_org and org_id) else "user"},
-        success_url=f"{current_app.config['FRONTEND_URL']}/settings/billing?status=success&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{current_app.config['FRONTEND_URL']}/pricing?status=cancel",
+        quantity=quantity if quantity > 0 else 1,
+        meta=meta,
+        success_url=success_url,
+        cancel_url=cancel_url,
     )
+
     return jsonify({"checkout_url": session.url})
 
 @bp.post("/portal")
 @require_auth()
 def portal():
     stripe_svc.init_stripe()
-    user_id = g.clerk["user_id"]
-    org_id  = g.clerk.get("org_id")
-    is_org  = bool(org_id)
+    user_id: str = g.clerk["user_id"]
+    org_id: str | None = g.clerk.get("org_id")
+    is_org: bool = bool(org_id)
 
-    customer_id = _resolve_customer_id(is_org, user_id, org_id)
-    if not customer_id:
-        return jsonify({"error": "customer_not_found"}), 400
-
+    customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
     portal = stripe_svc.create_billing_portal(customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing")
     return jsonify({"portal_url": portal.url})

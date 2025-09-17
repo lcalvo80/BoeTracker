@@ -54,20 +54,19 @@ def create_app(config: dict | None = None):
 
     # ===== CORS (solo bajo /api/*) =====
     origins = _parse_origins()
-    # Ejemplo en Railway (backend):
-    #   ALLOWED_ORIGINS=https://boefrontend-production.up.railway.app
     CORS(
         app,
         resources={r"/api/.*": {"origins": origins}},   # regex
         supports_credentials=True,
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"],
+        allow_headers=[
+            "Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"
+        ],
         expose_headers=["X-Total-Count", "Content-Range"],
         max_age=86400,
     )
 
     # ===== Blueprints =====
-    # Ajusta rutas según tu proyecto real
     from app.routes.items import bp as items_bp
     from app.routes.comments import bp as comments_bp
     from app.routes.compat import bp as compat_bp  # alias compatibles para FE
@@ -102,15 +101,13 @@ def create_app(config: dict | None = None):
         return ("", 204)
 
     # ===== WebSocket =====
-    # Cliente: wss://<backend>.railway.app/ws  (si usas ws en prod)
     sock = Sock(app)
 
     @sock.route("/ws")
     def ws_handler(ws):
-        # (Opcional) token en query ?token=...
         try:
             qs = ws.environ.get("QUERY_STRING", "")
-            token = parse_qs(qs).get("token", [None])[0]  # noqa: F841  (útil si luego validas)
+            token = parse_qs(qs).get("token", [None])[0]  # noqa: F841
         except Exception:
             token = None  # noqa: F841
 
@@ -134,7 +131,7 @@ def create_app(config: dict | None = None):
                 ws.send("pong")
                 continue
 
-            # eco por defecto (ajusta con tu lógica)
+            # eco por defecto
             ws.send(json.dumps({"type": "echo", "data": payload}))
 
     return app
