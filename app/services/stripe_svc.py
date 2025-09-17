@@ -21,6 +21,12 @@ def _env_list(name: str) -> List[str]:
         return []
     return [x.strip().upper() for x in raw.split(",") if x.strip()]
 
+def _env_str(name: str, default: str | None = None) -> str | None:
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
+    return str(val).strip()
+
 
 # ───────────────────────── Init Stripe ─────────────────────────
 
@@ -48,9 +54,10 @@ def create_checkout_session(
 
     - Requiere Price ID (price_...).
     - Automatic Tax (configurable).
-    - Recolecta dirección de facturación y guarda en Customer.
-    - **Nuevo**: `customer_update[name]='auto'` para permitir recoger Tax ID.
+    - Recolecta dirección de facturación y la guarda en el Customer.
+    - `customer_update[name]='auto'` para permitir Tax ID collection.
     - NO usa customer_creation si ya pasamos 'customer'.
+    - `locale='auto'` (o forzado por ENV) para idioma del navegador.
     - Shipping opcional por ENV (por defecto desactivado).
     """
     if not price_id:
@@ -70,8 +77,10 @@ def create_checkout_session(
 
     auto_save_address     = _env_flag("STRIPE_SAVE_ADDRESS_AUTO", True)
     auto_save_shipping    = _env_flag("STRIPE_SAVE_SHIPPING_AUTO", collect_shipping)
-    # ⬇️ NUEVO: permitir a Checkout actualizar el name del Customer (requerido por tax_id_collection)
     auto_save_name        = _env_flag("STRIPE_SAVE_NAME_AUTO", True)
+
+    # Idioma: por defecto 'auto' (Stripe detecta navegador). Puedes forzar p.ej. 'es' con ENV.
+    locale = _env_str("STRIPE_CHECKOUT_LOCALE", "auto")
 
     # Construcción base (pasamos customer_id → NO usar customer_creation)
     kwargs: Dict[str, Any] = {
@@ -84,6 +93,7 @@ def create_checkout_session(
         "subscription_data": {"metadata": meta},
         "metadata": meta,
         "tax_id_collection": {"enabled": True},  # VAT/IVA (UE)
+        "locale": locale,                        # idioma auto/forzado
         # "customer_creation": "always",  # ❌ NO usar si pasamos 'customer'
     }
 
@@ -95,9 +105,10 @@ def create_checkout_session(
             kwargs["billing_address_collection"] = "required"
         if auto_save_address:
             cu["address"] = "auto"
-        # ⬇️ NUEVO: para permitir tax_id_collection, Stripe pide habilitar name=auto
+        # Para permitir tax_id_collection, Stripe pide habilitar name=auto
         if auto_save_name:
             cu["name"] = "auto"
+
     # Shipping (solo si vendes físico)
     if collect_shipping:
         if auto_save_shipping:
