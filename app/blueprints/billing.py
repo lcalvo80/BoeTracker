@@ -4,7 +4,6 @@ from flask import Blueprint, request, jsonify, g, current_app
 from app.services.auth import require_auth
 from app.services import clerk_svc, stripe_svc
 import stripe
-import typing as t
 
 bp = Blueprint("billing", __name__)
 
@@ -25,7 +24,9 @@ def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -
             name=name,
             metadata={"clerk_org_id": org_id},
         )
-        clerk_svc.update_org_metadata(org_id, private={"billing": {**billing, "stripeCustomerId": customer.id}})
+        clerk_svc.update_org_metadata(
+            org_id, private={"billing": {**billing, "stripeCustomerId": customer.id}}
+        )
         return customer.id
 
     # scope usuario
@@ -57,12 +58,17 @@ def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -
         name=name,
         metadata={"clerk_user_id": user_id},
     )
-    clerk_svc.update_user_metadata(user_id, private={"billing": {**billing, "stripeCustomerId": customer.id}})
+    clerk_svc.update_user_metadata(
+        user_id, private={"billing": {**billing, "stripeCustomerId": customer.id}}
+    )
     return customer.id
 
-@bp.post("/checkout")
+@bp.route("/checkout", methods=["POST", "OPTIONS"])
 @require_auth()
 def checkout():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     stripe_svc.init_stripe()
 
     data = request.get_json(silent=True) or {}
@@ -103,14 +109,19 @@ def checkout():
 
     return jsonify({"checkout_url": session.url})
 
-@bp.post("/portal")
+@bp.route("/portal", methods=["POST", "OPTIONS"])
 @require_auth()
 def portal():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     stripe_svc.init_stripe()
     user_id: str = g.clerk["user_id"]
     org_id: str | None = g.clerk.get("org_id")
     is_org: bool = bool(org_id)
 
     customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
-    portal = stripe_svc.create_billing_portal(customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing")
+    portal = stripe_svc.create_billing_portal(
+        customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing"
+    )
     return jsonify({"portal_url": portal.url})

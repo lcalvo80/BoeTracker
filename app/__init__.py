@@ -59,9 +59,7 @@ def create_app(config: dict | None = None):
         resources={r"/api/.*": {"origins": origins}},   # regex
         supports_credentials=True,
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=[
-            "Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"
-        ],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"],
         expose_headers=["X-Total-Count", "Content-Range"],
         max_age=86400,
     )
@@ -76,18 +74,33 @@ def create_app(config: dict | None = None):
     app.register_blueprint(comments_bp, url_prefix="/api")
     app.register_blueprint(compat_bp,   url_prefix="/api")
 
-    # Opcionales: billing & webhooks
+    # Billing con fallback (si cambia la ubicación del módulo, no se cae)
     try:
         from app.routes.billing import bp as billing_bp
+        app.logger.info("[init] billing cargado desde app.routes.billing")
+    except Exception as e1:
+        try:
+            from app.blueprints.billing import bp as billing_bp  # fallback
+            app.logger.warning(f"[init] billing fallback app.blueprints.billing (error primario: {e1})")
+        except Exception as e2:
+            app.logger.error(f"[init] billing no cargado: {e1} | fallback error: {e2}")
+            billing_bp = None
+    if billing_bp:
         app.register_blueprint(billing_bp, url_prefix="/api/billing")
-    except Exception as e:
-        app.logger.info(f"[init] billing no cargado: {e}")
 
+    # Webhooks con fallback
     try:
         from app.routes.webhooks import bp as webhooks_bp
+        app.logger.info("[init] webhooks cargado desde app.routes.webhooks")
+    except Exception as e1:
+        try:
+            from app.blueprints.webhooks import bp as webhooks_bp  # fallback
+            app.logger.warning(f"[init] webhooks fallback app.blueprints.webhooks (error primario: {e1})")
+        except Exception as e2:
+            app.logger.error(f"[init] webhooks no cargado: {e1} | fallback error: {e2}")
+            webhooks_bp = None
+    if webhooks_bp:
         app.register_blueprint(webhooks_bp, url_prefix="/api/webhooks")
-    except Exception as e:
-        app.logger.info(f"[init] webhooks no cargado: {e}")
 
     # ===== Healthcheck =====
     @app.get("/api/health")
