@@ -1,161 +1,66 @@
 # app/routes/billing.py
-from __future__ import annotations
-from flask import Blueprint, request, jsonify, g, current_app
-from app.services.auth import require_auth
-from app.services import clerk_svc, stripe_svc
+from flask import Blueprint, request, jsonify, current_app, g, abort
+from app.auth import require_clerk_auth
+from app.integrations.stripe_utils import ensure_customer, init_stripe
 import stripe
-import logging
 
 bp = Blueprint("billing", __name__)
-log = logging.getLogger(__name__)
-
-def _get_or_create_customer(*, is_org: bool, user_id: str, org_id: str | None) -> str:
-    stripe_svc.init_stripe()
-
-    if is_org and org_id:
-        org = clerk_svc.get_org(org_id)
-        billing = (org.get("private_metadata") or {}).get("billing", {}) or {}
-        customer_id = billing.get("stripeCustomerId")
-        if customer_id:
-            return customer_id
-
-        name = org.get("name") or f"Org {org_id}"
-        customer = stripe.Customer.create(
-            name=name,
-            metadata={"clerk_org_id": org_id},
-        )
-        clerk_svc.update_org_metadata(
-            org_id, private={"billing": {**billing, "stripeCustomerId": customer.id}}
-        )
-        return customer.id
-
-    # scope usuario
-    user = clerk_svc.get_user(user_id)
-    billing = (user.get("private_metadata") or {}).get("billing", {}) or {}
-    customer_id = billing.get("stripeCustomerId")
-    if customer_id:
-        return customer_id
-
-    # e-mail / nombre best-effort
-    email = None
-    try:
-        email = user.get("email_address") or user.get("email")
-        if not email:
-            peid = user.get("primary_email_address_id")
-            if peid:
-                for e in (user.get("email_addresses") or []):
-                    if e.get("id") == peid:
-                        email = e.get("email_address")
-                        break
-    except Exception:
-        pass
-
-    name = (user.get("first_name") or "") + " " + (user.get("last_name") or "")
-    name = name.strip() or user_id
-
-    customer = stripe.Customer.create(
-        email=email,
-        name=name,
-        metadata={"clerk_user_id": user_id},
-    )
-    clerk_svc.update_user_metadata(
-        user_id, private={"billing": {**billing, "stripeCustomerId": customer.id}}
-    )
-    return customer.id
 
 
-@bp.route("/checkout", methods=["POST", "OPTIONS"])
-@require_auth()
-def checkout():
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    try:
-        stripe_svc.init_stripe()
-    except Exception as e:
-        log.exception("Stripe init error")
-        return jsonify({"error": "stripe_init_failed", "detail": str(e)}), 500
-
-    try:
-        data = request.get_json(silent=True) or {}
-        price_id: str | None = data.get("price_id") or None
-        is_org: bool = bool(data.get("is_org"))
-        quantity: int = max(int(data.get("quantity") or 1), 1)
-    except Exception:
-        return jsonify({"error": "invalid_payload"}), 400
-
-    try:
-        user_id: str = g.clerk["user_id"]
-        org_id: str | None = g.clerk.get("org_id") if is_org else None
-    except Exception:
-        return jsonify({"error": "auth_context_missing"}), 401
-
-    # Por defecto desde config si no llega price_id
+@bp.post("/checkout")
+@require_clerk_auth
+def create_checkout():
+    body = request.get_json(force=True, silent=True) or {}
+    price_id = body.get("price_id")
+    is_org = bool(body.get("is_org", False))
+    quantity = int(body.get("quantity") or 1)
     if not price_id:
-        price_id = current_app.config.get(
-            "PRICE_ENTERPRISE_SEAT_ID" if is_org else "PRICE_PRO_MONTHLY_ID"
-        )
-    if not price_id:
-        return jsonify({"error": "missing_price_id"}), 400
+        abort(400, "price_id required")
 
-    try:
-        customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
-        success_url = f"{current_app.config['FRONTEND_URL']}/pricing?status=success"
-        cancel_url  = f"{current_app.config['FRONTEND_URL']}/pricing?status=cancel"
+    entity_type = "org" if is_org else "user"
+    entity_id = g.clerk.get("org_id") if is_org else g.clerk.get("user_id")
+    if is_org and not entity_id:
+        abort(400, "Missing org_id in token")
 
-        meta = {
-            "plan_scope": "org" if is_org else "user",
-            "clerk_user_id": user_id,
-            "clerk_org_id": org_id or "",
-        }
+    customer_id = ensure_customer(entity_type, entity_id)
 
-        session = stripe_svc.create_checkout_session(
-            customer_id=customer_id,
-            price_id=price_id,
-            quantity=quantity,
-            meta=meta,
-            success_url=success_url,
-            cancel_url=cancel_url,
-        )
-        return jsonify({"checkout_url": session.url})
-    except stripe.error.InvalidRequestError as e:
-        # Ej: price_id inválido/mismatch con modo test/live
-        log.exception("Stripe invalid request")
-        return jsonify({"error": "stripe_invalid_request", "detail": str(e)}), 400
-    except stripe.error.AuthenticationError as e:
-        log.exception("Stripe auth error (API key)")
-        return jsonify({"error": "stripe_auth_error", "detail": str(e)}), 401
-    except stripe.error.APIConnectionError as e:
-        log.exception("Stripe connection error")
-        return jsonify({"error": "stripe_connection_error", "detail": str(e)}), 502
-    except stripe.error.RateLimitError as e:
-        log.warning("Stripe rate limit")
-        return jsonify({"error": "stripe_rate_limited", "detail": str(e)}), 429
-    except Exception as e:
-        log.exception("Unhandled error in /billing/checkout")
-        return jsonify({"error": "internal_error", "detail": str(e)}), 500
+    init_stripe()
+    frontend = current_app.config["FRONTEND_URL"].rstrip("/")
+    success_url = f"{frontend}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{frontend}/pricing?canceled=1"
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer=customer_id,
+        line_items=[{"price": price_id, "quantity": max(1, quantity)}],
+        allow_promotion_codes=True,
+        success_url=success_url,
+        cancel_url=cancel_url,
+        client_reference_id=entity_id,
+        metadata={"entity_type": entity_type, "entity_id": entity_id, "price_id": price_id},
+        subscription_data={
+            "metadata": {"entity_type": entity_type, "entity_id": entity_id, "price_id": price_id}
+        },
+    )
+    return jsonify(checkout_url=session.url)
 
 
-@bp.route("/portal", methods=["POST", "OPTIONS"])
-@require_auth()
-def portal():
-    if request.method == "OPTIONS":
-        return ("", 204)
+@bp.post("/portal")
+@require_clerk_auth
+def create_portal():
+    body = request.get_json(silent=True) or {}
+    is_org = bool(body.get("is_org", False))
+    entity_type = "org" if is_org else "user"
+    entity_id = g.clerk.get("org_id") if is_org else g.clerk.get("user_id")
+    if is_org and not entity_id:
+        abort(400, "Missing org_id in token")
 
-    try:
-        stripe_svc.init_stripe()
-    except Exception as e:
-        return jsonify({"error": "stripe_init_failed", "detail": str(e)}), 500
+    customer_id = ensure_customer(entity_type, entity_id)
+    init_stripe()
+    frontend = current_app.config["FRONTEND_URL"].rstrip("/")
 
-    try:
-        user_id: str = g.clerk["user_id"]
-        org_id: str | None = g.clerk.get("org_id")
-        is_org: bool = bool(org_id)
-
-        customer_id = _get_or_create_customer(is_org=is_org, user_id=user_id, org_id=org_id)
-        portal = stripe_svc.create_billing_portal(
-            customer_id, f"{current_app.config['FRONTEND_URL']}/settings/billing"
-        )
-        return jsonify({"portal_url": portal.url})
-    except Exception as e:
-        return jsonify({"error": "internal_error", "detail": str(e)}), 500
+    portal = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=f"{frontend}/billing",
+    )
+    return jsonify(portal_url=portal.url)

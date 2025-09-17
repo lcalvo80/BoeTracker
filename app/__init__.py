@@ -3,156 +3,102 @@ import os
 import json
 from urllib.parse import parse_qs
 
-from flask import Flask, jsonify, make_response
+from flask import Flask, jsonify, make_response, request
 from flask_cors import CORS
 from flask_sock import Sock
 from dotenv import load_dotenv
 
 
 def _parse_origins():
-    """
-    Lee orígenes permitidos desde:
-      - ALLOWED_ORIGINS (separados por comas)  → producción
-      - FRONTEND_ORIGIN (uno solo)             → compat
-      - fallback local: http://localhost:3000, http://localhost:5173
-    """
     raw = os.getenv("ALLOWED_ORIGINS", "").strip()
     if raw:
         return [o.strip() for o in raw.split(",") if o.strip()]
-
     single = os.getenv("FRONTEND_ORIGIN", "").strip()
     if single:
         return [single]
-
-    # fallback solo dev
     return ["http://localhost:3000", "http://localhost:5173"]
 
 
 def create_app(config: dict | None = None):
-    # ===== Env & App =====
     load_dotenv()
     app = Flask(__name__)
+    app.url_map.strict_slashes = False  # evita 308 por trailing slash
 
-    # Evita redirecciones 308 por trailing slash en TODAS las rutas
-    # (los preflight OPTIONS no deben redirigir)
-    app.url_map.strict_slashes = False
+    # --- corta el preflight antes de cualquier auth/blueprint ---
+    @app.before_request
+    def _short_circuit_preflight():
+        if request.method == "OPTIONS" and request.path.startswith("/api/"):
+            return make_response(("", 204))
 
-    # ===== App Config =====
+    # Config
     app.config.update(
         FRONTEND_URL=os.getenv("FRONTEND_URL", "http://localhost:5173"),
         # Clerk
         CLERK_PUBLISHABLE_KEY=os.getenv("CLERK_PUBLISHABLE_KEY", ""),
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
         CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
-        CLERK_WEBHOOK_SECRET=os.getenv("CLERK_WEBHOOK_SECRET", ""),
         # Stripe
         STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
         STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
         PRICE_PRO_MONTHLY_ID=os.getenv("PRICE_PRO_MONTHLY_ID", ""),
         PRICE_ENTERPRISE_SEAT_ID=os.getenv("PRICE_ENTERPRISE_SEAT_ID", ""),
-        # Flask sane defaults
         JSON_SORT_KEYS=False,
     )
     if config:
         app.config.update(config)
 
-    # ===== CORS (solo /api/*) =====
+    # CORS sólo en /api/*
     origins = _parse_origins()
-    app.logger.info(f"[init] CORS allow origins: {origins}")
-
     CORS(
         app,
         resources={r"/api/.*": {"origins": origins}},
-        supports_credentials=True,  # si usas Authorization/cookies
+        supports_credentials=True,
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=[
-            "Content-Type",
-            "Authorization",
-            "X-Requested-With",
-            "X-Debug-Filters",
-        ],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"],
         expose_headers=["X-Total-Count", "Content-Range"],
         max_age=86400,
     )
 
-    # ===== Blueprints =====
+    # Blueprints
     from app.routes.items import bp as items_bp
     from app.routes.comments import bp as comments_bp
-    from app.routes.compat import bp as compat_bp  # alias compatibles para FE
-
-    app.register_blueprint(items_bp, url_prefix="/api/items")
+    from app.routes.compat import bp as compat_bp
+    app.register_blueprint(items_bp,    url_prefix="/api/items")
     app.register_blueprint(comments_bp, url_prefix="/api")
-    app.register_blueprint(compat_bp, url_prefix="/api")
+    app.register_blueprint(compat_bp,   url_prefix="/api")
 
-    # Billing con fallback
-    try:
-        from app.routes.billing import bp as billing_bp
-        app.logger.info("[init] billing cargado desde app.routes.billing")
-    except Exception as e1:
-        try:
-            from app.blueprints.billing import bp as billing_bp
-            app.logger.warning(f"[init] billing fallback app.blueprints.billing (error primario: {e1})")
-        except Exception as e2:
-            app.logger.error(f"[init] billing no cargado: {e1} | fallback error: {e2}")
-            billing_bp = None
-    if billing_bp:
-        app.register_blueprint(billing_bp, url_prefix="/api/billing")
+    # Billing
+    from app.routes.billing import bp as billing_bp
+    app.register_blueprint(billing_bp, url_prefix="/api/billing")
 
-    # Webhooks con fallback
-    try:
-        from app.routes.webhooks import bp as webhooks_bp
-        app.logger.info("[init] webhooks cargado desde app.routes.webhooks")
-    except Exception as e1:
-        try:
-            from app.blueprints.webhooks import bp as webhooks_bp
-            app.logger.warning(f"[init] webhooks fallback app.blueprints.webhooks (error primario: {e1})")
-        except Exception as e2:
-            app.logger.error(f"[init] webhooks no cargado: {e1} | fallback error: {e2}")
-            webhooks_bp = None
-    if webhooks_bp:
-        app.register_blueprint(webhooks_bp, url_prefix="/api/webhooks")
+    # Webhooks
+    from app.routes.webhooks import bp as webhooks_bp
+    app.register_blueprint(webhooks_bp, url_prefix="/api/webhooks")
 
-    # ===== Healthcheck =====
+    # Health
     @app.get("/api/health")
     def health():
         return jsonify({"status": "ok"}), 200
 
-    # ===== Preflight universal /api (cinturón y tirantes) =====
-    @app.route("/api/<path:_any>", methods=["OPTIONS"])
-    def api_options(_any):
-        # flask-cors añadirá los headers CORS; devolvemos 204 explícito
-        return make_response(("", 204))
-
-    # ===== WebSocket =====
+    # WS (opcional)
     sock = Sock(app)
 
     @sock.route("/ws")
     def ws_handler(ws):
-        try:
-            qs = ws.environ.get("QUERY_STRING", "")
-            token = parse_qs(qs).get("token", [None])[0]  # noqa: F841
-        except Exception:
-            token = None  # noqa: F841
-
         ws.send(json.dumps({"type": "hello", "msg": "ws up"}))
-
         while True:
             data = ws.receive()
             if data is None:
                 break
-
             try:
                 payload = json.loads(data)
             except Exception:
                 payload = data
-
             if isinstance(payload, dict) and payload.get("type") == "ping":
                 ws.send(json.dumps({"type": "pong"}))
-                continue
-            if payload == "ping":
+            elif payload == "ping":
                 ws.send("pong")
-                continue
-
-            ws.send(json.dumps({"type": "echo", "data": payload}))
+            else:
+                ws.send(json.dumps({"type": "echo", "data": payload}))
 
     return app
