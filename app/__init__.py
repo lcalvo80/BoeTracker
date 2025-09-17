@@ -3,7 +3,7 @@ import os
 import json
 from urllib.parse import parse_qs
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, make_response
 from flask_cors import CORS
 from flask_sock import Sock
 from dotenv import load_dotenv
@@ -24,14 +24,18 @@ def _parse_origins():
     if single:
         return [single]
 
-    # fallback sólo para desarrollo local
+    # fallback solo dev
     return ["http://localhost:3000", "http://localhost:5173"]
 
 
 def create_app(config: dict | None = None):
     # ===== Env & App =====
-    load_dotenv()  # en prod no molesta; en local carga .env
+    load_dotenv()
     app = Flask(__name__)
+
+    # Evita redirecciones 308 por trailing slash en TODAS las rutas
+    # (los preflight OPTIONS no deben redirigir)
+    app.url_map.strict_slashes = False
 
     # ===== App Config =====
     app.config.update(
@@ -52,14 +56,21 @@ def create_app(config: dict | None = None):
     if config:
         app.config.update(config)
 
-    # ===== CORS (solo bajo /api/*) =====
+    # ===== CORS (solo /api/*) =====
     origins = _parse_origins()
+    app.logger.info(f"[init] CORS allow origins: {origins}")
+
     CORS(
         app,
-        resources={r"/api/.*": {"origins": origins}},   # regex
-        supports_credentials=True,
+        resources={r"/api/.*": {"origins": origins}},
+        supports_credentials=True,  # si usas Authorization/cookies
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"],
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-Requested-With",
+            "X-Debug-Filters",
+        ],
         expose_headers=["X-Total-Count", "Content-Range"],
         max_age=86400,
     )
@@ -69,18 +80,17 @@ def create_app(config: dict | None = None):
     from app.routes.comments import bp as comments_bp
     from app.routes.compat import bp as compat_bp  # alias compatibles para FE
 
-    # Canonical
-    app.register_blueprint(items_bp,    url_prefix="/api/items")
+    app.register_blueprint(items_bp, url_prefix="/api/items")
     app.register_blueprint(comments_bp, url_prefix="/api")
-    app.register_blueprint(compat_bp,   url_prefix="/api")
+    app.register_blueprint(compat_bp, url_prefix="/api")
 
-    # Billing con fallback (si cambia la ubicación del módulo, no se cae)
+    # Billing con fallback
     try:
         from app.routes.billing import bp as billing_bp
         app.logger.info("[init] billing cargado desde app.routes.billing")
     except Exception as e1:
         try:
-            from app.blueprints.billing import bp as billing_bp  # fallback
+            from app.blueprints.billing import bp as billing_bp
             app.logger.warning(f"[init] billing fallback app.blueprints.billing (error primario: {e1})")
         except Exception as e2:
             app.logger.error(f"[init] billing no cargado: {e1} | fallback error: {e2}")
@@ -94,7 +104,7 @@ def create_app(config: dict | None = None):
         app.logger.info("[init] webhooks cargado desde app.routes.webhooks")
     except Exception as e1:
         try:
-            from app.blueprints.webhooks import bp as webhooks_bp  # fallback
+            from app.blueprints.webhooks import bp as webhooks_bp
             app.logger.warning(f"[init] webhooks fallback app.blueprints.webhooks (error primario: {e1})")
         except Exception as e2:
             app.logger.error(f"[init] webhooks no cargado: {e1} | fallback error: {e2}")
@@ -110,8 +120,8 @@ def create_app(config: dict | None = None):
     # ===== Preflight universal /api (cinturón y tirantes) =====
     @app.route("/api/<path:_any>", methods=["OPTIONS"])
     def api_options(_any):
-        # flask-cors responde; devolvemos 204 por si un proxy/WAF interfiere
-        return ("", 204)
+        # flask-cors añadirá los headers CORS; devolvemos 204 explícito
+        return make_response(("", 204))
 
     # ===== WebSocket =====
     sock = Sock(app)
@@ -124,7 +134,6 @@ def create_app(config: dict | None = None):
         except Exception:
             token = None  # noqa: F841
 
-        # saludo inicial
         ws.send(json.dumps({"type": "hello", "msg": "ws up"}))
 
         while True:
@@ -144,7 +153,6 @@ def create_app(config: dict | None = None):
                 ws.send("pong")
                 continue
 
-            # eco por defecto
             ws.send(json.dumps({"type": "echo", "data": payload}))
 
     return app
