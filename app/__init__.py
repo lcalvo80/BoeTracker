@@ -5,7 +5,6 @@ import json
 import importlib
 import traceback
 from pathlib import Path
-from urllib.parse import parse_qs  # si no lo usas, puedes eliminarlo
 
 from flask import Flask, jsonify, make_response, request
 from flask_cors import CORS
@@ -32,18 +31,23 @@ def create_app(config: dict | None = None):
     # ── Logs de diagnóstico para paths y archivos ──
     app.logger.info(f"[init] cwd={os.getcwd()} root_path={app.root_path} sys.path[0]={sys.path[0]}")
     for rel in [
+        # núcleo
         "app/__init__.py",
+        # rutas clásicas
         "app/routes/__init__.py",
         "app/routes/billing.py",
         "app/routes/debug.py",
         "app/routes/webhooks.py",
+        "app/routes/items.py",
+        "app/routes/comments.py",
+        "app/routes/compat.py",
+        # nueva ubicación: blueprints
         "app/blueprints/__init__.py",
         "app/blueprints/billing.py",
         "app/blueprints/webhooks.py",
-        # temporal (por si aún existe con errata)
-        "app/blueprinsts/__init__.py",
-        "app/blueprinsts/billing.py",
-        "app/blueprinsts/webhooks.py",
+        "app/blueprints/items.py",
+        "app/blueprints/comments.py",
+        "app/blueprints/compat.py",
     ]:
         p = Path(app.root_path).parent / rel  # app.root_path suele ser /app/app
         app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
@@ -98,7 +102,7 @@ def create_app(config: dict | None = None):
             return False
 
     # ── Helper flexible: intenta varios roots de módulo ──
-    MODULE_ROOTS = ["app.routes", "app.blueprints", "app.blueprinsts"]  # el último temporal por seguridad
+    MODULE_ROOTS = ["app.routes", "app.blueprints", "app.blueprinsts"]  # el último es temporal/compat
 
     def register_bp_flexible(module_name: str, attr: str, url_prefix: str) -> bool:
         for root in MODULE_ROOTS:
@@ -157,8 +161,7 @@ def create_app(config: dict | None = None):
     @sock.route("/ws")
     def ws_handler(ws):
         try:
-            qs = ws.environ.get("QUERY_STRING", "")
-            _ = qs  # no-op, pero lo dejamos por si se quiere leer luego
+            _ = ws.environ.get("QUERY_STRING", "")
         except Exception:
             pass
 
