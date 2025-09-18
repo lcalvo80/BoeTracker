@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import importlib
+import traceback
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -19,6 +20,7 @@ def _parse_origins():
     single = os.getenv("FRONTEND_ORIGIN", "").strip()
     if single:
         return [single]
+    # fallback dev
     return ["http://localhost:3000", "http://localhost:5173"]
 
 
@@ -39,25 +41,31 @@ def create_app(config: dict | None = None):
         p = Path(app.root_path).parent / rel  # app.root_path suele ser /app/app
         app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
 
+    # ── Preflight universal /api/* ──
     @app.before_request
     def _short_circuit_preflight():
         if request.method == "OPTIONS" and request.path.startswith("/api/"):
             return make_response(("", 204))
 
+    # ── Config ──
     app.config.update(
         FRONTEND_URL=os.getenv("FRONTEND_URL", "http://localhost:5173"),
+        # Clerk
         CLERK_PUBLISHABLE_KEY=os.getenv("CLERK_PUBLISHABLE_KEY", ""),
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
         CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
+        # Stripe
         STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
         STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
         PRICE_PRO_MONTHLY_ID=os.getenv("PRICE_PRO_MONTHLY_ID", ""),
         PRICE_ENTERPRISE_SEAT_ID=os.getenv("PRICE_ENTERPRISE_SEAT_ID", ""),
+        # Flask sane defaults
         JSON_SORT_KEYS=False,
     )
     if config:
         app.config.update(config)
 
+    # ── CORS (solo /api/*) ──
     origins = _parse_origins()
     CORS(
         app,
@@ -69,6 +77,7 @@ def create_app(config: dict | None = None):
         max_age=86400,
     )
 
+    # ── Helper: registrar blueprints con traceback en error ──
     def _try_register(module_path: str, attr: str, url_prefix: str) -> bool:
         try:
             mod = importlib.import_module(module_path)
@@ -78,9 +87,10 @@ def create_app(config: dict | None = None):
             return True
         except Exception as e:
             app.logger.error(f"[init] NO se pudo registrar {module_path}.{attr}: {e}")
+            app.logger.error("[init] traceback:\n" + traceback.format_exc())
             return False
 
-    # Debug (si falla, monta fallback)
+    # ── Debug (si falla, monta fallback mínimo) ──
     if not _try_register("app.routes.debug", "bp", "/api/_debug"):
         from flask import Blueprint, current_app
         debug_bp = Blueprint("debug_fallback", __name__)
@@ -108,44 +118,30 @@ def create_app(config: dict | None = None):
         app.register_blueprint(debug_bp, url_prefix="/api/_debug")
         app.logger.warning("[init] debug fallback montado en /api/_debug")
 
-    # Core (si existen)
+    # ── Core (si existen) ──
     _try_register("app.routes.items", "bp", "/api/items")
     _try_register("app.routes.comments", "bp", "/api")
     _try_register("app.routes.compat", "bp", "/api")
 
-    # Billing (si falla, monta fallback temporal para evitar 404)
-    if not _try_register("app.routes.billing", "bp", "/api/billing"):
-        from flask import Blueprint, abort
-        billing_bp = Blueprint("billing_fallback", __name__)
+    # ── Billing (sin fallback: si falla import, NO máscara el problema) ──
+    _try_register("app.routes.billing", "bp", "/api/billing")
 
-        @billing_bp.post("/checkout")
-        def _checkout_fallback():
-            body = request.get_json(silent=True) or {}
-            if not body.get("price_id"):
-                abort(400, "price_id required (fallback)")
-            return jsonify({"checkout_url": "https://example/checkout/fallback"})
-
-        @billing_bp.post("/portal")
-        def _portal_fallback():
-            return jsonify({"portal_url": "https://example/portal/fallback"})
-
-        app.register_blueprint(billing_bp, url_prefix="/api/billing")
-        app.logger.warning("[init] billing fallback montado en /api/billing")
-
-    # Webhooks (si existe)
+    # ── Webhooks ──
     _try_register("app.routes.webhooks", "bp", "/api/webhooks")
 
+    # ── Health ──
     @app.get("/api/health")
     def health():
         return jsonify({"status": "ok"}), 200
 
+    # ── WebSocket (opcional) ──
     sock = Sock(app)
 
     @sock.route("/ws")
     def ws_handler(ws):
         try:
             qs = ws.environ.get("QUERY_STRING", "")
-            _ = qs
+            _ = qs  # no-op
         except Exception:
             pass
 
