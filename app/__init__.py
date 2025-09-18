@@ -31,9 +31,8 @@ def create_app(config: dict | None = None):
     # ── Logs de diagnóstico para paths y archivos ──
     app.logger.info(f"[init] cwd={os.getcwd()} root_path={app.root_path} sys.path[0]={sys.path[0]}")
     for rel in [
-        # núcleo
         "app/__init__.py",
-        # rutas clásicas
+        # roots antiguos
         "app/routes/__init__.py",
         "app/routes/billing.py",
         "app/routes/debug.py",
@@ -41,7 +40,7 @@ def create_app(config: dict | None = None):
         "app/routes/items.py",
         "app/routes/comments.py",
         "app/routes/compat.py",
-        # nueva ubicación: blueprints
+        # ubicación preferida
         "app/blueprints/__init__.py",
         "app/blueprints/billing.py",
         "app/blueprints/webhooks.py",
@@ -49,7 +48,7 @@ def create_app(config: dict | None = None):
         "app/blueprints/comments.py",
         "app/blueprints/compat.py",
     ]:
-        p = Path(app.root_path).parent / rel  # app.root_path suele ser /app/app
+        p = Path(app.root_path).parent / rel
         app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
 
     # ── Preflight universal /api/* ──
@@ -65,11 +64,14 @@ def create_app(config: dict | None = None):
         CLERK_PUBLISHABLE_KEY=os.getenv("CLERK_PUBLISHABLE_KEY", ""),
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
         CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
+        CLERK_WEBHOOK_SECRET=os.getenv("CLERK_WEBHOOK_SECRET", ""),
         # Stripe
         STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
         STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
         PRICE_PRO_MONTHLY_ID=os.getenv("PRICE_PRO_MONTHLY_ID", ""),
         PRICE_ENTERPRISE_SEAT_ID=os.getenv("PRICE_ENTERPRISE_SEAT_ID", ""),
+        # Dev flags
+        DISABLE_AUTH=os.getenv("DISABLE_AUTH", "0"),
         # Flask sane defaults
         JSON_SORT_KEYS=False,
     )
@@ -88,31 +90,44 @@ def create_app(config: dict | None = None):
         max_age=86400,
     )
 
-    # ── Helper: registrar blueprints con traceback en error ──
-    def _try_register(module_path: str, attr: str, url_prefix: str) -> bool:
-        try:
-            mod = importlib.import_module(module_path)
-            bp = getattr(mod, attr)
-            app.register_blueprint(bp, url_prefix=url_prefix)
-            app.logger.info(f"[init] Registrado BP '{bp.name}' de {module_path} en {url_prefix}")
-            return True
-        except Exception as e:
-            app.logger.error(f"[init] NO se pudo registrar {module_path}.{attr}: {e}")
-            app.logger.error("[init] traceback:\n" + traceback.format_exc())
-            return False
-
-    # ── Helper flexible: intenta varios roots de módulo ──
-    MODULE_ROOTS = ["app.routes", "app.blueprints", "app.blueprinsts"]  # el último es temporal/compat
+    # ── Helper flexible: registra blueprints buscando en varios roots ──
+    MODULE_ROOTS = ["app.blueprints", "app.routes"]  # preferimos blueprints
 
     def register_bp_flexible(module_name: str, attr: str, url_prefix: str) -> bool:
+        errors = []
         for root in MODULE_ROOTS:
-            if _try_register(f"{root}.{module_name}", attr, url_prefix):
+            module_path = f"{root}.{module_name}"
+            try:
+                mod = importlib.import_module(module_path)
+            except ModuleNotFoundError:
+                # root inexistente para este módulo → sigue probando sin ruido
+                continue
+            except Exception as e:
+                errors.append((module_path, f"import_error: {e}"))
+                continue
+
+            try:
+                bp = getattr(mod, attr)
+            except Exception as e:
+                errors.append((module_path, f"missing_attr_{attr}: {e}"))
+                continue
+
+            try:
+                app.register_blueprint(bp, url_prefix=url_prefix)
+                app.logger.info(f"[init] Registrado BP '{bp.name}' de {module_path} en {url_prefix}")
                 return True
-        app.logger.error("[init] No se encontró módulo '%s' en %s", module_name, MODULE_ROOTS)
+            except Exception as e:
+                errors.append((module_path, f"register_error: {e}"))
+
+        if errors:
+            for where, msg in errors:
+                app.logger.error(f"[init] Fallo registrando {where}.{attr}: {msg}")
+        else:
+            app.logger.info(f"[init] No se encontró módulo '{module_name}' en {MODULE_ROOTS}")
         return False
 
     # ── Debug (si falla, monta fallback mínimo) ──
-    if not _try_register("app.routes.debug", "bp", "/api/_debug"):
+    if not register_bp_flexible("debug", "bp", "/api/_debug"):
         from flask import Blueprint, current_app
         debug_bp = Blueprint("debug_fallback", __name__)
 
@@ -122,12 +137,12 @@ def create_app(config: dict | None = None):
             for r in current_app.url_map.iter_rules():
                 rules.append({
                     "endpoint": r.endpoint,
-                    "methods": sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
+                    "methods": sorted(m for m in r.methods if m in {"GET","POST","PUT","PATCH","DELETE","OPTIONS"}),
                     "rule": str(r.rule),
                 })
             return jsonify(sorted(rules, key=lambda x: x["rule"]))
 
-        @debug_bp.route("/echo", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+        @debug_bp.route("/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
         def _echo():
             return jsonify({
                 "method": request.method,
@@ -139,15 +154,13 @@ def create_app(config: dict | None = None):
         app.register_blueprint(debug_bp, url_prefix="/api/_debug")
         app.logger.warning("[init] debug fallback montado en /api/_debug")
 
-    # ── Core (si existen; flexible entre routes/blueprints) ──
+    # ── Core (si existen; flexible) ──
     register_bp_flexible("items", "bp", "/api/items")
     register_bp_flexible("comments", "bp", "/api")
     register_bp_flexible("compat", "bp", "/api")
 
-    # ── Billing ──
+    # ── Billing & Webhooks ──
     register_bp_flexible("billing", "bp", "/api/billing")
-
-    # ── Webhooks ──
     register_bp_flexible("webhooks", "bp", "/api/webhooks")
 
     # ── Health ──
@@ -160,11 +173,6 @@ def create_app(config: dict | None = None):
 
     @sock.route("/ws")
     def ws_handler(ws):
-        try:
-            _ = ws.environ.get("QUERY_STRING", "")
-        except Exception:
-            pass
-
         ws.send(json.dumps({"type": "hello", "msg": "ws up"}))
         while True:
             data = ws.receive()
