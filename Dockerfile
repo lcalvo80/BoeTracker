@@ -34,4 +34,4 @@ EXPOSE 8000
 
 # Railway inyecta PORT; mantenemos fallback a 8000 para local
 # Gunicorn con gevent-websocket
-CMD ["sh", "-c", "PORT=${PORT:-8000}; echo PORT=$PORT; exec gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:${PORT} 'app:create_app()'"]
+CMD gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker 'app:create_app()' --bind 0.0.0.0:$PORT --timeout 120 --access-logfile - --error-logfile -
