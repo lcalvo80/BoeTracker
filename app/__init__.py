@@ -5,7 +5,7 @@ import json
 import importlib
 import traceback
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs  # si no lo usas, puedes eliminarlo
 
 from flask import Flask, jsonify, make_response, request
 from flask_cors import CORS
@@ -37,6 +37,13 @@ def create_app(config: dict | None = None):
         "app/routes/billing.py",
         "app/routes/debug.py",
         "app/routes/webhooks.py",
+        "app/blueprints/__init__.py",
+        "app/blueprints/billing.py",
+        "app/blueprints/webhooks.py",
+        # temporal (por si aún existe con errata)
+        "app/blueprinsts/__init__.py",
+        "app/blueprinsts/billing.py",
+        "app/blueprinsts/webhooks.py",
     ]:
         p = Path(app.root_path).parent / rel  # app.root_path suele ser /app/app
         app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
@@ -83,12 +90,22 @@ def create_app(config: dict | None = None):
             mod = importlib.import_module(module_path)
             bp = getattr(mod, attr)
             app.register_blueprint(bp, url_prefix=url_prefix)
-            app.logger.info(f"[init] registrado {module_path}.{attr} en {url_prefix}")
+            app.logger.info(f"[init] Registrado BP '{bp.name}' de {module_path} en {url_prefix}")
             return True
         except Exception as e:
             app.logger.error(f"[init] NO se pudo registrar {module_path}.{attr}: {e}")
             app.logger.error("[init] traceback:\n" + traceback.format_exc())
             return False
+
+    # ── Helper flexible: intenta varios roots de módulo ──
+    MODULE_ROOTS = ["app.routes", "app.blueprints", "app.blueprinsts"]  # el último temporal por seguridad
+
+    def register_bp_flexible(module_name: str, attr: str, url_prefix: str) -> bool:
+        for root in MODULE_ROOTS:
+            if _try_register(f"{root}.{module_name}", attr, url_prefix):
+                return True
+        app.logger.error("[init] No se encontró módulo '%s' en %s", module_name, MODULE_ROOTS)
+        return False
 
     # ── Debug (si falla, monta fallback mínimo) ──
     if not _try_register("app.routes.debug", "bp", "/api/_debug"):
@@ -101,12 +118,12 @@ def create_app(config: dict | None = None):
             for r in current_app.url_map.iter_rules():
                 rules.append({
                     "endpoint": r.endpoint,
-                    "methods": sorted(m for m in r.methods if m in {"GET","POST","PUT","PATCH","DELETE","OPTIONS"}),
+                    "methods": sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
                     "rule": str(r.rule),
                 })
             return jsonify(sorted(rules, key=lambda x: x["rule"]))
 
-        @debug_bp.route("/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
+        @debug_bp.route("/echo", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
         def _echo():
             return jsonify({
                 "method": request.method,
@@ -118,16 +135,16 @@ def create_app(config: dict | None = None):
         app.register_blueprint(debug_bp, url_prefix="/api/_debug")
         app.logger.warning("[init] debug fallback montado en /api/_debug")
 
-    # ── Core (si existen) ──
-    _try_register("app.routes.items", "bp", "/api/items")
-    _try_register("app.routes.comments", "bp", "/api")
-    _try_register("app.routes.compat", "bp", "/api")
+    # ── Core (si existen; flexible entre routes/blueprints) ──
+    register_bp_flexible("items", "bp", "/api/items")
+    register_bp_flexible("comments", "bp", "/api")
+    register_bp_flexible("compat", "bp", "/api")
 
-    # ── Billing (sin fallback: si falla import, NO máscara el problema) ──
-    _try_register("app.routes.billing", "bp", "/api/billing")
+    # ── Billing ──
+    register_bp_flexible("billing", "bp", "/api/billing")
 
     # ── Webhooks ──
-    _try_register("app.routes.webhooks", "bp", "/api/webhooks")
+    register_bp_flexible("webhooks", "bp", "/api/webhooks")
 
     # ── Health ──
     @app.get("/api/health")
@@ -141,7 +158,7 @@ def create_app(config: dict | None = None):
     def ws_handler(ws):
         try:
             qs = ws.environ.get("QUERY_STRING", "")
-            _ = qs  # no-op
+            _ = qs  # no-op, pero lo dejamos por si se quiere leer luego
         except Exception:
             pass
 
