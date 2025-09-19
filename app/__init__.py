@@ -39,6 +39,7 @@ def create_app(config: dict | None = None):
         "app/blueprints/items.py",
         "app/blueprints/comments.py",
         "app/blueprints/compat.py",
+        "app/blueprints/api_alias.py",   # <─ nuevo
         # legacy
         "app/routes/debug.py",
         "app/routes/billing.py",
@@ -131,13 +132,16 @@ def create_app(config: dict | None = None):
             app.logger.info(f"[init] No se encontró módulo '{module_name}' en {MODULE_ROOTS}")
         return False
 
-    # Intenta registrar debug/billing/webhooks y otros opcionales
+    # Blueprints principales
     register_bp("debug", "bp")
     register_bp("billing", "bp")
     register_bp("webhooks", "bp")
     register_bp("items", "bp")
     register_bp("comments", "bp")
     register_bp("compat", "bp")
+
+    # ⬅️ Alias coherentes bajo /api/* para endpoints legacy sin prefijo
+    register_bp("api_alias", "bp")
 
     # ── Fallback de debug GARANTIZADO en /api/_int ──
     from flask import Blueprint
