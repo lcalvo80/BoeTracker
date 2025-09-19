@@ -27,18 +27,18 @@ def create_app(config: dict | None = None):
     app = Flask(__name__)
     app.url_map.strict_slashes = False
 
-    # ── Logs de diagnóstico para paths y archivos ──
+    # ── Logs de diagnóstico de archivos existentes ──
     app.logger.info(f"[init] cwd={os.getcwd()} root_path={app.root_path} sys.path[0]={sys.path[0]}")
     for rel in [
         "app/__init__.py",
-        # ubicaciones preferidas (blueprints)
+        # preferidos
         "app/blueprints/debug.py",
         "app/blueprints/billing.py",
         "app/blueprints/webhooks.py",
         "app/blueprints/items.py",
         "app/blueprints/comments.py",
         "app/blueprints/compat.py",
-        # rutas legacy (si existen)
+        # legacy
         "app/routes/debug.py",
         "app/routes/billing.py",
         "app/routes/webhooks.py",
@@ -70,7 +70,7 @@ def create_app(config: dict | None = None):
         PRICE_ENTERPRISE_SEAT_ID=os.getenv("PRICE_ENTERPRISE_SEAT_ID", ""),
         # Flags
         DISABLE_AUTH=os.getenv("DISABLE_AUTH", "0"),
-        # Flask sane defaults
+        # Flask
         JSON_SORT_KEYS=False,
     )
     if config:
@@ -88,13 +88,14 @@ def create_app(config: dict | None = None):
         max_age=86400,
     )
 
-    # ── Helper: registra un BP si existe (blueprints primero; luego legacy routes) ──
+    # ── Registro de blueprints de forma robusta ──
     MODULE_ROOTS = ["app.blueprints", "app.routes"]
 
-    def register_bp(module_name: str, attr: str, url_prefix: str) -> bool:
+    def register_bp(module_name: str, attr: str) -> bool:
         """
         Busca module_name en app.blueprints y app.routes; si lo encuentra,
-        registra su atributo 'attr' (normalmente 'bp') con url_prefix dado.
+        registra su atributo 'attr' (normalmente 'bp').
+        El propio blueprint puede traer su 'url_prefix' y Flask lo respeta.
         """
         errors = []
         for root in MODULE_ROOTS:
@@ -114,9 +115,7 @@ def create_app(config: dict | None = None):
                 continue
 
             try:
-                # Si el BP ya trae url_prefix en su Blueprint, Flask ignora este parámetro;
-                # lo dejamos por compat, pero debug/billing ya definen su propio url_prefix interno.
-                app.register_blueprint(bp, url_prefix=None)
+                app.register_blueprint(bp)  # respeta url_prefix del propio BP
                 app.logger.info(f"[init] Registrado BP '{bp.name}' de {module_path}")
                 return True
             except Exception as e:
@@ -129,19 +128,76 @@ def create_app(config: dict | None = None):
             app.logger.info(f"[init] No se encontró módulo '{module_name}' en {MODULE_ROOTS}")
         return False
 
-    # ── Blueprints ──
-    # debug.py define url_prefix="/api/debug"
-    register_bp("debug", "bp", "/api/debug")
+    # Intenta registrar debug/billing/webhooks y otros opcionales
+    debug_ok = register_bp("debug", "bp")
+    billing_ok = register_bp("billing", "bp")
+    webhooks_ok = register_bp("webhooks", "bp")
+    register_bp("items", "bp")
+    register_bp("comments", "bp")
+    register_bp("compat", "bp")
 
-    # billing.py define BP con endpoints de billing; lo registramos tal cual.
-    # Si el propio BP trae url_prefix, lo respeta; si no, quedará bajo raíz.
-    register_bp("billing", "bp", "/api/billing")
-    register_bp("webhooks", "bp", "/api/webhooks")
+    # ── Fallback de debug GARANTIZADO en /api/_int ──
+    # (se monta SIEMPRE; así tenemos una vía de inspección aunque 'debug' falle)
+    from flask import Blueprint
+    intdbg = Blueprint("int_debug", __name__, url_prefix="/api/_int")
 
-    # Otros (si existen en tu proyecto)
-    register_bp("items", "bp", "/api/items")
-    register_bp("comments", "bp", "/api")
-    register_bp("compat", "bp", "/api")
+    @intdbg.get("/routes")
+    def _int_routes():
+        rules = []
+        for r in app.url_map.iter_rules():
+            methods = sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+            rules.append({"endpoint": r.endpoint, "methods": methods, "rule": str(r.rule)})
+        rules.sort(key=lambda x: x["rule"])
+        return jsonify(rules), 200
+
+    @intdbg.get("/auth-config")
+    def _int_auth_cfg():
+        cfg = {
+            "CLERK_ISSUER": os.getenv("CLERK_ISSUER", ""),
+            "CLERK_JWKS_URL": os.getenv("CLERK_JWKS_URL", ""),
+            "CLERK_AUDIENCE": os.getenv("CLERK_AUDIENCE", ""),
+            "CLERK_LEEWAY": os.getenv("CLERK_LEEWAY", ""),
+            "CLERK_JWKS_TTL": os.getenv("CLERK_JWKS_TTL", ""),
+            "CLERK_JWKS_TIMEOUT": os.getenv("CLERK_JWKS_TIMEOUT", ""),
+            "DISABLE_AUTH": os.getenv("DISABLE_AUTH", ""),
+        }
+        return jsonify(cfg), 200
+
+    # claims protegido si auth está disponible; si no, se omitirá
+    try:
+        from app.auth import require_clerk_auth
+        @intdbg.get("/claims")
+        @require_clerk_auth
+        def _int_claims():
+            authz = request.headers.get("Authorization", "")
+            authz_short = (authz[:20] + "...") if authz else ""
+            payload = {
+                "g_clerk": {
+                    "user_id": getattr(app, "g", g).clerk.get("user_id") if hasattr(g, "clerk") else None,
+                    "org_id": getattr(app, "g", g).clerk.get("org_id") if hasattr(g, "clerk") else None,
+                    "email": getattr(app, "g", g).clerk.get("email") if hasattr(g, "clerk") else None,
+                    "name": getattr(app, "g", g).clerk.get("name") if hasattr(g, "clerk") else None,
+                },
+                "auth_header_present": bool(authz),
+                "auth_header_prefix_ok": authz.startswith("Bearer "),
+                "auth_header_sample": authz_short,
+            }
+            return jsonify(payload), 200
+    except Exception as e:
+        app.logger.warning(f"[init] No se pudo montar /api/_int/claims protegido: {e}")
+
+    @intdbg.route("/echo", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+    def _int_echo():
+        return jsonify({
+            "method": request.method,
+            "path": request.path,
+            "headers": {k: v for k, v in request.headers.items()},
+            "json": request.get_json(silent=True),
+            "args": request.args.to_dict(flat=True),
+        }), 200
+
+    app.register_blueprint(intdbg)
+    app.logger.info("[init] Fallback interno montado en /api/_int")
 
     # ── Health ──
     @app.get("/api/health")

@@ -5,16 +5,13 @@ import os
 from flask import Blueprint, jsonify, request, g, current_app
 from app.auth import require_clerk_auth
 
-# Monta bajo /api/debug/*
+# Este blueprint se monta con su propio prefix:
 bp = Blueprint("debug", __name__, url_prefix="/api/debug")
 
 
 @bp.get("/auth-config")
 def auth_config():
-    """
-    Config mínima para verificar que las ENVs de Clerk (y flags) llegan al runtime.
-    No expone secretos.
-    """
+    """Config pública para verificar integración con Clerk/flags (sin secretos)."""
     cfg = {
         "CLERK_ISSUER": os.getenv("CLERK_ISSUER", ""),
         "CLERK_JWKS_URL": os.getenv("CLERK_JWKS_URL", ""),
@@ -32,10 +29,7 @@ def auth_config():
 @bp.get("/claims")
 @require_clerk_auth
 def claims():
-    """
-    Devuelve lo que el guard ha puesto en g.clerk para esta request.
-    Útil para verificar 'sub' (user_id) y 'org_id'.
-    """
+    """Muestra lo que dejó auth en g.clerk para esta request."""
     authz = request.headers.get("Authorization", "")
     authz_short = (authz[:20] + "...") if authz else ""
     payload = {
@@ -56,26 +50,18 @@ def claims():
 
 @bp.get("/routes")
 def routes_list():
-    """
-    Lista las rutas registradas (para confirmar que /api/debug está montado).
-    """
+    """Lista las rutas registradas."""
     rules = []
     for r in current_app.url_map.iter_rules():
         methods = sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
-        rules.append({
-            "endpoint": r.endpoint,
-            "methods": methods,
-            "rule": str(r.rule),
-        })
+        rules.append({"endpoint": r.endpoint, "methods": methods, "rule": str(r.rule)})
     rules.sort(key=lambda x: x["rule"])
     return jsonify(rules), 200
 
 
 @bp.route("/echo", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 def echo():
-    """
-    Endpoint de eco para probar CORS/headers/métodos.
-    """
+    """Echo útil para probar CORS/headers/métodos rápidamente."""
     return jsonify({
         "method": request.method,
         "path": request.path,
