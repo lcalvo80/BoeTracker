@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import stripe
+import json
+import requests
 from typing import Tuple
 from functools import wraps
 from flask import Blueprint, request, jsonify, current_app, g
@@ -14,10 +16,7 @@ def _truthy(v) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
 
 def _conf(key: str, default: str | None = None) -> str | None:
-    """
-    Lee primero de current_app.config y si falta, de ENV.
-    Devuelve default si no hay valor.
-    """
+    """Lee primero de current_app.config y si falta, de ENV."""
     try:
         val = current_app.config.get(key)
         if val is not None and str(val).strip() != "":
@@ -52,7 +51,7 @@ def _load_auth_guard():
     try:
         from app.auth import require_clerk_auth as real_guard
         return real_guard
-    except Exception as e:
+    except Exception:
         # Sin bypass y no podemos cargar auth → sube error para ver en logs
         raise
 
@@ -66,7 +65,6 @@ def _require_auth(fn):
 
 # ───────────────────────── Stripe helpers ─────────────────────────
 def _init_stripe() -> tuple[bool, tuple]:
-    """Inicializa la API key de Stripe desde config/ENV. Devuelve (ok, error_response?)."""
     key = _conf("STRIPE_SECRET_KEY", "")
     if not key:
         return False, _json_error("Stripe secret key (STRIPE_SECRET_KEY) is missing", 500)
@@ -78,7 +76,6 @@ def _clerk_target(is_org: bool) -> tuple[bool, tuple] | tuple[str, str]:
     Extrae (entity_type, entity_id) desde g.clerk.
     - is_org=True → requiere org_id.
     - is_org=False → requiere user_id.
-    Responde (False, json_error) si falta.
     """
     data = getattr(g, "clerk", {}) or {}
     entity_type = "org" if is_org else "user"
@@ -90,10 +87,6 @@ def _clerk_target(is_org: bool) -> tuple[bool, tuple] | tuple[str, str]:
     return entity_type, str(entity_id)
 
 def _maybe_contact_from_token() -> dict:
-    """
-    Intenta sacar email/name desde g.clerk si tu decorador los adjunta.
-    No es obligatorio, pero ayuda a que el Customer esté más completo.
-    """
     data = getattr(g, "clerk", {}) or {}
     out = {}
     if data.get("email"):
@@ -104,11 +97,6 @@ def _maybe_contact_from_token() -> dict:
     return out
 
 def _ensure_customer(entity_type: str, entity_id: str, is_org: bool) -> str:
-    """
-    Busca o crea un Customer en Stripe. Metadata compatible:
-      - entity_type/entity_id
-      - clerk_user_id/clerk_org_id
-    """
     # 1) Buscar por metadata (si tu cuenta tiene Customer Search)
     try:
         query = f"metadata['entity_type']:'{entity_type}' AND metadata['entity_id']:'{entity_id}'"
@@ -117,7 +105,6 @@ def _ensure_customer(entity_type: str, entity_id: str, is_org: bool) -> str:
             return res.data[0].id
     except Exception:
         pass
-
     # 2) Crear
     contact = _maybe_contact_from_token()
     metadata = {
@@ -129,22 +116,93 @@ def _ensure_customer(entity_type: str, entity_id: str, is_org: bool) -> str:
     return cust.id
 
 def _frontend_base() -> str:
-    """Base URL de frontend para construir success/return URLs."""
     return (_conf("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
 
 def _resolve_price_id(is_org: bool, price_id_hint: str | None) -> str:
-    """
-    Devuelve el price_id efectivo. Si no llega en body se usa el default del servidor:
-    - is_org=False → PRICE_PRO_MONTHLY_ID
-    - is_org=True  → PRICE_ENTERPRISE_SEAT_ID
-    Lee de config o ENV.
-    """
     pid = (price_id_hint or "").strip()
     if pid:
         return pid
     if is_org:
         return (_conf("PRICE_ENTERPRISE_SEAT_ID", "") or "").strip()
     return (_conf("PRICE_PRO_MONTHLY_ID", "") or "").strip()
+
+# ───────────────────────── Clerk helpers ─────────────────────────
+def _clerk_api_url(resource: str) -> str:
+    """
+    Construye la base de Clerk API en función de la instancia.
+    Si usas .dev, la API también es api.clerk.com con la secret, no .dev.
+    Puedes forzar base vía CLERK_API_URL si lo necesitas.
+    """
+    forced = _conf("CLERK_API_URL")
+    if forced:
+        return forced.rstrip("/") + resource
+    # API pública de Clerk es api.clerk.com independientemente del tenant .dev o prod
+    return "https://api.clerk.com" + resource
+
+def _clerk_headers() -> dict:
+    sk = _conf("CLERK_SECRET_KEY", "")
+    if not sk:
+        return {}
+    return {
+        "Authorization": f"Bearer {sk}",
+        "Content-Type": "application/json",
+    }
+
+def _update_clerk_public_metadata(entity_type: str, entity_id: str, plan: str) -> tuple[bool, tuple]:
+    """
+    Actualiza public_metadata.plan en Clerk para user/org.
+    plan: "free" | "pro" | "enterprise"
+    """
+    headers = _clerk_headers()
+    if not headers:
+        return False, _json_error("CLERK_SECRET_KEY is missing (server cannot update plan in Clerk)", 500)
+
+    payload = {"public_metadata": {"plan": plan}}
+    try:
+        if entity_type == "user":
+            url = _clerk_api_url(f"/v1/users/{entity_id}")
+        else:
+            url = _clerk_api_url(f"/v1/organizations/{entity_id}")
+        r = requests.patch(url, headers=headers, data=json.dumps(payload), timeout=15)
+        if r.status_code >= 400:
+            return False, _json_error(f"Clerk update failed ({r.status_code}): {r.text}", 500)
+        return True, ()
+    except requests.RequestException as e:
+        return False, _json_error(f"Clerk update error: {str(e)}", 500)
+
+def _plan_from_scope(plan_scope: str | None) -> str:
+    """
+    Deriva el nombre de plan lógico a partir del scope guardado:
+      - "org"  → "enterprise"
+      - "user" → "pro"
+    """
+    if (plan_scope or "").lower() == "org":
+        return "enterprise"
+    return "pro"
+
+def _plan_from_subscription(sub: stripe.Subscription) -> str:
+    """
+    Para suscripciones activas → plan según metadatos/price.
+    Si está cancelada o sin items → 'free'.
+    """
+    if not sub or sub.get("status") not in ("active", "trialing", "past_due"):
+        return "free"
+    # Si guardaste metadata en subscription_data.metadata:
+    md = (sub.get("metadata") or {})
+    plan_scope = md.get("plan_scope")
+    if plan_scope:
+        return _plan_from_scope(plan_scope)
+    # Fallback muy básico por si no hay metadata:
+    try:
+        items = sub.get("items", {}).get("data", [])
+        if items:
+            price = items[0].get("price", {})
+            nick = (price.get("nickname") or "").lower()
+            if "enterprise" in nick:
+                return "enterprise"
+    except Exception:
+        pass
+    return "pro"
 
 # ───────────────────────── Endpoints ─────────────────────────
 @bp.post("/checkout")
@@ -172,7 +230,6 @@ def create_checkout():
     price_id = _resolve_price_id(is_org=is_org, price_id_hint=body.get("price_id"))
 
     if not price_id:
-        # Mismo mensaje que estáis viendo, pero ahora en JSON:
         return _json_error("Missing price_id and no default price configured on server", 400)
     if price_id.startswith("prod_"):
         return _json_error("price_id looks like a product id (prod_...). Use a price id (price_...)", 400)
@@ -183,7 +240,6 @@ def create_checkout():
 
     clerk_target = _clerk_target(is_org=is_org)
     if isinstance(clerk_target, tuple) and clerk_target and clerk_target[0] is False:
-        # Error JSON ya preparado
         return clerk_target[1]
     entity_type, entity_id = clerk_target  # type: ignore
 
@@ -251,14 +307,13 @@ def create_portal():
     Crea una sesión del Billing Portal de Stripe para el Customer asociado.
     Body JSON (opcional):
       - is_org (bool, default False)
-    Respuestas JSON (nunca HTML).
     """
     body = request.get_json(silent=True) or {}
     is_org = bool(body.get("is_org", False))
 
     ok, err = _init_stripe()
     if not ok:
-        return err  # (json, 500)
+        return err
 
     clerk_target = _clerk_target(is_org=is_org)
     if isinstance(clerk_target, tuple) and clerk_target and clerk_target[0] is False:
@@ -286,3 +341,109 @@ def create_portal():
         return _json_error(f"Stripe error: {str(e)}", 400)
     except Exception as e:
         return _json_error(f"Unexpected error creating portal session: {str(e)}", 500)
+
+# ───────────────────────── Webhook & Sync ─────────────────────────
+@bp.post("/webhook")
+def stripe_webhook():
+    """
+    Webhook de Stripe. Configura en Stripe:
+      - endpoint:   https://<backend>/api/billing/webhook
+      - secret:     STRIPE_WEBHOOK_SECRET
+      - events:     checkout.session.completed, customer.subscription.created,
+                    customer.subscription.updated, customer.subscription.deleted
+    """
+    payload = request.data
+    sig = request.headers.get("Stripe-Signature", "")
+    wh_secret = _conf("STRIPE_WEBHOOK_SECRET", "")
+    if not wh_secret:
+        return _json_error("STRIPE_WEBHOOK_SECRET is missing", 500)
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, wh_secret)
+    except ValueError:
+        return _json_error("Invalid payload", 400)
+    except stripe.error.SignatureVerificationError:
+        return _json_error("Invalid signature", 400)
+
+    etype = event["type"]
+    data = event["data"]["object"]
+
+    try:
+        if etype == "checkout.session.completed":
+            # Obtenemos metadata y/o subscription para deducir plan
+            md = data.get("metadata", {}) or {}
+            entity_type = md.get("entity_type") or ("org" if md.get("plan_scope") == "org" else "user")
+            entity_id = md.get("entity_id") or md.get("clerk_org_id") or md.get("clerk_user_id")
+            plan = _plan_from_scope(md.get("plan_scope"))
+            if not entity_id:
+                # Fallback: intentar por customer + buscar subscription
+                sub_id = data.get("subscription")
+                if sub_id:
+                    sub = stripe.Subscription.retrieve(sub_id, expand=["items.data.price"])
+                    plan = _plan_from_subscription(sub)
+                # Sin entity_id no podemos actualizar Clerk
+                return jsonify(received=True, note="no entity_id in metadata"), 200
+
+            ok, err = _update_clerk_public_metadata(entity_type, entity_id, plan)
+            if not ok:
+                return err
+            return jsonify(received=True), 200
+
+        elif etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+            # En update/delete, volvemos a fijar plan según estado
+            sub = data
+            # Intentar leer metadata de la subscription
+            md = (sub.get("metadata") or {})
+            entity_type = md.get("entity_type") or ("org" if md.get("plan_scope") == "org" else "user")
+            entity_id = md.get("entity_id") or md.get("clerk_org_id") or md.get("clerk_user_id")
+            plan = _plan_from_subscription(sub)
+            if not entity_id:
+                return jsonify(received=True, note="no entity_id in subscription metadata"), 200
+            ok, err = _update_clerk_public_metadata(entity_type, entity_id, plan)
+            if not ok:
+                return err
+            return jsonify(received=True), 200
+
+        # Otros eventos no usados: confirmamos recepción
+        return jsonify(received=True, ignored=etype), 200
+
+    except stripe.error.StripeError as e:
+        return _json_error(f"Stripe webhook error: {str(e)}", 400)
+    except Exception as e:
+        return _json_error(f"Unexpected webhook error: {str(e)}", 500)
+
+@bp.post("/sync")
+@_require_auth
+def sync_after_success():
+    """
+    Fallback manual desde frontend tras éxito:
+    Body: { "session_id": "cs_test_..." }
+    Recupera la sesión, deduce entity y plan, y actualiza Clerk igual que el webhook.
+    """
+    body = request.get_json(silent=True) or {}
+    session_id = (body.get("session_id") or "").strip()
+    if not session_id:
+        return _json_error("session_id is required", 400)
+
+    ok, err = _init_stripe()
+    if not ok:
+        return err
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id, expand=["subscription", "subscription.items.data.price"])
+    except stripe.error.StripeError as e:
+        return _json_error(f"Stripe error retrieving session: {str(e)}", 400)
+
+    md = (session.get("metadata") or {})
+    entity_type = md.get("entity_type") or ("org" if md.get("plan_scope") == "org" else "user")
+    entity_id = md.get("entity_id") or md.get("clerk_org_id") or md.get("clerk_user_id")
+    plan = _plan_from_subscription(session.get("subscription") or {})
+
+    if not entity_id:
+        return _json_error("Cannot determine entity_id from session metadata", 400)
+
+    ok, err = _update_clerk_public_metadata(entity_type, entity_id, plan)
+    if not ok:
+        return err
+
+    return jsonify(ok=True, entity_type=entity_type, entity_id=entity_id, plan=plan), 200
