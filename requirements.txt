@@ -11,5 +11,5 @@ gevent-websocket
 stripe
 httpx
 python-jose[cryptography]
-svix
+svix==1.24.0
 hypercorn[trio]

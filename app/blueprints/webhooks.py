@@ -1,13 +1,13 @@
-# app/blueprints/webhooks.py
 from __future__ import annotations
 
-import stripe
 from typing import Optional, Tuple, Dict, Any
+
+import stripe
 from flask import Blueprint, request, jsonify, current_app, abort
 
 bp = Blueprint("webhooks", __name__)
 
-# Imports de servicios (opcionales pero recomendados)
+# ===== Servicios opcionales =====
 try:
     from app.services import clerk_svc
 except Exception:
@@ -19,6 +19,18 @@ except Exception:
     svc_init_stripe = None
     set_subscription_quantity = None  # type: ignore
 
+# ===== Svix (Clerk) opcional =====
+try:
+    from svix.webhooks import Webhook, WebhookVerificationError
+    _svix_available = True
+except Exception:
+    Webhook = None  # type: ignore
+    WebhookVerificationError = Exception  # type: ignore
+    _svix_available = False
+
+
+# ---------- STRIPE HELPERS ----------
+
 def _init_stripe():
     if svc_init_stripe:
         svc_init_stripe()
@@ -28,12 +40,9 @@ def _init_stripe():
         abort(500, "STRIPE_SECRET_KEY not configured")
     stripe.api_key = key
 
-# ---------- Utilidades para identificar el target (user/org) ----------
-
 def _target_from_metadata(md: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     if not md:
         return None, None
-    # Preferimos entity_type/entity_id; si no, clerk_*_id
     etype = md.get("entity_type")
     eid = md.get("entity_id")
     if etype and eid:
@@ -45,17 +54,14 @@ def _target_from_metadata(md: Dict[str, Any]) -> Tuple[Optional[str], Optional[s
     return None, None
 
 def _resolve_target(session: Optional[dict], sub: Optional[dict], customer: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
-    # 1) metadata en subscription
     if sub:
         et, ei = _target_from_metadata(sub.get("metadata") or {})
         if et and ei:
             return et, ei
-    # 2) metadata en session (checkout.session.completed)
     if session:
         et, ei = _target_from_metadata((session.get("metadata") or {}))
         if et and ei:
             return et, ei
-    # 3) metadata en customer
     if customer:
         et, ei = _target_from_metadata((customer.get("metadata") or {}))
         if et and ei:
@@ -68,18 +74,16 @@ def _subscription_item_id(sub: dict) -> Optional[str]:
     except Exception:
         return None
 
-# ---------- Patch helpers (Clerk) ----------
-
 def _update_clerk_for_subscription(entity_type: str, entity_id: str, sub: dict, price_id_hint: Optional[str] = None):
+    # Sin servicio declarado; no hacemos nada pero confirmamos recepción
     if not clerk_svc:
-        # Sin servicio declarado; no hacemos nada pero confirmamos recepción
         return
     status = sub.get("status")
     item = (sub.get("items", {}).get("data") or [{}])[0]
     price = (item.get("price") or {})
     price_id = price.get("id") or price_id_hint
+
     payload_public = {}
-    # Tilde de planes según estado (ajusta a tu lógica)
     if status in {"active", "trialing"}:
         payload_public["plan"] = "enterprise" if entity_type == "org" else "pro"
     else:
@@ -100,16 +104,16 @@ def _update_clerk_for_subscription(entity_type: str, entity_id: str, sub: dict, 
     else:
         clerk_svc.update_user_metadata(entity_id, public=payload_public, private=payload_private)
 
-# ---------- Stripe webhook ----------
 
-@bp.post("/stripe")
-def stripe_webhook():
+# ---------- STRIPE WEBHOOKS (coherente en /api) + ALIAS legacy ----------
+
+def _handle_stripe_webhook():
     _init_stripe()
     secret = current_app.config.get("STRIPE_WEBHOOK_SECRET")
     if not secret:
-        abort(500, "STRIPE_WEBHOOK_SECRET not configured")
+        return jsonify({"error": "STRIPE_WEBHOOK_SECRET not configured"}), 500
 
-    payload = request.get_data()
+    payload = request.get_data()  # raw bytes
     sig = request.headers.get("Stripe-Signature", "")
     try:
         event = stripe.Webhook.construct_event(payload, sig, secret)
@@ -135,7 +139,6 @@ def stripe_webhook():
     # Cambios de suscripción
     if etype in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
         sub = obj
-        # customer sin expand viene como id
         cust = stripe.Customer.retrieve(sub.get("customer"))
         entity_type, entity_id = _resolve_target(session=None, sub=sub, customer=cust)
         if entity_type and entity_id:
@@ -151,7 +154,6 @@ def stripe_webhook():
             cust = stripe.Customer.retrieve(sub.get("customer"))
             entity_type, entity_id = _resolve_target(session=None, sub=sub, customer=cust)
             if entity_type and entity_id and clerk_svc:
-                # Añadimos flag en private.billing
                 private = {"billing": {"status": sub.get("status"), "lastPaymentFailed": True}}
                 if entity_type == "org":
                     clerk_svc.update_org_metadata(entity_id, private=private)
@@ -159,42 +161,74 @@ def stripe_webhook():
                     clerk_svc.update_user_metadata(entity_id, private=private)
         return jsonify({"received": True})
 
+    # Otros eventos que no manejamos explícitamente
     return jsonify({"ignored": True})
 
-# ---------- Clerk (Svix) webhook opcional para seats enterprise ----------
+# Nueva ruta coherente
+@bp.post("/api/stripe")
+def stripe_webhook_api():
+    return _handle_stripe_webhook()
 
-try:
-    from svix.webhooks import Webhook
+# Alias legacy (retrocompatibilidad)
+@bp.post("/stripe")
+def stripe_webhook_legacy():
+    return _handle_stripe_webhook()
 
-    @bp.post("/clerk")
-    def clerk_webhook():
-        if not current_app.config.get("CLERK_WEBHOOK_SECRET"):
-            return jsonify({"error": "CLERK_WEBHOOK_SECRET not configured"}), 500
-        if not clerk_svc:
-            return jsonify({"error": "clerk_svc not available"}), 500
 
-        payload = request.get_data()
-        headers = dict(request.headers)
-        wh = Webhook(current_app.config["CLERK_WEBHOOK_SECRET"])
+# ---------- CLERK (SVIX) WEBHOOK (coherente en /api) + ALIAS legacy ----------
+
+def _handle_clerk_webhook():
+    if not _svix_available:
+        return jsonify({"error": "svix not installed"}), 500
+    secret = current_app.config.get("CLERK_WEBHOOK_SECRET")
+    if not secret:
+        return jsonify({"error": "CLERK_WEBHOOK_SECRET not configured"}), 500
+
+    # clerk_svc opcional: si no existe, igualmente respondemos 200 para ack
+    payload = request.get_data()  # raw bytes, NO usar get_json() antes
+    svix_headers = {
+        "svix-id": request.headers.get("svix-id", ""),
+        "svix-timestamp": request.headers.get("svix-timestamp", ""),
+        "svix-signature": request.headers.get("svix-signature", ""),
+    }
+    try:
+        event = Webhook(secret).verify(payload, svix_headers)  # type: ignore
+    except WebhookVerificationError as e:  # type: ignore
+        current_app.logger.warning(f"Clerk webhook signature failed: {e}")
+        return jsonify({"error": "invalid signature"}), 400
+    except Exception as e:
+        current_app.logger.exception(f"Clerk webhook error: {e}")
+        return jsonify({"error": "bad request"}), 400
+
+    evt_type = event.get("type")
+    data = event.get("data", {})
+    evt_id = event.get("id")
+    current_app.logger.info(f"Clerk evt {evt_type} ({evt_id})")
+
+    # Sincroniza seats con Stripe cuando cambia membership
+    if clerk_svc and evt_type in ("organizationMembership.created", "organizationMembership.deleted"):
         try:
-            event = wh.verify(payload, headers)
-        except Exception:
-            return jsonify({"error": "invalid_signature"}), 400
-
-        type_ = event["type"]
-        data  = event["data"]
-
-        # Sincronizamos seats con Stripe cuando cambia el membership
-        if type_ in ("organizationMembership.created", "organizationMembership.deleted"):
             org_id = data["organization"]["id"]
             org = clerk_svc.get_org(org_id)
             members_count = int((org.get("members_count") or 0))
-            billing = (org.get("private_metadata") or {}).get("billing", {})
+            billing = (org.get("private_metadata") or {}).get("billing", {}) or {}
             item_id = billing.get("subscriptionItemId")
             if item_id and set_subscription_quantity:
                 set_subscription_quantity(item_id, members_count)
                 clerk_svc.update_org_metadata(org_id, private={"billing": {**billing, "seatCount": members_count}})
-        return jsonify({"ok": True})
-except Exception:
-    # svix no instalado; omitimos el endpoint /clerk
-    pass
+        except Exception as e:
+            # Logueamos pero devolvemos 200 para que Clerk no reintente en bucle
+            current_app.logger.exception(f"handler error for {evt_type}: {e}")
+
+    # ACK rápido
+    return jsonify({"ok": True}), 200
+
+# Nueva ruta coherente
+@bp.post("/api/clerk")
+def clerk_webhook_api():
+    return _handle_clerk_webhook()
+
+# Alias legacy (retrocompatibilidad)
+@bp.post("/clerk")
+def clerk_webhook_legacy():
+    return _handle_clerk_webhook()
