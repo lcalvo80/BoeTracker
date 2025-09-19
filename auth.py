@@ -18,9 +18,12 @@ def _cfg(key: str, default: Optional[str] = None) -> str:
     Lee primero de Flask config (si hay app_context), si no de ENV.
     """
     if has_app_context():
-        val = current_app.config.get(key)
-        if val is not None:
-            return str(val)
+        try:
+            val = current_app.config.get(key)
+            if val is not None:
+                return str(val)
+        except Exception:
+            pass
     return str(os.getenv(key, default if default is not None else ""))
 
 def _truthy(v: Any) -> bool:
@@ -82,8 +85,14 @@ def _pick_key_for_kid(jwks: Dict[str, Any], kid: str) -> Optional[Dict[str, Any]
             return k
     return None
 
-def _decode_token(token: str, key: Dict[str, Any], leeway: int,
-                  audience: Optional[str], issuer: Optional[str], alg: Optional[str]) -> Dict[str, Any]:
+def _decode_token(
+    token: str,
+    key: Dict[str, Any],
+    leeway: int,
+    audience: Optional[str],
+    issuer: Optional[str],
+    alg: Optional[str],
+) -> Dict[str, Any]:
     options = {
         "verify_aud": bool(audience),  # desactiva aud si no hay audience
         "verify_iat": True,
@@ -113,7 +122,7 @@ def require_clerk_auth(fn):
     """
     Valida un JWT de Clerk usando JWKS, con cache y reintento ante kid desconocido.
     Si DISABLE_AUTH=1 → bypass (para diagnóstico/desarrollo).
-    Expone en g.clerk: user_id, org_id, email, name.
+    Expone en g.clerk: user_id, org_id, email, name, raw_claims (opcional).
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -124,6 +133,7 @@ def require_clerk_auth(fn):
                 "org_id": None,
                 "email": "dev@example.com",
                 "name": "Dev User",
+                "raw_claims": None,
             }
             return fn(*args, **kwargs)
 
@@ -187,13 +197,17 @@ def require_clerk_auth(fn):
             s = org_id.strip()
             if not s or s.startswith("{{"):
                 org_id = None
-            elif not s.startswith("org_"):  # quita si tu tenant no usa prefijo org_
+            elif not s.startswith("org_"):  # adapta a tu tenant si no usa prefijo
                 org_id = None
 
         # 5) Log básico para debug
         try:
-            current_app.logger.info("AUTH claims: iss=%s sub=%s org_id=%s",
-                                    claims.get("iss"), user_id, org_id)
+            current_app.logger.info(
+                "AUTH claims: iss=%s sub=%s org_id=%s",
+                claims.get("iss"),
+                user_id,
+                org_id,
+            )
         except Exception:
             pass
 

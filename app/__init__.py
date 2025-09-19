@@ -4,8 +4,9 @@ import sys
 import json
 import importlib
 from pathlib import Path
+from functools import wraps
 
-from flask import Flask, jsonify, make_response, request
+from flask import Flask, jsonify, make_response, request, g
 from flask_cors import CORS
 from flask_sock import Sock
 from dotenv import load_dotenv
@@ -45,6 +46,8 @@ def create_app(config: dict | None = None):
         "app/routes/items.py",
         "app/routes/comments.py",
         "app/routes/compat.py",
+        # auth
+        "app/auth.py",
     ]:
         p = Path(app.root_path).parent / rel
         app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
@@ -63,13 +66,14 @@ def create_app(config: dict | None = None):
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
         CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
         CLERK_WEBHOOK_SECRET=os.getenv("CLERK_WEBHOOK_SECRET", ""),
-        # Stripe
-        STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
-        STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
-        PRICE_PRO_MONTHLY_ID=os.getenv("PRICE_PRO_MONTHLY_ID", ""),
-        PRICE_ENTERPRISE_SEAT_ID=os.getenv("PRICE_ENTERPRISE_SEAT_ID", ""),
+        CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),
+        CLERK_AUDIENCE=os.getenv("CLERK_AUDIENCE", ""),
+        CLERK_LEEWAY=os.getenv("CLERK_LEEWAY", "30"),
+        CLERK_JWKS_TTL=os.getenv("CLERK_JWKS_TTL", "3600"),
+        CLERK_JWKS_TIMEOUT=os.getenv("CLERK_JWKS_TIMEOUT", "5"),
         # Flags
         DISABLE_AUTH=os.getenv("DISABLE_AUTH", "0"),
+        EXPOSE_CLAIMS_DEBUG=os.getenv("EXPOSE_CLAIMS_DEBUG", "0"),
         # Flask
         JSON_SORT_KEYS=False,
     )
@@ -95,7 +99,6 @@ def create_app(config: dict | None = None):
         """
         Busca module_name en app.blueprints y app.routes; si lo encuentra,
         registra su atributo 'attr' (normalmente 'bp').
-        El propio blueprint puede traer su 'url_prefix' y Flask lo respeta.
         """
         errors = []
         for root in MODULE_ROOTS:
@@ -129,15 +132,14 @@ def create_app(config: dict | None = None):
         return False
 
     # Intenta registrar debug/billing/webhooks y otros opcionales
-    debug_ok = register_bp("debug", "bp")
-    billing_ok = register_bp("billing", "bp")
-    webhooks_ok = register_bp("webhooks", "bp")
+    register_bp("debug", "bp")
+    register_bp("billing", "bp")
+    register_bp("webhooks", "bp")
     register_bp("items", "bp")
     register_bp("comments", "bp")
     register_bp("compat", "bp")
 
     # ── Fallback de debug GARANTIZADO en /api/_int ──
-    # (se monta SIEMPRE; así tenemos una vía de inspección aunque 'debug' falle)
     from flask import Blueprint
     intdbg = Blueprint("int_debug", __name__, url_prefix="/api/_int")
 
@@ -153,38 +155,47 @@ def create_app(config: dict | None = None):
     @intdbg.get("/auth-config")
     def _int_auth_cfg():
         cfg = {
-            "CLERK_ISSUER": os.getenv("CLERK_ISSUER", ""),
-            "CLERK_JWKS_URL": os.getenv("CLERK_JWKS_URL", ""),
-            "CLERK_AUDIENCE": os.getenv("CLERK_AUDIENCE", ""),
-            "CLERK_LEEWAY": os.getenv("CLERK_LEEWAY", ""),
-            "CLERK_JWKS_TTL": os.getenv("CLERK_JWKS_TTL", ""),
-            "CLERK_JWKS_TIMEOUT": os.getenv("CLERK_JWKS_TIMEOUT", ""),
-            "DISABLE_AUTH": os.getenv("DISABLE_AUTH", ""),
+            "CLERK_ISSUER": app.config.get("CLERK_ISSUER", ""),
+            "CLERK_JWKS_URL": app.config.get("CLERK_JWKS_URL", ""),
+            "CLERK_AUDIENCE": app.config.get("CLERK_AUDIENCE", ""),
+            "CLERK_LEEWAY": app.config.get("CLERK_LEEWAY", ""),
+            "CLERK_JWKS_TTL": app.config.get("CLERK_JWKS_TTL", ""),
+            "CLERK_JWKS_TIMEOUT": app.config.get("CLERK_JWKS_TIMEOUT", ""),
+            "DISABLE_AUTH": app.config.get("DISABLE_AUTH", ""),
         }
         return jsonify(cfg), 200
 
-    # claims protegido si auth está disponible; si no, se omitirá
+    # ── claims: SIEMPRE montado. Si no hay auth, responde 501 ──
     try:
-        from app.auth import require_clerk_auth
-        @intdbg.get("/claims")
-        @require_clerk_auth
-        def _int_claims():
-            authz = request.headers.get("Authorization", "")
-            authz_short = (authz[:20] + "...") if authz else ""
-            payload = {
-                "g_clerk": {
-                    "user_id": getattr(app, "g", g).clerk.get("user_id") if hasattr(g, "clerk") else None,
-                    "org_id": getattr(app, "g", g).clerk.get("org_id") if hasattr(g, "clerk") else None,
-                    "email": getattr(app, "g", g).clerk.get("email") if hasattr(g, "clerk") else None,
-                    "name": getattr(app, "g", g).clerk.get("name") if hasattr(g, "clerk") else None,
-                },
-                "auth_header_present": bool(authz),
-                "auth_header_prefix_ok": authz.startswith("Bearer "),
-                "auth_header_sample": authz_short,
-            }
-            return jsonify(payload), 200
+        from app.auth import require_clerk_auth as _auth_deco
+        app.logger.info("[init] Auth decorator cargado: app.auth.require_clerk_auth")
     except Exception as e:
-        app.logger.warning(f"[init] No se pudo montar /api/_int/claims protegido: {e}")
+        app.logger.warning(f"[init] Auth no disponible ({e}); /api/_int/claims devolverá 501")
+        def _auth_deco(fn):
+            @wraps(fn)
+            def wrapper(*args, **kwargs):
+                return jsonify({"error": "auth not configured"}), 501
+            return wrapper
+
+    @intdbg.get("/claims")
+    @_auth_deco
+    def _int_claims():
+        authz = request.headers.get("Authorization", "")
+        authz_short = (authz[:24] + "...") if authz else ""
+        clerk = getattr(g, "clerk", None) or {}
+        payload = {
+            "g_clerk": {
+                "user_id": clerk.get("user_id"),
+                "org_id": clerk.get("org_id"),
+                "email": clerk.get("email"),
+                "name": clerk.get("name"),
+                "raw_claims": clerk.get("raw_claims"),
+            },
+            "auth_header_present": bool(authz),
+            "auth_header_prefix_ok": authz.startswith("Bearer "),
+            "auth_header_sample": authz_short,
+        }
+        return jsonify(payload), 200
 
     @intdbg.route("/echo", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     def _int_echo():
