@@ -175,7 +175,7 @@ def require_clerk_auth(fn):
 
         # 3) Mapear claims
         user_id = claims.get("sub") or claims.get("user_id")
-        org_id = claims.get("org_id")  # puede ser None (sin org activa)
+        org_id = claims.get("org_id")  # puede ser None o ""
         email = claims.get("email") or claims.get("primary_email_address")
         name = claims.get("name") or claims.get("full_name")
 
@@ -185,8 +185,11 @@ def require_clerk_auth(fn):
         # 4) Sanear org_id si viene placeholder/valor inválido
         if isinstance(org_id, str):
             s = org_id.strip()
-            if s.startswith("{{") or s == "" or (not s.startswith("org_")):
-                # Si tu tenant no usa prefijo 'org_', elimina este check
+            if not s or s.startswith("{{"):      # e.g. "{{organization.id}}"
+                org_id = None
+            # Si tu tenant usa ids con prefijo 'org_', puedes reforzar:
+            elif not s.startswith("org_"):
+                # Quita este branch si Clerk no usa ese prefijo en tu tenant
                 org_id = None
 
         g.clerk = {
