@@ -42,7 +42,6 @@ class _JWKSCache:
             ent = self._store.get(url)
             if ent and now - ent["at"] < ttl:
                 return ent["jwks"]
-        # fetch fuera del lock para no bloquear
         jwks = self._fetch(url)
         with self._lock:
             self._store[url] = {"jwks": jwks, "at": now}
@@ -86,8 +85,7 @@ def _pick_key_for_kid(jwks: Dict[str, Any], kid: str) -> Optional[Dict[str, Any]
 def _decode_token(token: str, key: Dict[str, Any], leeway: int,
                   audience: Optional[str], issuer: Optional[str], alg: Optional[str]) -> Dict[str, Any]:
     options = {
-        # Validaciones por defecto activas; desactiva aud si no hay audience
-        "verify_aud": bool(audience),
+        "verify_aud": bool(audience),  # desactiva aud si no hay audience
         "verify_iat": True,
         "verify_exp": True,
         "verify_nbf": True,
@@ -150,15 +148,13 @@ def require_clerk_auth(fn):
 
         kid = headers.get("kid")
         alg = headers.get("alg", "RS256")
-
         if not kid:
             abort(401, "Missing kid header")
 
-        # 1) JWKS desde cache
+        # 1) JWKS desde cache (+refresh si no aparece el kid)
         try:
             jwks = _JWKS.get(jwks_url, ttl=ttl)
             key = _pick_key_for_kid(jwks, kid)
-            # 2) Si no hay key (rotación), refresca JWKS una vez
             if key is None:
                 jwks = _JWKS.refresh(jwks_url)
                 key = _pick_key_for_kid(jwks, kid)
@@ -167,7 +163,7 @@ def require_clerk_auth(fn):
         except Exception as e:
             abort(503, f"JWKS fetch error: {e}")
 
-        # 3) Decodificar y validar claims
+        # 2) Decodificar y validar claims
         try:
             claims = _decode_token(token, key, leeway, audience, issuer, alg)
         except jwt.ExpiredSignatureError:
@@ -177,13 +173,21 @@ def require_clerk_auth(fn):
         except Exception as e:
             abort(401, f"Invalid token: {e}")
 
+        # 3) Mapear claims
         user_id = claims.get("sub") or claims.get("user_id")
-        org_id = claims.get("org_id")
+        org_id = claims.get("org_id")  # puede ser None (sin org activa)
         email = claims.get("email") or claims.get("primary_email_address")
         name = claims.get("name") or claims.get("full_name")
 
         if not user_id:
             abort(401, "Missing user id in token")
+
+        # 4) Sanear org_id si viene placeholder/valor inválido
+        if isinstance(org_id, str):
+            s = org_id.strip()
+            if s.startswith("{{") or s == "" or (not s.startswith("org_")):
+                # Si tu tenant no usa prefijo 'org_', elimina este check
+                org_id = None
 
         g.clerk = {
             "user_id": user_id,
