@@ -4,11 +4,50 @@ from __future__ import annotations
 import os
 import stripe
 from typing import Tuple
+from functools import wraps
 from flask import Blueprint, request, jsonify, current_app, g, abort
 
-from app.auth import require_clerk_auth
-
 bp = Blueprint("billing", __name__)
+
+# ───────────────────────── Auth (robusta) ─────────────────────────
+def _truthy(v) -> bool:
+    return str(v).lower() in ("1", "true", "yes", "on")
+
+# Intentamos cargar el guard real, pero SIN romper el import del módulo.
+# Si falla y DISABLE_AUTH está activo, usamos un decorator no-op.
+# Si falla y DISABLE_AUTH NO está activo, re-raise para que se vea el error en logs.
+_DISABLE_AUTH_ENV = _truthy(os.getenv("DISABLE_AUTH", "0"))
+
+def _noop_decorator(fn):
+    @wraps(fn)
+    def _w(*a, **k): return fn(*a, **k)
+    return _w
+
+def _load_auth_guard():
+    # En runtime preferimos leer config (si ya hay app context), si no, ENV
+    disabled = _DISABLE_AUTH_ENV
+    try:
+        disabled = _truthy(current_app.config.get("DISABLE_AUTH", disabled))
+    except Exception:
+        pass
+    if disabled:
+        return _noop_decorator
+    # Auth real
+    try:
+        from app.auth import require_clerk_auth as real_guard
+        return real_guard
+    except Exception as e:
+        # Si no hay bypass y falla auth → sube el error para diagnosticar
+        raise
+
+# Decorator que resuelve el guard en tiempo de petición (no en import)
+def _require_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        guard = _load_auth_guard()
+        protected = guard(fn)
+        return protected(*args, **kwargs)
+    return wrapper
 
 # ───────────────────────── Stripe helpers ─────────────────────────
 
@@ -18,7 +57,6 @@ def _init_stripe() -> None:
     if not key:
         raise RuntimeError("STRIPE_SECRET_KEY is empty/missing")
     stripe.api_key = key
-
 
 def _clerk_target(is_org: bool) -> Tuple[str, str]:
     """
@@ -33,7 +71,6 @@ def _clerk_target(is_org: bool) -> Tuple[str, str]:
         abort(400, "Missing org_id in token" if is_org else "Missing user_id in token")
     return entity_type, str(entity_id)
 
-
 def _maybe_contact_from_token() -> dict:
     """
     Intenta sacar email/name desde g.clerk si tu decorador los adjunta.
@@ -43,25 +80,25 @@ def _maybe_contact_from_token() -> dict:
     out = {}
     if data.get("email"):
         out["email"] = str(data["email"])
-    if data.get("name"):
-        out["name"] = str(data["name"])
+    # admite "name"/"full_name"
+    name = data.get("name") or data.get("full_name")
+    if name:
+        out["name"] = str(name)
     return out
-
 
 def _ensure_customer(entity_type: str, entity_id: str, is_org: bool) -> str:
     """
-    Busca o crea un Customer en Stripe. Metadata compatible con ambos flujos:
+    Busca o crea un Customer en Stripe. Metadata compatible:
       - entity_type/entity_id
       - clerk_user_id/clerk_org_id
     """
-    # 1) Buscar por metadata (si tu cuenta tiene Customer Search habilitado)
+    # 1) Buscar por metadata (si tu cuenta tiene Customer Search)
     try:
         query = f"metadata['entity_type']:'{entity_type}' AND metadata['entity_id']:'{entity_id}'"
         res = stripe.Customer.search(query=query, limit=1)
         if res.data:
             return res.data[0].id
     except Exception:
-        # Si la cuenta no tiene Customer.search o falla, seguimos creando
         pass
 
     # 2) Crear
@@ -74,11 +111,9 @@ def _ensure_customer(entity_type: str, entity_id: str, is_org: bool) -> str:
     cust = stripe.Customer.create(metadata=metadata, **contact)
     return cust.id
 
-
 def _frontend_base() -> str:
     """Base URL de frontend para construir success/return URLs."""
     return (current_app.config.get("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
-
 
 def _resolve_price_id(is_org: bool, price_id_hint: str | None) -> str:
     """
@@ -95,11 +130,10 @@ def _resolve_price_id(is_org: bool, price_id_hint: str | None) -> str:
         ) or ""
     return pid.strip()
 
-
 # ───────────────────────── Endpoints ─────────────────────────
 
 @bp.post("/checkout")
-@require_clerk_auth
+@_require_auth
 def create_checkout():
     """
     Crea una sesión de Stripe Checkout (modo suscripción).
@@ -110,15 +144,14 @@ def create_checkout():
     """
     body = request.get_json(force=True, silent=True) or {}
     is_org = bool(body.get("is_org", False))
-    quantity_raw = body.get("quantity")
+    # normaliza cantidad
     try:
-        quantity = int(quantity_raw) if quantity_raw is not None else 1
+        quantity = int(body.get("quantity") or 1)
     except Exception:
         quantity = 1
     if quantity < 1:
         quantity = 1
 
-    # price_id del body o defaults del servidor
     price_id = _resolve_price_id(is_org=is_org, price_id_hint=body.get("price_id"))
     if not price_id:
         abort(400, "price_id required and no default configured on server")
@@ -135,10 +168,9 @@ def create_checkout():
 
     # Ajustes de idioma / impuestos (tuneables por ENV):
     locale = os.getenv("STRIPE_CHECKOUT_LOCALE", "auto")
-    automatic_tax = os.getenv("STRIPE_AUTOMATIC_TAX", "true").lower() in ("1", "true", "yes", "on")
-    require_billing_addr = os.getenv("STRIPE_REQUIRE_BILLING_ADDRESS", "true").lower() in ("1", "true", "yes", "on")
+    automatic_tax = _truthy(os.getenv("STRIPE_AUTOMATIC_TAX", "true"))
+    require_billing_addr = _truthy(os.getenv("STRIPE_REQUIRE_BILLING_ADDRESS", "true"))
 
-    # Metadatos consistentes para el webhook
     session_metadata = {
         "price_id": price_id,
         "plan_scope": "org" if is_org else "user",
@@ -157,22 +189,22 @@ def create_checkout():
         cancel_url=cancel_url,
         client_reference_id=entity_id,
         metadata=session_metadata,
-        subscription_data={
-            "metadata": session_metadata,
-        },
+        subscription_data={"metadata": session_metadata},
         # UX/Tax
         tax_id_collection={"enabled": True},
         locale=locale,
         automatic_tax={"enabled": automatic_tax},
         billing_address_collection=("required" if require_billing_addr else "auto"),
-        customer_update={"address": "auto", "name": "auto"},
+        customer_update={
+            "address": "auto" if _truthy(os.getenv("STRIPE_SAVE_ADDRESS_AUTO", "true")) else "none",
+            "name": "auto" if _truthy(os.getenv("STRIPE_SAVE_NAME_AUTO", "true")) else "none",
+        },
     )
 
     return jsonify(checkout_url=session.url)
 
-
 @bp.post("/portal")
-@require_clerk_auth
+@_require_auth
 def create_portal():
     """
     Crea una sesión del Billing Portal de Stripe para el Customer asociado.
