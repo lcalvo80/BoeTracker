@@ -447,3 +447,43 @@ def sync_after_success():
         return err
 
     return jsonify(ok=True, entity_type=entity_type, entity_id=entity_id, plan=plan), 200
+
+# ───────────────────────── Debug helpers (en el mismo blueprint 'billing') ─────────────────────────
+import os
+from flask import request
+from app.auth import require_clerk_auth  # asegura que existe
+
+@bp.get("/debug/auth-config")
+def _dbg_auth_config():
+    """Ver qué config/ENVs de Clerk ve el servidor (seguro, no incluye secretos)."""
+    cfg = {
+        "CLERK_ISSUER": os.getenv("CLERK_ISSUER", ""),
+        "CLERK_JWKS_URL": os.getenv("CLERK_JWKS_URL", ""),
+        "CLERK_AUDIENCE": os.getenv("CLERK_AUDIENCE", ""),
+        "CLERK_LEEWAY": os.getenv("CLERK_LEEWAY", ""),
+        "CLERK_JWKS_TTL": os.getenv("CLERK_JWKS_TTL", ""),
+        "CLERK_JWKS_TIMEOUT": os.getenv("CLERK_JWKS_TIMEOUT", ""),
+        "DISABLE_AUTH": os.getenv("DISABLE_AUTH", ""),
+    }
+    return jsonify(cfg), 200
+
+@bp.get("/debug/claims")
+@require_clerk_auth
+def _dbg_claims():
+    """Muestra lo que dejó auth en g.clerk para esta request."""
+    authz = request.headers.get("Authorization", "")
+    authz_short = (authz[:20] + "...") if authz else ""
+    payload = {
+        "g_clerk": {
+            "user_id": getattr(g, "clerk", {}).get("user_id"),
+            "org_id": getattr(g, "clerk", {}).get("org_id"),
+            "email": getattr(g, "clerk", {}).get("email"),
+            "name": getattr(g, "clerk", {}).get("name"),
+        },
+        "auth_header_present": bool(authz),
+        "auth_header_prefix_ok": authz.startswith("Bearer "),
+        "auth_header_sample": authz_short,
+    }
+    if (os.getenv("EXPOSE_CLAIMS_DEBUG", "0")).lower() in ("1", "true", "yes"):
+        payload["raw_claims"] = getattr(g, "clerk", {}).get("raw_claims")
+    return jsonify(payload), 200
