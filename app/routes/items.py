@@ -14,7 +14,8 @@ from app.controllers.items_controller import (
     list_epigrafes,
 )
 
-bp = Blueprint("items", __name__)
+# Prefijo unificado: /api/items
+bp = Blueprint("items", __name__, url_prefix="/api/items")
 
 # ===== Helpers =====
 
@@ -182,7 +183,7 @@ def _json_with_cache(payload, status=200, max_age=3600):
 # ===== Rutas =====
 
 # Listado
-@bp.route("", methods=["GET"])
+@bp.get("")
 def api_items():
     try:
         parsed = _parse_query_args(request.args)
@@ -234,32 +235,32 @@ def api_items():
 
 
 # Detalle
-@bp.route("/<identificador>", methods=["GET"])
+@bp.get("/<identificador>")
 def api_item_by_id(identificador):
     data = get_item_by_id(identificador)
     if not data:
         return jsonify({"detail": "Not found"}), 404
     return jsonify(data), 200
 
-@bp.route("/<identificador>/resumen", methods=["GET"])
+@bp.get("/<identificador>/resumen")
 def api_resumen(identificador):
     return jsonify(get_item_resumen(identificador)), 200
 
-@bp.route("/<identificador>/impacto", methods=["GET"])
+@bp.get("/<identificador>/impacto")
 def api_impacto(identificador):
     return jsonify(get_item_impacto(identificador)), 200
 
 # Reacciones
-@bp.route("/<identificador>/like", methods=["POST"])
+@bp.post("/<identificador>/like")
 def api_like(identificador):
     return jsonify(like_item(identificador)), 200
 
-@bp.route("/<identificador>/dislike", methods=["POST"])
+@bp.post("/<identificador>/dislike")
 def api_dislike(identificador):
     return jsonify(dislike_item(identificador)), 200
 
 # Catálogos (cache)
-@bp.route("/departamentos", methods=["GET"])
+@bp.get("/departamentos")
 def api_departamentos():
     try:
         data = list_departamentos()
@@ -268,7 +269,7 @@ def api_departamentos():
         current_app.logger.exception("departamentos failed")
         return _json_with_cache([], 200, max_age=60)
 
-@bp.route("/secciones", methods=["GET"])
+@bp.get("/secciones")
 def api_secciones():
     try:
         data = list_secciones()
@@ -277,7 +278,7 @@ def api_secciones():
         current_app.logger.exception("secciones failed")
         return _json_with_cache([], 200, max_age=60)
 
-@bp.route("/epigrafes", methods=["GET"])
+@bp.get("/epigrafes")
 def api_epigrafes():
     try:
         data = list_epigrafes()
@@ -287,7 +288,7 @@ def api_epigrafes():
         return _json_with_cache([], 200, max_age=60)
 
 # ===== Endpoint de eco/diagnóstico explícito (solo DEV) =====
-@bp.route("/_debug/echo", methods=["GET"])
+@bp.get("/_debug/echo")
 def api_items_echo():
     """
     /api/items/_debug/echo?departamentos=a&departamentos=b&secciones=I,II...

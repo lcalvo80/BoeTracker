@@ -5,7 +5,8 @@ from math import ceil
 from datetime import datetime
 import os
 
-bp = Blueprint("comments", __name__)
+# Prefijo unificado: /api/items
+bp = Blueprint("comments", __name__, url_prefix="/api/items")
 
 # ---------- helpers ----------
 def _col_exists(conn, table, col) -> bool:
@@ -43,16 +44,13 @@ def _ensure_table():
     Crea la tabla mínima si existe DATABASE_URL y no estamos en TESTING.
     Nunca rompe en import-time (tests/entornos sin BD).
     """
-    # Si no hay BD configurada, salimos
     if not os.getenv("DATABASE_URL"):
         return
 
-    # Si estamos en TESTING, no tocar BD
     try:
         if current_app and current_app.config.get("TESTING"):
             return
     except Exception:
-        # current_app puede no estar disponible en import-time
         pass
 
     try:
@@ -68,19 +66,17 @@ def _ensure_table():
                 """)
             conn.commit()
     except Exception:
-        # Log y seguir; no queremos que falle el import
         try:
             current_app.logger.exception("comments bootstrap failed")
         except Exception:
             pass
 
-# Ejecuta el bootstrap solo si procede (según reglas anteriores)
 _ensure_table()
 
 # =========================
 # GET /api/items/<ident>/comments
 # =========================
-@bp.route("/items/<ident>/comments", methods=["GET"])
+@bp.get("/<ident>/comments")
 def list_item_comments(ident):
     page  = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
     limit = _safe_int(request.args.get("limit", 20), 20, 1, 100)
@@ -95,7 +91,6 @@ def list_item_comments(ident):
 
             text_expr = "COALESCE(content, comentario)" if (has_content and has_comentario) \
                         else ("content" if has_content else ("comentario" if has_comentario else "NULL"))
-            # Devolvemos siempre 'author' normalizado
             author_expr = "COALESCE(author, user_name)" if (has_author and has_user_name) \
                           else ("author" if has_author else ("user_name" if has_user_name else "NULL"))
 
@@ -124,18 +119,17 @@ def list_item_comments(ident):
             "page": page if total else 1,
             "pages": pages if total else 0,
             "total": total,
-            "limit": limit,  # para que la UI pueda mostrar "x de y"
+            "limit": limit,
         }), 200
 
     except Exception:
         current_app.logger.exception("list_item_comments failed")
-        # Respuesta estable para la UI aunque falle la BD
         return jsonify({"items": [], "page": 1, "pages": 0, "total": 0, "limit": limit}), 200
 
 # =========================
 # POST /api/items/<ident>/comments
 # =========================
-@bp.route("/items/<ident>/comments", methods=["POST"])
+@bp.post("/<ident>/comments")
 def add_item_comment(ident):
     try:
         body = request.get_json(force=True) or {}
@@ -151,7 +145,6 @@ def add_item_comment(ident):
             has_author     = _col_exists(conn, "comments", "author")
             has_user_name  = _col_exists(conn, "comments", "user_name")
 
-            # Asegura columna de texto si hace falta
             if not has_content and not has_comentario:
                 with conn.cursor() as cur:
                     cur.execute('ALTER TABLE comments ADD COLUMN content TEXT;')
@@ -172,7 +165,6 @@ def add_item_comment(ident):
             col_list = ", ".join(cols)
 
             return_text_expr   = f"{text_col} AS content"
-            # Siempre devolver 'author' normalizado
             return_author_expr = ("COALESCE(author, user_name) AS author"
                                   if (has_author and has_user_name)
                                   else (f"{author_col} AS author" if author_col else "NULL AS author"))
