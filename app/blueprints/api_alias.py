@@ -10,7 +10,7 @@ def _call_endpoint(endpoint_name: str, *args, **kwargs):
         return jsonify({"error": f"endpoint '{endpoint_name}' not available"}), 501
     return func(*args, **kwargs)
 
-# ───────── compat filtros legacy ─────────
+# ── compat filtros legacy ──
 @bp.get("/filters")
 def api_filters():
     return _call_endpoint("compat.filters_options")
@@ -19,7 +19,7 @@ def api_filters():
 def api_meta_filters():
     return _call_endpoint("compat.meta_filters")
 
-# ───────── compat items/comments (si existieran) ─────────
+# ── compat items/comments (si existen) ──
 @bp.get("/items")
 def api_items():
     for name in ("items.api_items", "items.list_items"):
@@ -38,11 +38,10 @@ def api_items():
 
 @bp.get("/items/<ident>/comments")
 def api_list_item_comments(ident):
-    return _call_endpoint("comments.list_item_comments", ident)
+    return _call_endpoint("comments.list_item_comment", ident)  # si tu endpoint se llama distinto, ajusta aquí
 
 @bp.post("/items/<ident>/comments")
 def api_add_item_comment(ident):
     return _call_endpoint("comments.add_item_comment", ident)
 
-# ⚠️ Importante: NO proxyeamos /api/checkout, /api/portal ni /api/sync aquí.
-# Esas rutas están implementadas directamente en app/blueprints/billing.py.
+# ⚠️ Nada de /checkout /portal /sync aquí. Billing ya los expone directamente.

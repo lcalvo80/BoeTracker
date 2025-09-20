@@ -12,33 +12,29 @@ from app.services.stripe_svc import (
     create_billing_portal,
 )
 
-# Exponemos las rutas oficiales bajo /api
+# Todas las rutas bajo /api
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
 
-# ───────────────────── helpers ─────────────────────
+# ───────── helpers ─────────
 def _cfg(k: str, default: str | None = None) -> str:
     v = current_app.config.get(k)
     if v is None or str(v).strip() == "":
         v = os.getenv(k, default)
     return "" if v is None else str(v)
 
-
 def _frontend_base() -> str:
     return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
 
-
 def _ensure_customer_for_user(user_id: str) -> str:
-    """
-    Busca/crea Customer en Stripe y lo guarda en Clerk.private_metadata.billing.stripeCustomerId.
-    """
+    """Busca/crea Customer en Stripe y guarda el ID en Clerk.private_metadata.billing."""
     u = clerk_svc.get_user(user_id)
     priv = (u.get("private_metadata") or {})
     existing = (priv.get("billing") or {}).get("stripeCustomerId") or priv.get("stripe_customer_id")
     if existing:
         return existing
 
-    # Email + nombre “amigables”
+    # Email + nombre
     email = None
     try:
         emails = u.get("email_addresses") or []
@@ -54,15 +50,12 @@ def _ensure_customer_for_user(user_id: str) -> str:
     return cust.id
 
 
-# ───────────────────── Checkout ─────────────────────
+# ───────── Checkout (suscripción) ─────────
 @bp.post("/checkout")
-@bp.post("/billing/checkout")  # ← compat estable con FE que lo llama así
+@bp.post("/billing/checkout")  # compat estable para versiones anteriores del FE
 @require_clerk_auth
 def checkout():
-    """
-    Crea una Checkout Session (suscripción de usuario).
-    Body: { price_id?: string, quantity?: number }
-    """
+    """Crea una Checkout Session de Stripe."""
     init_stripe()
 
     body = request.get_json(silent=True) or {}
@@ -103,12 +96,12 @@ def checkout():
         return jsonify(error="Unexpected error"), 500
 
 
-# ───────────────────── Billing Portal ─────────────────────
+# ───────── Billing Portal ─────────
 @bp.post("/portal")
-@bp.post("/billing/portal")  # ← compat estable
+@bp.post("/billing/portal")  # compat estable
 @require_clerk_auth
 def portal():
-    """Crea sesión del Billing Portal para el usuario actual."""
+    """Crea sesión del Billing Portal de Stripe para el usuario actual."""
     init_stripe()
     user_id = g.clerk["user_id"]
     customer_id = _ensure_customer_for_user(user_id)
@@ -122,15 +115,12 @@ def portal():
         return jsonify(error="Unexpected error"), 500
 
 
-# ───────────────────── Sync manual tras success ─────────────────────
+# ───────── Sync manual tras success ─────────
 @bp.post("/sync")
-@bp.post("/billing/sync")  # ← compat estable
+@bp.post("/billing/sync")  # compat estable
 @require_clerk_auth
 def sync_after_success():
-    """
-    Fallback manual tras éxito de Checkout.
-    Body: { "session_id": "cs_..." }
-    """
+    """Body: { session_id } → actualiza plan en Clerk igual que el webhook."""
     init_stripe()
     b = request.get_json(silent=True) or {}
     sid = (b.get("session_id") or "").strip()
@@ -138,8 +128,7 @@ def sync_after_success():
         return jsonify(error="session_id is required"), 400
     try:
         sess = stripe.checkout.Session.retrieve(
-            sid,
-            expand=["subscription", "subscription.items.data.price"]
+            sid, expand=["subscription", "subscription.items.data.price"]
         )
         sub = sess.get("subscription") or {}
         status = sub.get("status") or "active"
