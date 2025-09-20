@@ -6,6 +6,7 @@ from flask import Blueprint, request, jsonify, current_app, g
 from app.auth import require_clerk_auth
 from app.services import clerk_svc
 
+# Todas las rutas bajo /api, como antes
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
 def _cfg(k: str, default: str | None = None) -> str | None:
@@ -25,7 +26,6 @@ def _front_base() -> str:
     return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
 
 def _ensure_customer_for_user(user_id: str) -> str:
-    """Crea/recupera customer en Stripe y guarda referencia en Clerk (private)."""
     # 1) ¿el user tiene customer ya?
     u = clerk_svc.get_user(user_id)
     priv = (u.get("private_metadata") or {})
@@ -46,7 +46,8 @@ def _ensure_customer_for_user(user_id: str) -> str:
     clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer.id}})
     return customer.id
 
-@bp.post("/checkout")
+# 👇 Recuperamos los nombres de endpoint legacy con endpoint="create_checkout"
+@bp.post("/checkout", endpoint="create_checkout")
 @require_clerk_auth
 def checkout():
     """
@@ -84,7 +85,8 @@ def checkout():
     )
     return jsonify(checkout_url=session.url), 200
 
-@bp.post("/portal")
+# 👇 Restauramos nombre legacy con endpoint="create_portal"
+@bp.post("/portal", endpoint="create_portal")
 @require_clerk_auth
 def portal():
     """Crea una Billing Portal session para el usuario actual."""
@@ -95,7 +97,8 @@ def portal():
     ps = stripe.billing_portal.Session.create(customer=customer_id, return_url=f"{_front_base()}/account")
     return jsonify(portal_url=ps.url), 200
 
-@bp.post("/sync")
+# 👇 Restauramos nombre legacy con endpoint="sync_after_success"
+@bp.post("/sync", endpoint="sync_after_success")
 @require_clerk_auth
 def sync_after_success():
     """
@@ -119,7 +122,6 @@ def sync_after_success():
         pass
 
     user_id = g.clerk["user_id"]
-    # actualiza metadata en Clerk
     priv = {"billing": {"stripeCustomerId": sess.get("customer"), "subscriptionId": sub.get("id") if sub else None, "status": status, "planPriceId": price}}
     clerk_svc.set_user_plan(user_id, plan=("pro" if status in ("active","trialing","past_due") else "free"), status=status, extra_private=priv)
     return jsonify(ok=True), 200
