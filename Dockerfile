@@ -6,32 +6,38 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Dependencias del sistema:
-# - libpq5 si usas psycopg2-binary no hace falta compilar; si usas psycopg2 normal, añade libpq-dev y gcc
+# Dependencias del sistema mínimas
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Si usas psycopg2 (no binary), descomenta:
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#     build-essential \
-#     libpq-dev \
-#     && rm -rf /var/lib/apt/lists/*
-
-# Requisitos
+# Requisitos Python
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-# App
+# Copiar app
 COPY . .
 
-# (Opcional) usuario no-root
+# Usuario no-root
 RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Documentativo
+# Puerto "documentativo"
 EXPOSE 8000
 
-# Railway inyecta PORT; mantenemos fallback a 8000 para local
-# Gunicorn con gevent-websocket
-CMD gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker 'app:create_app()' --bind 0.0.0.0:$PORT --timeout 120 --access-logfile - --error-logfile -
+# Variables de concurrencia con defaults sensatos
+#   - WEB_CONCURRENCY: workers de Gunicorn
+#   - PORT: puerto; fallback a 8000 si no viene inyectado (e.g. local)
+ENV WEB_CONCURRENCY=2
+
+# Importante:
+#  - Usa expansión de shell para fallback de puerto: ${PORT:-8000}
+#  - Carga la factory directamente: "app:create_app()"
+#  - Worker WebSocket: geventwebsocket.gunicorn.workers.GeventWebSocketWorker
+CMD gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
+  --workers ${WEB_CONCURRENCY:-2} \
+  --bind 0.0.0.0:${PORT:-8000} \
+  --timeout 120 \
+  --access-logfile - \
+  --error-logfile - \
+  "app:create_app()"
