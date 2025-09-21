@@ -1,4 +1,6 @@
 # app/__init__.py
+from __future__ import annotations
+
 import os
 import sys
 import json
@@ -39,8 +41,8 @@ def create_app(config: dict | None = None):
         "app/blueprints/items.py",
         "app/blueprints/comments.py",
         "app/blueprints/compat.py",
-        "app/blueprints/api_alias.py",   # <─ nuevo
-        # legacy
+        "app/blueprints/api_alias.py",
+        # legacy (si existieran, se intentarán registrar)
         "app/routes/debug.py",
         "app/routes/billing.py",
         "app/routes/webhooks.py",
@@ -132,7 +134,7 @@ def create_app(config: dict | None = None):
             app.logger.info(f"[init] No se encontró módulo '{module_name}' en {MODULE_ROOTS}")
         return False
 
-    # Blueprints principales
+    # Blueprints principales (si alguno no existe, no pasa nada)
     register_bp("debug", "bp")
     register_bp("billing", "bp")
     register_bp("webhooks", "bp")
@@ -140,7 +142,7 @@ def create_app(config: dict | None = None):
     register_bp("comments", "bp")
     register_bp("compat", "bp")
 
-    # ⬅️ Alias coherentes bajo /api/* para endpoints legacy sin prefijo
+    # Alias coherentes bajo /api/* para endpoints legacy sin prefijo (si existe)
     register_bp("api_alias", "bp")
 
     # ── Fallback de debug GARANTIZADO en /api/_int ──
@@ -171,7 +173,8 @@ def create_app(config: dict | None = None):
 
     # ── claims: SIEMPRE montado. Si no hay auth, responde 501 ──
     try:
-        from app.auth import require_clerk_auth as _auth_deco
+        # ⬅️ Import relativo al paquete 'app' para evitar "No module named 'app.auth'"
+        from .auth import require_clerk_auth as _auth_deco
         app.logger.info("[init] Auth decorator cargado: app.auth.require_clerk_auth")
     except Exception as e:
         app.logger.warning(f"[init] Auth no disponible ({e}); /api/_int/claims devolverá 501")
