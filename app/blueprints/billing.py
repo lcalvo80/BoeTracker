@@ -1,17 +1,36 @@
 # app/blueprints/billing.py
 from __future__ import annotations
+
 import os
+import logging
+from functools import wraps
+from typing import Any, Optional
+
 import stripe
-from flask import Blueprint, request, jsonify, current_app, g
+from flask import Blueprint, request, jsonify, current_app, g, has_app_context
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
 # ───────── helpers de config ─────────
-def _cfg(k: str, default: str | None = None) -> str | None:
-    v = current_app.config.get(k)
+def _cfg(k: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Lee config de Flask si hay app context; si no, cae a variables de entorno.
+    Nunca debe explotar fuera de contexto.
+    """
+    v: Optional[Any] = None
+    if has_app_context():
+        try:
+            v = current_app.config.get(k)
+        except Exception:
+            v = None
     if v is None or str(v).strip() == "":
         v = os.getenv(k, default)
     return None if v is None else str(v)
+
+
+def _truthy(v: Any) -> bool:
+    return str(v).lower() in ("1", "true", "yes", "on")
+
 
 def _init_stripe():
     sk = _cfg("STRIPE_SECRET_KEY", "")
@@ -20,39 +39,48 @@ def _init_stripe():
     stripe.api_key = sk
     return sk, None
 
+
 def _front_base() -> str:
     return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
 
-# ───────── guard de auth robusto ─────────
-def _truthy(v) -> bool:
-    return str(v).lower() in ("1", "true", "yes", "on")
 
-def _load_auth_guard():
-    # Si DISABLE_AUTH=1 → bypass
-    disabled = _truthy(_cfg("DISABLE_AUTH", "0") or "0")
-    if disabled:
-        def _noop(fn):
-            def w(*a, **k): return fn(*a, **k)
-            return w
-        return _noop
-    # Intentar importar app.auth; si falla, aún así que se registre el BP
-    try:
-        from app.auth import require_clerk_auth as real_guard
-        return real_guard
-    except Exception as e:
-        current_app.logger.warning(f"[billing] auth decorator no disponible: {e}")
-        def _noop(fn):
-            def w(*a, **k): return fn(*a, **k)
-            return w
-        return _noop
+def _require_auth(fn):
+    """
+    Decorador perezoso (lazy) seguro fuera de contexto:
+    - Si DISABLE_AUTH=1 -> bypass.
+    - Si existe app.auth.require_clerk_auth -> aplicarlo dinámicamente.
+    - Si no, no-op con logging estándar (nunca usa current_app fuera de contexto).
+    """
+    @wraps(fn)
+    def _wrapped(*args, **kwargs):
+        if _truthy(_cfg("DISABLE_AUTH", "0") or "0"):
+            # Bypass: en dev no exigimos token, pero llenamos g.clerk mínimo para coherencia
+            g.clerk = {"user_id": "dev_user", "org_id": None, "email": "dev@example.com", "name": "Dev User", "raw_claims": None}
+            return fn(*args, **kwargs)
+        try:
+            # Import relativo preferido; si no funciona, probar absoluto.
+            try:
+                from ..auth import require_clerk_auth as real_guard
+            except Exception:
+                from app.auth import require_clerk_auth as real_guard  # fallback si el paquete se importa como "app"
+        except Exception as e:
+            logging.getLogger("billing").warning("Auth decorator no disponible: %s", e)
+            return fn(*args, **kwargs)
+        # Aplicar el decorador real dinámicamente en cada llamada
+        return real_guard(fn)(*args, **kwargs)
+    return _wrapped
 
-_require_auth = _load_auth_guard()
 
 # ───────── Clerk svc (opcional, si no está no rompemos) ─────────
 try:
-    from app.services import clerk_svc
+    # Import relativo, más robusto dentro del paquete
+    from ..services import clerk_svc  # type: ignore
 except Exception:
-    clerk_svc = None  # type: ignore
+    try:
+        from app.services import clerk_svc  # type: ignore
+    except Exception:
+        clerk_svc = None  # type: ignore
+
 
 def _ensure_customer_for_user(user_id: str) -> str:
     # Si tenemos clerk_svc, intentamos reusar/guardar customerId
@@ -77,6 +105,7 @@ def _ensure_customer_for_user(user_id: str) -> str:
             try:
                 clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer.id}})
             except Exception:
+                # Estamos dentro de request context; logger seguro
                 current_app.logger.warning("No se pudo persistir stripeCustomerId en Clerk (continuamos).")
             return customer.id
         except Exception:
@@ -85,6 +114,7 @@ def _ensure_customer_for_user(user_id: str) -> str:
     # Sin clerk_svc → crear mínimo viable
     customer = stripe.Customer.create(metadata={"clerk_user_id": user_id})
     return customer.id
+
 
 # ───────── Endpoints ─────────
 
@@ -96,7 +126,8 @@ def create_checkout():
     Body: { price_id?: string, quantity?: number }
     """
     _, err = _init_stripe()
-    if err: return err
+    if err:
+        return err
 
     body = request.get_json(silent=True) or {}
     price_id = (body.get("price_id") or _cfg("STRIPE_PRICE_ID") or "").strip()
@@ -107,14 +138,15 @@ def create_checkout():
         quantity = int(body.get("quantity") or 1)
     except Exception:
         quantity = 1
-    if quantity < 1: quantity = 1
+    if quantity < 1:
+        quantity = 1
 
     # user_id desde g.clerk si hay auth; si no, “dev_user” (bypass)
     user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
     customer_id = _ensure_customer_for_user(user_id)
 
     success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
+    cancel_url = _cfg("CHECKOUT_CANCEL_URL") or f"{_front_base()}/pricing?canceled=1"
 
     session = stripe.checkout.Session.create(
         mode="subscription",
@@ -136,21 +168,25 @@ def create_checkout():
     )
     return jsonify(checkout_url=session.url), 200
 
+
 @bp.post("/portal", endpoint="billing.create_portal")
 @_require_auth
 def create_portal():
     _, err = _init_stripe()
-    if err: return err
+    if err:
+        return err
     user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
     customer_id = _ensure_customer_for_user(user_id)
     ps = stripe.billing_portal.Session.create(customer=customer_id, return_url=f"{_front_base()}/account")
     return jsonify(portal_url=ps.url), 200
 
+
 @bp.post("/sync", endpoint="billing.sync_after_success")
 @_require_auth
 def sync_after_success():
     _, err = _init_stripe()
-    if err: return err
+    if err:
+        return err
     b = request.get_json(silent=True) or {}
     sid = (b.get("session_id") or "").strip()
     if not sid:
