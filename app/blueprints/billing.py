@@ -31,6 +31,14 @@ def _init_stripe():
 def _front_base() -> str:
     return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
 
+# Solo valores válidos para Stripe: 'auto' | 'never'
+def _update_mode(v: str | None, default: str = "auto") -> str:
+    s = (v or default).strip().lower()
+    # aceptamos truthy típicos como 'true' -> 'auto'
+    if s in ("auto", "1", "true", "yes", "on"):
+        return "auto"
+    # cualquier otra cosa: 'never'
+    return "never"
 
 # ───────── Auth guard (bypass si no está disponible) ─────────
 def _load_auth_guard():
@@ -57,7 +65,6 @@ try:
     from app.services import clerk_svc
 except Exception:
     clerk_svc = None  # type: ignore
-
 
 # ───────── Customer helpers ─────────
 def _derive_identity():
@@ -143,7 +150,6 @@ def _ensure_customer_for_user(user_id: str) -> str:
     )
     return customer.id
 
-
 # ───────── Endpoints públicos ─────────
 @bp.post("/checkout", endpoint="billing_create_checkout")
 @_require_auth
@@ -181,6 +187,10 @@ def create_checkout():
     success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
+    # Normalizar modos válidos para Stripe ('auto' | 'never')
+    address_mode = _update_mode(_cfg("STRIPE_SAVE_ADDRESS_AUTO"), "auto")
+    name_mode    = _update_mode(_cfg("STRIPE_SAVE_NAME_AUTO"), "auto")
+
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
@@ -196,8 +206,8 @@ def create_checkout():
             automatic_tax={"enabled": _truthy(_cfg("STRIPE_AUTOMATIC_TAX", "true") or "true")},
             billing_address_collection=("required" if _truthy(_cfg("STRIPE_REQUIRE_BILLING_ADDRESS", "true") or "true") else "auto"),
             customer_update={
-                "address": "auto" if _truthy(_cfg("STRIPE_SAVE_ADDRESS_AUTO", "true") or "true") else "none",
-                "name": "auto" if _truthy(_cfg("STRIPE_SAVE_NAME_AUTO", "true") or "true") else "none",
+                "address": address_mode,  # <- 'auto' o 'never'
+                "name": name_mode,        # <- 'auto' o 'never'
             },
             # Puedes considerar prellenar email si no existe en Customer
             customer_email=None,
@@ -210,7 +220,6 @@ def create_checkout():
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
     return jsonify(checkout_url=session.url), 200
-
 
 @bp.post("/portal", endpoint="billing_create_portal")
 @_require_auth
@@ -225,7 +234,6 @@ def create_portal():
     except Exception as e:
         current_app.logger.exception("Error creando portal")
         return jsonify(error="portal creation failed", detail=str(e)), 502
-
 
 @bp.post("/sync", endpoint="billing_sync_after_success")
 @_require_auth
@@ -268,7 +276,6 @@ def sync_after_success():
         return jsonify(error="sync failed", detail=str(e)), 502
 
     return jsonify(ok=True), 200
-
 
 # ───────── Endpoint de diagnóstico interno ─────────
 @bp.get("/_int/stripe-ping")
