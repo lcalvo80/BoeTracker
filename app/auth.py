@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 import requests
 from flask import request, g, abort, current_app, has_app_context
 from jose import jwt
+from jose.exceptions import ExpiredSignatureError, JWTClaimsError
 
 
 # ───────────────── helpers de config ─────────────────
@@ -98,6 +99,10 @@ def _decode_token(
     issuer: Optional[str],
     alg: Optional[str],
 ) -> Dict[str, Any]:
+    """
+    Decodifica el JWT con verificación. Intenta con 'leeway' (python-jose 3.x).
+    Si la versión de la librería no soporta el kwarg, reintenta sin él.
+    """
     options = {
         "verify_aud": bool(audience),
         "verify_iat": True,
@@ -109,13 +114,18 @@ def _decode_token(
         "key": key,
         "algorithms": [alg] if alg else ["RS256", "RS512", "ES256", "ES512"],
         "options": options,
-        "leeway": leeway,
     }
     if audience:
         kwargs["audience"] = audience
     if issuer:
         kwargs["issuer"] = issuer
-    return jwt.decode(token, **kwargs)
+
+    # Intento 1: con leeway (python-jose 3.x)
+    try:
+        return jwt.decode(token, leeway=leeway, **kwargs)  # type: ignore[arg-type]
+    except TypeError:
+        # Intento 2: sin leeway (compat libs antiguas)
+        return jwt.decode(token, **kwargs)
 
 
 def _bypass_enabled() -> bool:
@@ -133,6 +143,8 @@ def require_clerk_auth(fn):
         CLERK_ISSUER   (opcional)
         CLERK_JWKS_TTL (opcional, default 3600)
         CLERK_LEEWAY   (opcional, default 30)
+        CLERK_JWKS_TIMEOUT (opcional, default 5s)
+        EXPOSE_CLAIMS_DEBUG (opcional, "1" muestra claims completos en g.clerk)
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -154,10 +166,17 @@ def require_clerk_auth(fn):
         if not jwks_url:
             abort(500, "CLERK_JWKS_URL not configured")
 
-        leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
+        # Config
+        try:
+            leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
+        except Exception:
+            leeway = 30
         audience = _cfg("CLERK_AUDIENCE", "") or None
         issuer = _cfg("CLERK_ISSUER", "") or None
-        ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
+        try:
+            ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
+        except Exception:
+            ttl = 3600
 
         # Header sin verificar, para obtener kid/alg
         try:
@@ -182,9 +201,9 @@ def require_clerk_auth(fn):
         # Decodificación / validación
         try:
             claims = _decode_token(token, key, leeway, audience, issuer, alg)
-        except jwt.ExpiredSignatureError:
+        except ExpiredSignatureError:
             abort(401, "Token expired")
-        except jwt.JWTClaimsError as e:
+        except JWTClaimsError as e:
             abort(401, f"Invalid claims: {e}")
         except Exception as e:
             abort(401, f"Invalid token: {e}")

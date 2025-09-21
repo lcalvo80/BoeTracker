@@ -1,7 +1,6 @@
 flask
 Flask-Cors
 psycopg2-binary
-requests
 python-dotenv
 openai>=1.0.0
 gunicorn
@@ -10,6 +9,7 @@ gevent
 gevent-websocket
 stripe
 httpx
-python-jose[cryptography]
+python-jose[cryptography]==3.3.0
+requests>=2.32.0
 svix==1.24.0
 hypercorn[trio]
