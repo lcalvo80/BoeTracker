@@ -13,10 +13,6 @@ bp = Blueprint("billing", __name__, url_prefix="/api")
 
 # ───────── helpers de config ─────────
 def _cfg(k: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Lee config de Flask si hay app context; si no, cae a variables de entorno.
-    Nunca debe explotar fuera de contexto.
-    """
     v: Optional[Any] = None
     if has_app_context():
         try:
@@ -27,10 +23,8 @@ def _cfg(k: str, default: Optional[str] = None) -> Optional[str]:
         v = os.getenv(k, default)
     return None if v is None else str(v)
 
-
 def _truthy(v: Any) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
-
 
 def _init_stripe():
     sk = _cfg("STRIPE_SECRET_KEY", "")
@@ -39,41 +33,34 @@ def _init_stripe():
     stripe.api_key = sk
     return sk, None
 
-
 def _front_base() -> str:
     return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
 
-
 def _require_auth(fn):
     """
-    Decorador perezoso (lazy) seguro fuera de contexto:
-    - Si DISABLE_AUTH=1 -> bypass.
-    - Si existe app.auth.require_clerk_auth -> aplicarlo dinámicamente.
-    - Si no, no-op con logging estándar (nunca usa current_app fuera de contexto).
+    Decorador perezoso:
+    - DISABLE_AUTH=1 => bypass.
+    - Si existe app.auth.require_clerk_auth -> aplícalo dinámicamente.
+    - Si no, no-op con logging estándar.
     """
     @wraps(fn)
     def _wrapped(*args, **kwargs):
         if _truthy(_cfg("DISABLE_AUTH", "0") or "0"):
-            # Bypass: en dev no exigimos token, pero llenamos g.clerk mínimo para coherencia
             g.clerk = {"user_id": "dev_user", "org_id": None, "email": "dev@example.com", "name": "Dev User", "raw_claims": None}
             return fn(*args, **kwargs)
         try:
-            # Import relativo preferido; si no funciona, probar absoluto.
             try:
                 from ..auth import require_clerk_auth as real_guard
             except Exception:
-                from app.auth import require_clerk_auth as real_guard  # fallback si el paquete se importa como "app"
+                from app.auth import require_clerk_auth as real_guard
         except Exception as e:
             logging.getLogger("billing").warning("Auth decorator no disponible: %s", e)
             return fn(*args, **kwargs)
-        # Aplicar el decorador real dinámicamente en cada llamada
         return real_guard(fn)(*args, **kwargs)
     return _wrapped
 
-
-# ───────── Clerk svc (opcional, si no está no rompemos) ─────────
+# ───────── Clerk svc (opcional) ─────────
 try:
-    # Import relativo, más robusto dentro del paquete
     from ..services import clerk_svc  # type: ignore
 except Exception:
     try:
@@ -81,9 +68,7 @@ except Exception:
     except Exception:
         clerk_svc = None  # type: ignore
 
-
 def _ensure_customer_for_user(user_id: str) -> str:
-    # Si tenemos clerk_svc, intentamos reusar/guardar customerId
     if clerk_svc:
         try:
             u = clerk_svc.get_user(user_id)
@@ -91,7 +76,6 @@ def _ensure_customer_for_user(user_id: str) -> str:
             existing = (priv.get("billing") or {}).get("stripeCustomerId") or priv.get("stripe_customer_id")
             if existing:
                 return existing
-            # crear
             email = None
             try:
                 emails = u.get("email_addresses") or []
@@ -105,20 +89,16 @@ def _ensure_customer_for_user(user_id: str) -> str:
             try:
                 clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer.id}})
             except Exception:
-                # Estamos dentro de request context; logger seguro
                 current_app.logger.warning("No se pudo persistir stripeCustomerId en Clerk (continuamos).")
             return customer.id
         except Exception:
             current_app.logger.exception("ensure_customer_for_user via Clerk falló; creamos Customer sin Clerk")
-
-    # Sin clerk_svc → crear mínimo viable
     customer = stripe.Customer.create(metadata={"clerk_user_id": user_id})
     return customer.id
 
+# ───────── Endpoints (sin puntos en endpoint=...) ─────────
 
-# ───────── Endpoints ─────────
-
-@bp.post("/checkout", endpoint="billing.create_checkout")
+@bp.post("/checkout", endpoint="create_checkout")
 @_require_auth
 def create_checkout():
     """
@@ -141,7 +121,6 @@ def create_checkout():
     if quantity < 1:
         quantity = 1
 
-    # user_id desde g.clerk si hay auth; si no, “dev_user” (bypass)
     user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
     customer_id = _ensure_customer_for_user(user_id)
 
@@ -169,7 +148,7 @@ def create_checkout():
     return jsonify(checkout_url=session.url), 200
 
 
-@bp.post("/portal", endpoint="billing.create_portal")
+@bp.post("/portal", endpoint="create_portal")
 @_require_auth
 def create_portal():
     _, err = _init_stripe()
@@ -181,7 +160,7 @@ def create_portal():
     return jsonify(portal_url=ps.url), 200
 
 
-@bp.post("/sync", endpoint="billing.sync_after_success")
+@bp.post("/sync", endpoint="sync_after_success")
 @_require_auth
 def sync_after_success():
     _, err = _init_stripe()
@@ -211,7 +190,6 @@ def sync_after_success():
                 "planPriceId": price
             }}
             plan = "pro" if status in ("active", "trialing", "past_due") else "free"
-            # Método helper opcional que sugerimos en tu clerk_svc
             if hasattr(clerk_svc, "set_user_plan"):
                 clerk_svc.set_user_plan(user_id, plan=plan, status=status, extra_private=priv)
             else:
