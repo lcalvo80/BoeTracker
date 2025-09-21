@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import stripe
 from flask import Blueprint, request, jsonify, current_app, g, has_app_context
+from app.integrations.stripe_utils import ensure_customer  # <-- importante
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
@@ -59,57 +60,26 @@ def _require_auth(fn):
         return real_guard(fn)(*args, **kwargs)
     return _wrapped
 
-# ───────── Clerk svc (opcional) ─────────
-try:
-    from ..services import clerk_svc  # type: ignore
-except Exception:
-    try:
-        from app.services import clerk_svc  # type: ignore
-    except Exception:
-        clerk_svc = None  # type: ignore
-
-def _ensure_customer_for_user(user_id: str) -> str:
-    if clerk_svc:
-        try:
-            u = clerk_svc.get_user(user_id)
-            priv = (u.get("private_metadata") or {})
-            existing = (priv.get("billing") or {}).get("stripeCustomerId") or priv.get("stripe_customer_id")
-            if existing:
-                return existing
-            email = None
-            try:
-                emails = u.get("email_addresses") or []
-                primary_id = u.get("primary_email_address_id")
-                primary = next((e for e in emails if e.get("id") == primary_id), emails[0] if emails else None)
-                email = primary.get("email_address") if primary else None
-            except Exception:
-                pass
-            name = " ".join(filter(None, [u.get("first_name"), u.get("last_name")])) or u.get("username") or u.get("id")
-            customer = stripe.Customer.create(email=email, name=name, metadata={"clerk_user_id": user_id})
-            try:
-                clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer.id}})
-            except Exception:
-                current_app.logger.warning("No se pudo persistir stripeCustomerId en Clerk (continuamos).")
-            return customer.id
-        except Exception:
-            current_app.logger.exception("ensure_customer_for_user via Clerk falló; creamos Customer sin Clerk")
-    customer = stripe.Customer.create(metadata={"clerk_user_id": user_id})
-    return customer.id
-
-# ───────── Endpoints (sin puntos en endpoint=...) ─────────
+# ───────── Endpoints ─────────
 
 @bp.post("/checkout", endpoint="create_checkout")
 @_require_auth
 def create_checkout():
     """
-    Crea Stripe Checkout (suscripción)
-    Body: { price_id?: string, quantity?: number }
+    Crea una Stripe Checkout Session (suscripción).
+    Body opcional:
+      - price_id: str (si no, STRIPE_PRICE_ID)
+      - quantity: int (>=1, por defecto 1)
+      - entity_type: "user" | "org" (por defecto "user")
+      - entity_id: id explícito (si no, se infiere del guard de Clerk)
+      - plan_scope: "user" | "org" (alias del entity_type; por defecto = entity_type)
     """
     _, err = _init_stripe()
     if err:
         return err
 
     body = request.get_json(silent=True) or {}
+
     price_id = (body.get("price_id") or _cfg("STRIPE_PRICE_ID") or "").strip()
     if not price_id:
         return jsonify(error="price_id required or STRIPE_PRICE_ID missing"), 400
@@ -121,30 +91,67 @@ def create_checkout():
     if quantity < 1:
         quantity = 1
 
-    user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
-    customer_id = _ensure_customer_for_user(user_id)
+    # ---- Identidad (user/org) ----
+    entity_type = (body.get("entity_type") or "user").strip().lower()
+    if entity_type not in ("user", "org"):
+        entity_type = "user"
 
+    clerk_ctx = getattr(g, "clerk", {}) or {}
+    inferred_user_id = clerk_ctx.get("user_id")
+    inferred_org_id = clerk_ctx.get("org_id")
+    entity_id = (body.get("entity_id")
+                 or (inferred_user_id if entity_type == "user" else inferred_org_id)
+                 or "dev_user")
+
+    plan_scope = (body.get("plan_scope") or entity_type).strip().lower()
+
+    # ---- Customer coherente con entity ----
+    try:
+        customer_id = ensure_customer(entity_type, entity_id)
+    except Exception:
+        current_app.logger.exception("ensure_customer falló")
+        return jsonify(error="cannot ensure stripe customer"), 500
+
+    # ---- URLs ----
     success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = _cfg("CHECKOUT_CANCEL_URL") or f"{_front_base()}/pricing?canceled=1"
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        customer=customer_id,
-        line_items=[{"price": price_id, "quantity": quantity}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        allow_promotion_codes=True,
-        subscription_data={"metadata": {"entity_type": "user", "entity_id": user_id, "plan_scope": "user"}},
-        metadata={"entity_type": "user", "entity_id": user_id, "plan_scope": "user", "price_id": price_id},
-        tax_id_collection={"enabled": True},
-        locale=_cfg("STRIPE_CHECKOUT_LOCALE", "auto") or "auto",
-        automatic_tax={"enabled": _truthy(_cfg("STRIPE_AUTOMATIC_TAX", "true") or "true")},
-        billing_address_collection=("required" if _truthy(_cfg("STRIPE_REQUIRE_BILLING_ADDRESS", "true") or "true") else "auto"),
-        customer_update={
-            "address": "auto" if _truthy(_cfg("STRIPE_SAVE_ADDRESS_AUTO", "true") or "true") else "none",
-            "name": "auto" if _truthy(_cfg("STRIPE_SAVE_NAME_AUTO", "true") or "true") else "none",
-        },
-    )
+    # ---- Crear Session con metadatos NORMALIZADOS ----
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer=customer_id,
+            line_items=[{"price": price_id, "quantity": quantity}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+            client_reference_id=f"{entity_type}:{entity_id}",
+            metadata={
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "plan_scope": plan_scope,
+                "price_id": price_id,
+            },
+            subscription_data={
+                "metadata": {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "plan_scope": plan_scope,
+                }
+            },
+            tax_id_collection={"enabled": True},
+            locale=_cfg("STRIPE_CHECKOUT_LOCALE", "auto") or "auto",
+            automatic_tax={"enabled": _truthy(_cfg("STRIPE_AUTOMATIC_TAX", "true") or "true")},
+            billing_address_collection=("required" if _truthy(_cfg("STRIPE_REQUIRE_BILLING_ADDRESS", "true") or "true") else "auto"),
+            customer_update={
+                "address": "auto" if _truthy(_cfg("STRIPE_SAVE_ADDRESS_AUTO", "true") or "true") else "none",
+                "name": "auto" if _truthy(_cfg("STRIPE_SAVE_NAME_AUTO", "true") or "true") else "none",
+            },
+        )
+    except Exception as e:
+        current_app.logger.exception("Stripe Checkout Session.create error")
+        return jsonify(error="stripe checkout error", detail=str(e)), 400
+
     return jsonify(checkout_url=session.url), 200
 
 
@@ -154,8 +161,26 @@ def create_portal():
     _, err = _init_stripe()
     if err:
         return err
-    user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
-    customer_id = _ensure_customer_for_user(user_id)
+
+    body = request.get_json(silent=True) or {}
+    # Permite abrir portal para user u org si lo soportas en UI
+    entity_type = (body.get("entity_type") or "user").strip().lower()
+    if entity_type not in ("user", "org"):
+        entity_type = "user"
+
+    clerk_ctx = getattr(g, "clerk", {}) or {}
+    inferred_user_id = clerk_ctx.get("user_id")
+    inferred_org_id = clerk_ctx.get("org_id")
+    entity_id = (body.get("entity_id")
+                 or (inferred_user_id if entity_type == "user" else inferred_org_id)
+                 or "dev_user")
+
+    try:
+        customer_id = ensure_customer(entity_type, entity_id)
+    except Exception:
+        current_app.logger.exception("ensure_customer falló en portal")
+        return jsonify(error="cannot ensure stripe customer"), 500
+
     ps = stripe.billing_portal.Session.create(customer=customer_id, return_url=f"{_front_base()}/account")
     return jsonify(portal_url=ps.url), 200
 
@@ -180,21 +205,25 @@ def sync_after_success():
     except Exception:
         pass
 
-    user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
-    if clerk_svc:
-        try:
-            priv = {"billing": {
-                "stripeCustomerId": sess.get("customer"),
-                "subscriptionId": sub.get("id"),
-                "status": status,
-                "planPriceId": price
-            }}
-            plan = "pro" if status in ("active", "trialing", "past_due") else "free"
-            if hasattr(clerk_svc, "set_user_plan"):
-                clerk_svc.set_user_plan(user_id, plan=plan, status=status, extra_private=priv)
-            else:
-                clerk_svc.update_user_metadata(user_id, public={"plan": plan}, private=priv)
-        except Exception:
-            current_app.logger.exception("No se pudo actualizar Clerk en /billing/sync (continuamos).")
+    # Inferimos usuario por el guard
+    clerk_ctx = getattr(g, "clerk", {}) or {}
+    user_id = clerk_ctx.get("user_id") or "dev_user"
+
+    # Actualiza Clerk
+    try:
+        from app.services import clerk_svc
+        priv = {"billing": {
+            "stripeCustomerId": sess.get("customer"),
+            "subscriptionId": sub.get("id"),
+            "status": status,
+            "planPriceId": price
+        }}
+        plan = "pro" if status in ("active", "trialing", "past_due") else "free"
+        if hasattr(clerk_svc, "set_user_plan"):
+            clerk_svc.set_user_plan(user_id, plan=plan, status=status, extra_private=priv)
+        else:
+            clerk_svc.update_user_metadata(user_id, public={"plan": plan}, private=priv)
+    except Exception:
+        current_app.logger.exception("No se pudo actualizar Clerk en /billing/sync (continuamos).")
 
     return jsonify(ok=True), 200
