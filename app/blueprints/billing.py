@@ -581,6 +581,69 @@ def billing_state():
         return jsonify({"plan": user_plan, "org_id": None, "seats": None, "source": "stripe"}), 200
 
 
+# ───────────────────────── PUBLIC: invitado enterprise ─────────────────────────
+@bp.post("/public/enterprise-checkout")
+def public_enterprise_checkout():
+    """
+    Invitado abre Checkout Enterprise.
+    Body: { email: string, quantity?: number, price_id?: string }
+    """
+    _, err = _init_stripe()
+    if err: return err
+
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        return jsonify(error="email is required"), 400
+
+    try:
+        quantity = int(body.get("quantity") or 1)
+    except Exception:
+        quantity = 1
+    if quantity < 1:
+        quantity = 1
+
+    price_id = (body.get("price_id") or _cfg("STRIPE_PRICE_ID") or "").strip()
+    if not price_id:
+        return jsonify(error="price_id required or STRIPE_PRICE_ID missing"), 400
+
+    try:
+        # Customer huérfano, el webhook creará user+org y los enlazará
+        customer = stripe.Customer.create(
+            email=email,
+            metadata={"entity_type": "org", "entity_id": "", "entity_email": email, "plan_scope": "org"},
+        )
+    except Exception as e:
+        current_app.logger.exception("[public_enterprise_checkout] Customer.create failed")
+        return jsonify(error="cannot create stripe customer", detail=str(e)), 502
+
+    success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            customer=customer.id,
+            line_items=[{"price": price_id, "quantity": quantity}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+            subscription_data={
+                "metadata": {"entity_type": "org", "entity_id": "", "plan_scope": "org", "entity_email": email}
+            },
+            metadata={"entity_type": "org", "entity_id": "", "plan_scope": "org", "price_id": price_id, "entity_email": email},
+            tax_id_collection={"enabled": True},
+            locale=_cfg("STRIPE_CHECKOUT_LOCALE", "auto") or "auto",
+            automatic_tax={"enabled": _truthy(_cfg("STRIPE_AUTOMATIC_TAX", "true") or "true")},
+            billing_address_collection=("required" if _truthy(_cfg("STRIPE_REQUIRE_BILLING_ADDRESS", "true") or "true") else "auto"),
+            customer_update={"address": "auto", "name": "auto"},
+        )
+        return jsonify(checkout_url=session.url), 200
+    except Exception as e:
+        current_app.logger.exception("[public_enterprise_checkout] Session.create failed")
+        return jsonify(error="checkout creation failed", detail=str(e)), 502
+
+
 # Diagnóstico
 @bp.get("/_int/stripe-ping")
 def stripe_ping():

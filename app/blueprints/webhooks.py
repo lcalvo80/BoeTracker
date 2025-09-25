@@ -36,16 +36,22 @@ def _sum_seats_from_subscription(sub: dict) -> int:
             pass
     return max(qty, 1)
 
-def _ensure_customer_has_entity(customer_id: str, entity_type: str, entity_id: str):
+def _ensure_customer_has_entity(customer_id: str, entity_type: str, entity_id: str, entity_email: str | None = None):
     try:
         cust = stripe.Customer.retrieve(customer_id)
         md = cust.get("metadata") or {}
-        if md.get("entity_type") != entity_type or md.get("entity_id") != entity_id:
-            md.update({"entity_type": entity_type, "entity_id": entity_id})
-            if entity_type == "user":
-                md.setdefault("clerk_user_id", entity_id)
-            if entity_type == "org":
-                md.setdefault("clerk_org_id", entity_id)
+        changed = False
+        if md.get("entity_type") != entity_type:
+            md["entity_type"] = entity_type; changed = True
+        if md.get("entity_id") != entity_id:
+            md["entity_id"] = entity_id; changed = True
+        if entity_type == "user" and md.get("clerk_user_id") != entity_id:
+            md["clerk_user_id"] = entity_id; changed = True
+        if entity_type == "org" and md.get("clerk_org_id") != entity_id:
+            md["clerk_org_id"] = entity_id; changed = True
+        if entity_email and md.get("entity_email") != entity_email:
+            md["entity_email"] = entity_email; changed = True
+        if changed:
             stripe.Customer.modify(customer_id, metadata=md)
     except Exception:
         current_app.logger.warning("[Stripe] no se pudo garantizar metadata de customer")
@@ -83,13 +89,34 @@ def _handle_stripe():
             meta = session.get("metadata") or {}
             entity_type = meta.get("entity_type")
             entity_id = meta.get("entity_id") or meta.get("clerk_user_id") or meta.get("user_id") or meta.get("org_id")
+            entity_email = meta.get("entity_email") or session.get("customer_details", {}).get("email")
 
             sub = stripe.Subscription.retrieve(sub_id, expand=["items.data.price"]) if sub_id else None
             status = (sub or {}).get("status") or "active"
             seats = _sum_seats_from_subscription(sub or {})
 
+            # ── CASO INVITADO: enterprise sin entity_id pero con email ──
+            if (entity_type == "org") and not entity_id and entity_email and customer_id:
+                try:
+                    u = clerk_svc.ensure_user_by_email(entity_email)
+                    uid = u.get("id")
+                    org = clerk_svc.create_org_for_user(
+                        user_id=uid,
+                        name=f"Org de {entity_email}",
+                        public={"plan": "enterprise", "subscription": "enterprise", "seats": seats},
+                    )
+                    org_id = org.get("id")
+                    priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
+                    clerk_svc.set_org_plan(org_id, plan="enterprise", status=status, extra_private=priv)
+                    _ensure_customer_has_entity(customer_id, "org", org_id, entity_email)
+                    if event_id: _mark_processed(event_id)
+                    return jsonify(received=True), 200
+                except Exception:
+                    current_app.logger.exception("[Stripe] guest enterprise provisioning failed")
+
+            # ── Flujos existentes autenticados ──
             if customer_id and entity_type and entity_id:
-                _ensure_customer_has_entity(customer_id, entity_type, entity_id)
+                _ensure_customer_has_entity(customer_id, entity_type, entity_id, entity_email)
 
             if entity_type == "user" and entity_id:
                 priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
@@ -117,14 +144,40 @@ def _handle_stripe():
                 current_app.logger.exception("[Stripe] error retrieving customer")
 
             md_cust = (cust.get("metadata") if cust else {}) or {}
-            md_sub = (sub.get("metadata") or {})
+            md_sub = (sub.get("metadata") or {}) or {}
 
             entity_type = md_cust.get("entity_type") or md_sub.get("entity_type")
             entity_id = (md_cust.get("entity_id") or md_sub.get("entity_id")
                          or md_cust.get("clerk_user_id") or md_sub.get("clerk_user_id")
                          or md_cust.get("user_id") or md_sub.get("user_id")
                          or md_cust.get("org_id") or md_sub.get("org_id"))
+            entity_email = md_cust.get("entity_email") or md_sub.get("entity_email") or (cust.get("email") if cust else None)
 
+            # ── CASO INVITADO: enterprise sin entity_id ──
+            if (entity_type == "org") and not entity_id and entity_email and sub.get("customer"):
+                try:
+                    u = clerk_svc.ensure_user_by_email(entity_email)
+                    uid = u.get("id")
+                    is_active = status in ("active","trialing","past_due")
+                    org = clerk_svc.create_org_for_user(
+                        user_id=uid,
+                        name=f"Org de {entity_email}",
+                        public={
+                            "plan": ("enterprise" if is_active else "free"),
+                            "subscription": ("enterprise" if is_active else None),
+                            "seats": (seats if is_active else 0),
+                        },
+                    )
+                    org_id = org.get("id")
+                    priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
+                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if is_active else "free"), status=status, extra_private=priv)
+                    _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
+                    if event_id: _mark_processed(event_id)
+                    return jsonify(received=True), 200
+                except Exception:
+                    current_app.logger.exception("[Stripe] guest enterprise provisioning (subs.*) failed")
+
+            # ── Flujos existentes autenticados ──
             if entity_type == "user" and entity_id:
                 priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
                 clerk_svc.set_user_plan(entity_id, plan=("pro" if status in ("active","trialing","past_due") else "free"),

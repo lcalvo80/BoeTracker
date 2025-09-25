@@ -93,3 +93,25 @@ def set_org_plan(
         pub.update(extra_public)
     priv = extra_private or {}
     return update_org_metadata(org_id, public=pub, private=priv)
+
+# ─── Invitado por email: buscar/crear usuario ───
+def find_users_by_email(email: str) -> List[Dict[str, Any]]:
+    r = httpx.get(f"{API_BASE}/users", params={"email_address": email}, headers=_headers(), timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else (data.get("data") or [])
+
+def create_user_skeleton(email: str) -> Dict[str, Any]:
+    payload = {
+        "email_address": [email],
+        "skip_password_requirement": True,  # alta sin password inicial
+    }
+    r = httpx.post(f"{API_BASE}/users", headers=_headers(), json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def ensure_user_by_email(email: str) -> Dict[str, Any]:
+    found = find_users_by_email(email)
+    if found:
+        return found[0] if isinstance(found, list) else found
+    return create_user_skeleton(email)
