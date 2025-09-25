@@ -397,21 +397,37 @@ def summary_get():
             if scope == "org" and org_id and _is_org_admin(user_id, org_id):
                 qty = int(data.get("quantity") or 1)
                 try:
-                    _clerk_update_org_metadata(org_id, public={"seats": qty}, private={"billing": {
-                        "stripeCustomerId": customer_id,
-                        "subscriptionId": data["subscription_id"],
-                        "status": data["status"],
-                    }})
+                    _clerk_update_org_metadata(
+                        org_id,
+                        public={
+                            "subscription": "enterprise",
+                            "plan": "enterprise",  # si tu UI lo usa
+                            "seats": qty,
+                        },
+                        private={
+                            "billing": {
+                                "stripeCustomerId": customer_id,
+                                "subscriptionId": data["subscription_id"],
+                                "status": data["status"],
+                            }
+                        },
+                    )
                 except Exception:
                     pass
             else:
                 plan = "pro" if data["status"] in ("active", "trialing", "past_due") else "free"
                 try:
-                    _clerk_update_user_metadata(user_id, public={"plan": plan}, private={"billing": {
-                        "stripeCustomerId": customer_id,
-                        "subscriptionId": data["subscription_id"],
-                        "status": data["status"],
-                    }})
+                    _clerk_update_user_metadata(
+                        user_id,
+                        public={"plan": plan},
+                        private={
+                            "billing": {
+                                "stripeCustomerId": customer_id,
+                                "subscriptionId": data["subscription_id"],
+                                "status": data["status"],
+                            }
+                        },
+                    )
                 except Exception:
                     pass
         return jsonify(data), 200
@@ -488,15 +504,23 @@ def sync_after_success():
         customer_id = sess.get("customer")
 
         if scope == "org" and entity_type == "org" and entity_id:
-            # Actualizar organización (seats = qty) y billing metadata
+            # ✅ Actualizar organización (enterprise + seats) y billing metadata
             try:
-                _clerk_update_org_metadata(entity_id,
-                    public={"seats": qty},
-                    private={"billing": {
-                        "stripeCustomerId": customer_id,
-                        "subscriptionId": sub.get("id"),
-                        "status": status
-                    }})
+                _clerk_update_org_metadata(
+                    entity_id,
+                    public={
+                        "subscription": "enterprise",
+                        "plan": "enterprise",   # si tu UI lo usa
+                        "seats": qty,
+                    },
+                    private={
+                        "billing": {
+                            "stripeCustomerId": customer_id,
+                            "subscriptionId": sub.get("id"),
+                            "status": status,
+                        }
+                    },
+                )
             except Exception as e:
                 current_app.logger.warning(f"[billing] No se pudo actualizar metadata de la org: {e}")
         else:
@@ -504,13 +528,17 @@ def sync_after_success():
             user_id, _, _, _, _ = _derive_identity()
             plan = "pro" if status in ("active", "trialing", "past_due") else "free"
             try:
-                _clerk_update_user_metadata(user_id,
+                _clerk_update_user_metadata(
+                    user_id,
                     public={"plan": plan},
-                    private={"billing": {
-                        "stripeCustomerId": customer_id,
-                        "subscriptionId": sub.get("id"),
-                        "status": status
-                    }})
+                    private={
+                        "billing": {
+                            "stripeCustomerId": customer_id,
+                            "subscriptionId": sub.get("id"),
+                            "status": status,
+                        }
+                    },
+                )
             except Exception as e:
                 current_app.logger.warning(f"[billing] No se pudo actualizar metadata de usuario: {e}")
 

@@ -42,6 +42,7 @@ def create_app(config: dict | None = None):
         "app/blueprints/comments.py",
         "app/blueprints/compat.py",
         "app/blueprints/api_alias.py",
+        "app/blueprints/enterprise.py",  # diagnóstico
         # legacy (si existieran, se intentarán registrar)
         "app/routes/debug.py",
         "app/routes/billing.py",
@@ -141,6 +142,7 @@ def create_app(config: dict | None = None):
     register_bp("items", "bp")
     register_bp("comments", "bp")
     register_bp("compat", "bp")
+    register_bp("enterprise", "bp")  # ✅ registra Enterprise (gestión de usuarios/org)
 
     # Alias coherentes bajo /api/* para endpoints legacy sin prefijo (si existe)
     register_bp("api_alias", "bp")
@@ -173,7 +175,6 @@ def create_app(config: dict | None = None):
 
     # ── claims: SIEMPRE montado. Si no hay auth, responde 501 ──
     try:
-        # ⬅️ Import relativo al paquete 'app' para evitar "No module named 'app.auth'"
         from .auth import require_clerk_auth as _auth_deco
         app.logger.info("[init] Auth decorator cargado: app.auth.require_clerk_auth")
     except Exception as e:
