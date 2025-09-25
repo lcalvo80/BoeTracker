@@ -1,4 +1,3 @@
-# app/blueprints/webhooks.py
 from __future__ import annotations
 import os
 import stripe
@@ -8,7 +7,6 @@ from svix.webhooks import Webhook, WebhookVerificationError
 
 bp = Blueprint("webhooks", __name__, url_prefix="/api")
 
-# ───────── Utils & Config ─────────
 def _cfg(k, default=None):
     v = current_app.config.get(k)
     if v is None or str(v).strip() == "":
@@ -22,22 +20,36 @@ def _init_stripe():
     stripe.api_key = sk
     return sk, None
 
-def _plan_from_subscription(sub: dict) -> str:
-    st = (sub or {}).get("status")
-    if st in ("active", "trialing", "past_due"):
-        return "pro"
-    return "free"
-
 # ───────── Idempotencia (plug: DB/Redis) ─────────
 def _already_processed(event_id: str) -> bool:
-    # TODO: consulta en DB/Redis una tabla/clave "stripe_events" por event_id
     return False
 
 def _mark_processed(event_id: str):
-    # TODO: inserta event_id con timestamp para deduplicar
     pass
 
-# ───────── Stripe Webhook ─────────
+def _sum_seats_from_subscription(sub: dict) -> int:
+    qty = 0
+    for it in (sub.get("items", {}) or {}).get("data", []) or []:
+        try:
+            qty += int(it.get("quantity") or 0)
+        except Exception:
+            pass
+    return max(qty, 1)
+
+def _ensure_customer_has_entity(customer_id: str, entity_type: str, entity_id: str):
+    try:
+        cust = stripe.Customer.retrieve(customer_id)
+        md = cust.get("metadata") or {}
+        if md.get("entity_type") != entity_type or md.get("entity_id") != entity_id:
+            md.update({"entity_type": entity_type, "entity_id": entity_id})
+            if entity_type == "user":
+                md.setdefault("clerk_user_id", entity_id)
+            if entity_type == "org":
+                md.setdefault("clerk_org_id", entity_id)
+            stripe.Customer.modify(customer_id, metadata=md)
+    except Exception:
+        current_app.logger.warning("[Stripe] no se pudo garantizar metadata de customer")
+
 def _handle_stripe():
     _, err = _init_stripe()
     if err:
@@ -47,7 +59,7 @@ def _handle_stripe():
     if not wh_secret:
         return jsonify(error="STRIPE_WEBHOOK_SECRET missing"), 500
 
-    payload = request.get_data()  # RAW body
+    payload = request.get_data()
     sig = request.headers.get("Stripe-Signature", "")
     try:
         event = stripe.Webhook.construct_event(payload, sig, wh_secret)
@@ -59,7 +71,6 @@ def _handle_stripe():
     etype = event.get("type")
     obj = (event.get("data") or {}).get("object") or {}
 
-    # Idempotencia
     if event_id and _already_processed(event_id):
         current_app.logger.info(f"[Stripe] duplicate event {event_id} ({etype}) ignored")
         return jsonify(received=True, dedup=True), 200
@@ -70,53 +81,34 @@ def _handle_stripe():
             sub_id = session.get("subscription")
             customer_id = session.get("customer")
             meta = session.get("metadata") or {}
-
-            # Normaliza entidad
             entity_type = meta.get("entity_type")
-            entity_id = (
-                meta.get("entity_id")
-                or meta.get("clerk_user_id")
-                or meta.get("user_id")
-                or meta.get("org_id")
-            )
+            entity_id = meta.get("entity_id") or meta.get("clerk_user_id") or meta.get("user_id") or meta.get("org_id")
 
             sub = stripe.Subscription.retrieve(sub_id, expand=["items.data.price"]) if sub_id else None
             status = (sub or {}).get("status") or "active"
-            plan = _plan_from_subscription(sub or {})
+            seats = _sum_seats_from_subscription(sub or {})
+
+            if customer_id and entity_type and entity_id:
+                _ensure_customer_has_entity(customer_id, entity_type, entity_id)
 
             if entity_type == "user" and entity_id:
-                priv = {
-                    "billing": {
-                        "stripeCustomerId": customer_id,
-                        "subscriptionId": sub.get("id") if sub else None,
-                        "status": status,
-                    }
-                }
-                clerk_svc.set_user_plan(entity_id, plan=plan, status=status, extra_private=priv)
+                priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
+                clerk_svc.set_user_plan(entity_id, plan=("pro" if status in ("active","trialing","past_due") else "free"), status=status, extra_private=priv)
 
             elif entity_type == "org" and entity_id:
-                priv = {
-                    "billing": {
-                        "stripeCustomerId": customer_id,
-                        "subscriptionId": sub.get("id") if sub else None,
-                        "status": status,
-                    }
-                }
-                clerk_svc.set_org_plan(entity_id, plan=plan, status=status, extra_private=priv)
+                priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
+                clerk_svc.set_org_plan(entity_id, plan="enterprise", status=status,
+                                       extra_private=priv,
+                                       extra_public={"seats": seats, "subscription": "enterprise"})
 
             else:
                 current_app.logger.warning("[Stripe] checkout.session.completed sin entity_id/entity_type")
 
-        elif etype in (
-            "customer.subscription.created",
-            "customer.subscription.updated",
-            "customer.subscription.deleted",
-        ):
+        elif etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
             sub = obj
-            status = sub.get("status")
-            plan = _plan_from_subscription(sub)
+            status = sub.get("status") or "canceled"
+            seats = _sum_seats_from_subscription(sub)
 
-            # Recuperar customer con metadata coherente
             cust = None
             try:
                 if sub.get("customer"):
@@ -128,37 +120,25 @@ def _handle_stripe():
             md_sub = (sub.get("metadata") or {})
 
             entity_type = md_cust.get("entity_type") or md_sub.get("entity_type")
-            entity_id = (
-                md_cust.get("entity_id") or md_sub.get("entity_id")
-                or md_cust.get("clerk_user_id") or md_sub.get("clerk_user_id")
-                or md_cust.get("user_id") or md_sub.get("user_id")
-                or md_cust.get("org_id") or md_sub.get("org_id")
-            )
+            entity_id = (md_cust.get("entity_id") or md_sub.get("entity_id")
+                         or md_cust.get("clerk_user_id") or md_sub.get("clerk_user_id")
+                         or md_cust.get("user_id") or md_sub.get("user_id")
+                         or md_cust.get("org_id") or md_sub.get("org_id"))
 
             if entity_type == "user" and entity_id:
-                priv = {
-                    "billing": {
-                        "stripeCustomerId": sub.get("customer"),
-                        "subscriptionId": sub.get("id"),
-                        "status": status,
-                    }
-                }
-                clerk_svc.set_user_plan(entity_id, plan=plan, status=status, extra_private=priv)
+                priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
+                clerk_svc.set_user_plan(entity_id, plan=("pro" if status in ("active","trialing","past_due") else "free"),
+                                        status=status, extra_private=priv)
 
             elif entity_type == "org" and entity_id:
-                priv = {
-                    "billing": {
-                        "stripeCustomerId": sub.get("customer"),
-                        "subscriptionId": sub.get("id"),
-                        "status": status,
-                    }
-                }
-                clerk_svc.set_org_plan(entity_id, plan=plan, status=status, extra_private=priv)
+                priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
+                clerk_svc.set_org_plan(entity_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
+                                       status=status, extra_private=priv,
+                                       extra_public={"seats": seats, "subscription": ("enterprise" if status in ("active","trialing","past_due") else None)})
 
             else:
                 current_app.logger.warning("[Stripe] subscription.* sin entity_id/entity_type")
 
-        # Marca como procesado
         if event_id:
             _mark_processed(event_id)
 

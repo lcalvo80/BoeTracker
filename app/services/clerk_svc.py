@@ -1,6 +1,6 @@
-# app/services/clerk_svc.py
 import httpx
 from flask import current_app
+from typing import Any, Dict, List, Optional
 
 API_BASE = "https://api.clerk.com/v1"
 
@@ -23,14 +23,22 @@ def get_org(org_id: str):
     r.raise_for_status()
     return r.json()
 
+def get_user_memberships(user_id: str) -> List[Dict[str, Any]]:
+    r = httpx.get(
+        f"{API_BASE}/users/{user_id}/organization_memberships",
+        headers=_headers(),
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else (data.get("data") or [])
+
 def update_user_metadata(user_id: str, public: dict | None=None, private: dict | None=None):
-    """
-    PATCH /v1/users/{id} con public_metadata/private_metadata.
-    (Clerk también expone /metadata, pero este endpoint es válido y simple.)
-    """
     payload = {}
     if public is not None: payload["public_metadata"] = public
     if private is not None: payload["private_metadata"] = private
+    if not payload:
+        return get_user(user_id)
     r = httpx.patch(f"{API_BASE}/users/{user_id}", headers=_headers(), json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
@@ -39,21 +47,49 @@ def update_org_metadata(org_id: str, public: dict | None=None, private: dict | N
     payload = {}
     if public is not None: payload["public_metadata"] = public
     if private is not None: payload["private_metadata"] = private
+    if not payload:
+        return get_org(org_id)
     r = httpx.patch(f"{API_BASE}/organizations/{org_id}", headers=_headers(), json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
 
+def create_org_for_user(user_id: str, name: str, public: dict | None=None, private: dict | None=None):
+    payload: Dict[str, Any] = {"name": name, "created_by": user_id}
+    if public is not None:
+        payload["public_metadata"] = public
+    if private is not None:
+        payload["private_metadata"] = private
+    r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
 # Helpers de conveniencia
-def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_private: dict | None=None):
+def set_user_plan(
+    user_id: str,
+    plan: str,
+    status: str | None = None,
+    extra_private: dict | None=None,
+    extra_public: dict | None=None,
+):
     pub = {"plan": plan}
     if status is not None:
         pub["status"] = status
+    if extra_public:
+        pub.update(extra_public)
     priv = extra_private or {}
     return update_user_metadata(user_id, public=pub, private=priv)
 
-def set_org_plan(org_id: str, plan: str, status: str | None = None, extra_private: dict | None=None):
+def set_org_plan(
+    org_id: str,
+    plan: str,
+    status: str | None = None,
+    extra_private: dict | None=None,
+    extra_public: dict | None=None,
+):
     pub = {"plan": plan}
     if status is not None:
         pub["status"] = status
+    if extra_public:
+        pub.update(extra_public)
     priv = extra_private or {}
     return update_org_metadata(org_id, public=pub, private=priv)

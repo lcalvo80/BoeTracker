@@ -1,12 +1,13 @@
-# app/blueprints/billing.py
 from __future__ import annotations
 import os
 import stripe
 import requests
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from flask import Blueprint, request, jsonify, current_app, g
+
+from app.services import clerk_svc  # <<< usamos helpers unificados
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
@@ -59,7 +60,7 @@ def _load_auth_guard():
 
 _require_auth = _load_auth_guard()
 
-# ───────────────── Clerk Admin API ─────────────────
+# ───────────────── Clerk Admin (mínimos para compat) ─────────────────
 def _clerk_headers() -> Dict[str, str]:
     sk = _cfg("CLERK_SECRET_KEY", "")
     if not sk:
@@ -69,43 +70,8 @@ def _clerk_headers() -> Dict[str, str]:
 def _clerk_base() -> str:
     return "https://api.clerk.com/v1"
 
-def _clerk_get_user(user_id: str) -> Dict[str, Any]:
-    r = requests.get(f"{_clerk_base()}/users/{user_id}", headers=_clerk_headers(), timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-def _clerk_update_user_metadata(user_id: str, public: Optional[Dict]=None, private: Optional[Dict]=None):
-    body: Dict[str, Any] = {}
-    if public is not None:
-        body["public_metadata"] = public
-    if private is not None:
-        body["private_metadata"] = private
-    if not body:
-        return
-    r = requests.patch(f"{_clerk_base()}/users/{user_id}", headers=_clerk_headers(), json=body, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
 def _clerk_get_org(org_id: str) -> Dict[str, Any]:
     r = requests.get(f"{_clerk_base()}/organizations/{org_id}", headers=_clerk_headers(), timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-def _clerk_update_org_metadata(org_id: str, public: Optional[Dict]=None, private: Optional[Dict]=None):
-    # merge-friendly: lee primero para no pisar
-    org = _clerk_get_org(org_id)
-    body: Dict[str, Any] = {}
-    if public is not None:
-        merged = dict(org.get("public_metadata") or {})
-        merged.update(public)
-        body["public_metadata"] = merged
-    if private is not None:
-        mergedp = dict(org.get("private_metadata") or {})
-        mergedp.update(private)
-        body["private_metadata"] = mergedp
-    if not body:
-        return org
-    r = requests.patch(f"{_clerk_base()}/organizations/{org_id}", headers=_clerk_headers(), json=body, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -147,65 +113,57 @@ def _search_customer_by_email(email: str | None) -> str | None:
     return None
 
 def _ensure_customer_for_user(user_id: str) -> str:
-    # 1) leer de Clerk private_metadata
+    # usa Clerk public_metadata/private_metadata para reusar si existe
+    u = clerk_svc.get_user(user_id)
+    priv = (u.get("private_metadata") or {})
+    existing = (priv.get("billing") or {}).get("stripeCustomerId")
+    if existing:
+        return existing
+
+    email = None
     try:
-        u = _clerk_get_user(user_id)
-        priv = (u.get("private_metadata") or {})
-        existing = (priv.get("billing") or {}).get("stripeCustomerId") or priv.get("stripe_customer_id")
-        if existing:
-            return existing
-        # construir info básica
-        email = None
-        try:
-            emails = u.get("email_addresses") or []
-            pid = u.get("primary_email_address_id")
-            primary = next((e for e in emails if e.get("id") == pid), emails[0] if emails else None)
-            email = primary.get("email_address") if primary else None
-        except Exception:
-            pass
-        name = " ".join(filter(None, [u.get("first_name"), u.get("last_name")])) or u.get("username") or u.get("id")
+        emails = u.get("email_addresses") or []
+        pid = u.get("primary_email_address_id")
+        primary = next((e for e in emails if e.get("id") == pid), emails[0] if emails else None)
+        email = primary.get("email_address") if primary else None
     except Exception:
-        # fallback: g.clerk
-        uid, email, name, _, _ = _derive_identity()
-        user_id = uid  # asegurar
-    # 2) reusar por email
+        pass
+    name = " ".join(filter(None, [u.get("first_name"), u.get("last_name")])) or u.get("username") or u.get("id")
+
     _init_stripe()
-    cid = _search_customer_by_email(locals().get("email"))
+    cid = _search_customer_by_email(email)
     if cid:
         try:
-            _clerk_update_user_metadata(user_id, private={"billing": {"stripeCustomerId": cid}})
+            clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": cid}})
         except Exception:
             pass
         return cid
-    # 3) crear
+
     customer = stripe.Customer.create(
-        email=locals().get("email"),
-        name=locals().get("name") or user_id,
-        metadata={"clerk_user_id": user_id, "entity_type": "user", "entity_id": user_id},
+        email=email,
+        name=name or user_id,
+        metadata={"entity_type": "user", "entity_id": user_id, "clerk_user_id": user_id},
     )
     try:
-        _clerk_update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer.id}})
+        clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": customer.id}})
     except Exception:
         pass
     return customer.id
 
 def _ensure_customer_for_org(org_id: str) -> str:
-    # 1) leer de org.private_metadata
-    org = _clerk_get_org(org_id)
+    org = clerk_svc.get_org(org_id)
     priv = org.get("private_metadata") or {}
     existing = (priv.get("billing") or {}).get("stripeCustomerId")
     if existing:
         return existing
-    # 2) construir nombre/email de facturación (opcional)
+
     name = org.get("name") or org_id
-    # 3) crear
     _init_stripe()
     customer = stripe.Customer.create(
         name=name,
-        metadata={"clerk_org_id": org_id, "entity_type": "org", "entity_id": org_id},
+        metadata={"entity_type": "org", "entity_id": org_id, "clerk_org_id": org_id},
     )
-    # 4) persistir en Clerk
-    _clerk_update_org_metadata(org_id, private={"billing": {"stripeCustomerId": customer.id}})
+    clerk_svc.update_org_metadata(org_id, private={"billing": {"stripeCustomerId": customer.id}})
     return customer.id
 
 def _subscription_summary(customer_id: str) -> dict:
@@ -219,8 +177,17 @@ def _subscription_summary(customer_id: str) -> dict:
     if not sub:
         return {"plan_name": "Free", "status": "none", "current_period_end": None, "payment_method": None}
 
-    price = sub["items"]["data"][0]["price"] if sub["items"]["data"] else None
-    qty = sub["items"]["data"][0]["quantity"] if sub["items"]["data"] else 1
+    # seats (sumatorio de quantities)
+    qty = 0
+    items = sub.get("items", {}).get("data", [])
+    for it in items:
+        try:
+            qty += int(it.get("quantity") or 0)
+        except Exception:
+            pass
+    qty = max(qty, 1)
+
+    price = items[0]["price"] if items else None
     plan_name = price.get("nickname") or price.get("id") if price else "Plan"
     period_end = sub.get("current_period_end")
     period_end_iso = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat() if period_end else None
@@ -253,7 +220,7 @@ def create_checkout():
       price_id: string,
       quantity?: number,
       is_org?: bool,
-      org_id?: string   # opcional; si falta y is_org=True, usamos g.clerk.org_id
+      org_id?: string   # opcional; si falta y is_org=True, creamos org
     }
     """
     _, err = _init_stripe()
@@ -270,9 +237,23 @@ def create_checkout():
         quantity = 1
     if quantity < 1: quantity = 1
 
-    user_id, _, _, ctx_org_id, _ = _derive_identity()
+    user_id, user_email, user_name, ctx_org_id, _ = _derive_identity()
     is_org = bool(body.get("is_org"))
     org_id = (body.get("org_id") or ctx_org_id)
+
+    # Si es compra para organización y no hay org, crearla y poner al comprador como owner
+    if is_org and not org_id:
+        try:
+            org_name = f"Organización de {user_name or user_email or user_id}"
+            org = clerk_svc.create_org_for_user(
+                user_id=user_id,
+                name=org_name,
+                public={"plan": "enterprise", "seats": quantity, "subscription": "enterprise"},
+            )
+            org_id = org.get("id")
+        except Exception as e:
+            current_app.logger.exception("No se pudo crear la organización para checkout de org")
+            return jsonify(error="cannot create organization for enterprise checkout", detail=str(e)), 502
 
     # Resolver customer (user u org)
     try:
@@ -335,14 +316,13 @@ def create_checkout():
     return jsonify(checkout_url=session.url), 200
 
 
-# Compat (existente en tu front legacy): POST /api/portal -> { portal_url }
+# Compat: POST /api/portal -> { portal_url }
 @bp.post("/portal")
 @_require_auth
 def create_portal_compat():
     _, err = _init_stripe()
     if err: return err
     user_id, _, _, org_id, _ = _derive_identity()
-    # Si el usuario está en una org y es admin, intentamos portal de la org; si no, del usuario.
     try:
         if org_id and _is_org_admin(user_id, org_id):
             customer_id = _ensure_customer_for_org(org_id)
@@ -358,7 +338,7 @@ def create_portal_compat():
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
 
-# Nuevo (usado por el Settings BillingSection): GET /api/billing/portal -> { url }
+# Nuevo (GET): /api/billing/portal -> { url }
 @bp.get("/billing/portal")
 @_require_auth
 def portal_get():
@@ -378,7 +358,7 @@ def portal_get():
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
 
-# Nuevo: GET /api/billing/summary  (por defecto, del usuario; admite ?scope=org)
+# GET /api/billing/summary  (user por defecto; admite ?scope=org)
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
@@ -392,19 +372,18 @@ def summary_get():
         else:
             customer_id = _ensure_customer_for_user(user_id)
         data = _subscription_summary(customer_id)
-        # Reflejar plan/seats en Clerk
+
+        # Reflejar plan/seats en Clerk (best-effort)
         if data.get("subscription_id"):
             if scope == "org" and org_id and _is_org_admin(user_id, org_id):
                 qty = int(data.get("quantity") or 1)
                 try:
-                    _clerk_update_org_metadata(
+                    clerk_svc.set_org_plan(
                         org_id,
-                        public={
-                            "subscription": "enterprise",
-                            "plan": "enterprise",  # si tu UI lo usa
-                            "seats": qty,
-                        },
-                        private={
+                        plan="enterprise",
+                        status=data["status"],
+                        extra_public={"seats": qty, "subscription": "enterprise"},
+                        extra_private={
                             "billing": {
                                 "stripeCustomerId": customer_id,
                                 "subscriptionId": data["subscription_id"],
@@ -417,10 +396,11 @@ def summary_get():
             else:
                 plan = "pro" if data["status"] in ("active", "trialing", "past_due") else "free"
                 try:
-                    _clerk_update_user_metadata(
+                    clerk_svc.set_user_plan(
                         user_id,
-                        public={"plan": plan},
-                        private={
+                        plan=plan,
+                        status=data["status"],
+                        extra_private={
                             "billing": {
                                 "stripeCustomerId": customer_id,
                                 "subscriptionId": data["subscription_id"],
@@ -436,7 +416,7 @@ def summary_get():
         return jsonify(error="summary failed", detail=str(e)), 502
 
 
-# Nuevo: GET /api/billing/invoices (user por defecto; admite ?scope=org)
+# GET /api/billing/invoices (user por defecto; admite ?scope=org)
 @bp.get("/billing/invoices")
 @_require_auth
 def invoices_get():
@@ -465,22 +445,19 @@ def invoices_get():
         return jsonify(error="invoices failed", detail=str(e)), 502
 
 
-# ── ALIAS ESTABLE: usado por el frontend moderno ──
+# Alias estable: POST /api/billing/sync
 @bp.post("/billing/sync")
 @_require_auth
 def billing_sync_alias():
-    # reutiliza la misma lógica del handler principal
     return sync_after_success()
 
-
-# Compat (fronts antiguos): POST /api/sync
+# Compat: POST /api/sync
 @bp.post("/sync")
 @_require_auth
 def sync_after_success():
     """
     Sincroniza tras volver de Stripe Checkout usando session_id.
-    - Detecta si la compra fue de usuario (plan_scope=user) u organización (plan_scope=org).
-    - Actualiza metadata correspondiente en Clerk.
+    Detecta compra personal u organización y actualiza Clerk.
     """
     _, err = _init_stripe()
     if err: return err
@@ -497,23 +474,27 @@ def sync_after_success():
         sub = sess.get("subscription") or {}
         status = sub.get("status") or "active"
         items = sub.get("items", {}).get("data") or []
-        qty = int(items[0]["quantity"]) if items else 1
+        qty = 0
+        for it in items:
+            try:
+                qty += int(it.get("quantity") or 0)
+            except Exception:
+                pass
+        qty = max(qty, 1)
+
         scope = (sub.get("metadata", {}) or {}).get("plan_scope") or (sess.get("metadata", {}) or {}).get("plan_scope")
         entity_type = (sub.get("metadata", {}) or {}).get("entity_type") or (sess.get("metadata", {}) or {}).get("entity_type")
         entity_id = (sub.get("metadata", {}) or {}).get("entity_id") or (sess.get("metadata", {}) or {}).get("entity_id")
         customer_id = sess.get("customer")
 
         if scope == "org" and entity_type == "org" and entity_id:
-            # ✅ Actualizar organización (enterprise + seats) y billing metadata
             try:
-                _clerk_update_org_metadata(
+                clerk_svc.set_org_plan(
                     entity_id,
-                    public={
-                        "subscription": "enterprise",
-                        "plan": "enterprise",   # si tu UI lo usa
-                        "seats": qty,
-                    },
-                    private={
+                    plan="enterprise",
+                    status=status,
+                    extra_public={"seats": qty, "subscription": "enterprise"},
+                    extra_private={
                         "billing": {
                             "stripeCustomerId": customer_id,
                             "subscriptionId": sub.get("id"),
@@ -524,14 +505,14 @@ def sync_after_success():
             except Exception as e:
                 current_app.logger.warning(f"[billing] No se pudo actualizar metadata de la org: {e}")
         else:
-            # Compra personal
             user_id, _, _, _, _ = _derive_identity()
             plan = "pro" if status in ("active", "trialing", "past_due") else "free"
             try:
-                _clerk_update_user_metadata(
+                clerk_svc.set_user_plan(
                     user_id,
-                    public={"plan": plan},
-                    private={
+                    plan=plan,
+                    status=status,
+                    extra_private={
                         "billing": {
                             "stripeCustomerId": customer_id,
                             "subscriptionId": sub.get("id"),
@@ -547,6 +528,57 @@ def sync_after_success():
     except Exception as e:
         current_app.logger.exception("sync_after_success error")
         return jsonify(error="sync failed", detail=str(e)), 502
+
+
+# NUEVO: Estado consolidado para el frontend
+# GET /api/billing/state  -> { plan, org_id, seats, source }
+@bp.get("/billing/state")
+@_require_auth
+def billing_state():
+    user_id, _, _, active_org_id, _ = _derive_identity()
+
+    # 1) Si hay org activa en el token, usarla.
+    candidate_org_ids: List[str] = []
+    if active_org_id:
+        candidate_org_ids.append(active_org_id)
+
+    # 2) Añadir memberships para encontrar una org enterprise aunque no sea “activa”
+    try:
+        mships = clerk_svc.get_user_memberships(user_id)
+        for m in mships:
+            org = m.get("organization") or {}
+            oid = org.get("id")
+            if oid and oid not in candidate_org_ids:
+                candidate_org_ids.append(oid)
+    except Exception:
+        pass
+
+    # Buscar primera org con plan=enterprise
+    org_id = None
+    seats = None
+    for oid in candidate_org_ids:
+        try:
+            o = clerk_svc.get_org(oid)
+            pub = (o.get("public_metadata") or {})
+            if (pub.get("plan") or "").lower() == "enterprise":
+                org_id = oid
+                seats = pub.get("seats")
+                break
+        except Exception:
+            continue
+
+    # Si no hay org enterprise, devolver plan del usuario
+    try:
+        u = clerk_svc.get_user(user_id)
+        u_pub = (u.get("public_metadata") or {})
+        user_plan = (u_pub.get("plan") or "free").lower()
+    except Exception:
+        user_plan = "free"
+
+    if org_id:
+        return jsonify({"plan": "enterprise", "org_id": org_id, "seats": seats, "source": "stripe"}), 200
+    else:
+        return jsonify({"plan": user_plan, "org_id": None, "seats": None, "source": "stripe"}), 200
 
 
 # Diagnóstico
