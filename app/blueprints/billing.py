@@ -2,13 +2,13 @@
 from __future__ import annotations
 import os
 import stripe
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, current_app, g
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
 # ───────── helpers de config ─────────
 def _cfg(k: str, default: str | None = None) -> str | None:
-    # current_app.config primero; si no, env
     try:
         v = current_app.config.get(k)
     except Exception:
@@ -34,13 +34,11 @@ def _front_base() -> str:
 # Solo valores válidos para Stripe: 'auto' | 'never'
 def _update_mode(v: str | None, default: str = "auto") -> str:
     s = (v or default).strip().lower()
-    # aceptamos truthy típicos como 'true' -> 'auto'
     if s in ("auto", "1", "true", "yes", "on"):
         return "auto"
-    # cualquier otra cosa: 'never'
     return "never"
 
-# ───────── Auth guard (bypass si no está disponible) ─────────
+# ───────── Auth guard (mantiene tu require_clerk_auth; fallback si DISABLE_AUTH) ─────────
 def _load_auth_guard():
     disabled = _truthy(_cfg("DISABLE_AUTH", "0") or "0")
     if disabled:
@@ -62,36 +60,38 @@ _require_auth = _load_auth_guard()
 
 # ───────── Clerk svc (opcional) ─────────
 try:
-    from app.services import clerk_svc
+    # wrapper de tu proyecto para usar Clerk Admin API (get_user, update_user_metadata, set_user_plan, etc.)
+    from app.integrations import clerk_admin as clerk_svc  # type: ignore
 except Exception:
     clerk_svc = None  # type: ignore
 
-# ───────── Customer helpers ─────────
+# ───────── Customer helpers (Clerk como única fuente de verdad) ─────────
 def _derive_identity():
-    """Devuelve (user_id, email, name) desde g.clerk cuando hay auth;
-    en bypass, usa valores de dev."""
+    """Devuelve (user_id, email, name) desde g.clerk o valores de dev si bypass."""
     user_id = getattr(g, "clerk", {}).get("user_id") or "dev_user"
     email   = getattr(g, "clerk", {}).get("email")
     name    = getattr(g, "clerk", {}).get("name") or user_id
     return user_id, email, name
 
 def _search_customer_by_email(email: str | None) -> str | None:
-    """Intenta localizar un customer existente por email (si la cuenta permite search)."""
     if not email:
         return None
     try:
-        # Requiere que tu cuenta tenga habilitado search API
         res = stripe.Customer.search(query=f'email:"{email}"', limit=1)
         if res and res.get("data"):
             return res["data"][0]["id"]
     except Exception as e:
-        # No es crítico; continúa creando.
         current_app.logger.info(f"[billing] Customer.search no disponible o sin resultados: {e}")
     return None
 
 def _ensure_customer_for_user(user_id: str) -> str:
-    """Garantiza un customer para el user_id. Usa Clerk si está disponible; si no, crea mínimo viable."""
-    # Intento con Clerk (persistir/reutilizar ID)
+    """
+    Garantiza un Stripe Customer para el usuario **persistiendo siempre en Clerk**.
+    - Busca en private_metadata.billing.stripeCustomerId
+    - Reutiliza por email (search) si existe
+    - Crea en Stripe y guarda en Clerk
+    """
+    # Intento con Clerk
     if clerk_svc:
         try:
             u = clerk_svc.get_user(user_id)
@@ -100,7 +100,7 @@ def _ensure_customer_for_user(user_id: str) -> str:
             if existing:
                 return existing
 
-            # Datos de email/nombre desde Clerk
+            # Datos primarios de email/nombre desde Clerk
             email = None
             try:
                 emails = u.get("email_addresses") or []
@@ -111,7 +111,7 @@ def _ensure_customer_for_user(user_id: str) -> str:
                 pass
             name = " ".join(filter(None, [u.get("first_name"), u.get("last_name")])) or u.get("username") or u.get("id")
 
-            # Reuso por email si existe
+            # Reuso por email
             cid = _search_customer_by_email(email)
             if cid:
                 try:
@@ -121,6 +121,7 @@ def _ensure_customer_for_user(user_id: str) -> str:
                 return cid
 
             # Crear
+            _init_stripe()
             customer = stripe.Customer.create(
                 email=email,
                 name=name,
@@ -134,15 +135,12 @@ def _ensure_customer_for_user(user_id: str) -> str:
         except Exception:
             current_app.logger.exception("ensure_customer_for_user via Clerk falló; intentamos sin Clerk")
 
-    # Sin Clerk → usar lo que tengamos en g.clerk
+    # Fallback sin clerk_svc: usa g.clerk
     _, email, name = _derive_identity()
-
-    # Reuso por email si existe
     cid = _search_customer_by_email(email)
     if cid:
         return cid
-
-    # Crear mínimo viable con metadata útil
+    _init_stripe()
     customer = stripe.Customer.create(
         email=email,
         name=name,
@@ -150,14 +148,38 @@ def _ensure_customer_for_user(user_id: str) -> str:
     )
     return customer.id
 
-# ───────── Endpoints públicos ─────────
-@bp.post("/checkout", endpoint="billing_create_checkout")
+def _subscription_summary(customer_id: str) -> dict:
+    _init_stripe()
+    subs = stripe.Subscription.list(customer=customer_id, status="all", limit=10)
+    sub = None
+    for s in subs.auto_paging_iter():
+        sub = s
+        if s.status in ("active", "trialing", "past_due", "unpaid"):
+            break
+    if not sub:
+        return {"plan_name": "Free", "status": "none", "current_period_end": None, "payment_method": None}
+
+    price = sub["items"]["data"][0]["price"] if sub["items"]["data"] else None
+    plan_name = price.get("nickname") or price.get("id") if price else "Plan"
+    period_end = sub.get("current_period_end")
+    period_end_iso = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat() if period_end else None
+
+    cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
+    pm = cust.get("invoice_settings", {}).get("default_payment_method")
+    pm_info = None
+    if pm and pm.get("card"):
+        pm_info = {"brand": pm["card"]["brand"], "last4": pm["card"]["last4"]}
+    elif pm and pm.get("sepa_debit"):
+        pm_info = {"brand": "sepa_debit", "last4": pm["sepa_debit"]["last4"]}
+
+    return {"plan_name": plan_name, "status": sub["status"], "current_period_end": period_end_iso, "payment_method": pm_info}
+
+# ───────── Endpoints públicos (compat + nuevos GET) ─────────
+
+# Compat: tu endpoint existente para Checkout (suscripción)
+@bp.post("/checkout")
 @_require_auth
 def create_checkout():
-    """
-    Crea Stripe Checkout (suscripción)
-    Body: { price_id?: string, quantity?: number, is_org?: bool }
-    """
     _, err = _init_stripe()
     if err: return err
 
@@ -170,9 +192,10 @@ def create_checkout():
         quantity = int(body.get("quantity") or 1)
     except Exception:
         quantity = 1
-    if quantity < 1: quantity = 1
+    if quantity < 1:
+        quantity = 1
 
-    user_id, email, name = _derive_identity()
+    user_id, _, _ = _derive_identity()
 
     # Customer
     try:
@@ -187,7 +210,6 @@ def create_checkout():
     success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
-    # Normalizar modos válidos para Stripe ('auto' | 'never')
     address_mode = _update_mode(_cfg("STRIPE_SAVE_ADDRESS_AUTO"), "auto")
     name_mode    = _update_mode(_cfg("STRIPE_SAVE_NAME_AUTO"), "auto")
 
@@ -205,11 +227,7 @@ def create_checkout():
             locale=_cfg("STRIPE_CHECKOUT_LOCALE", "auto") or "auto",
             automatic_tax={"enabled": _truthy(_cfg("STRIPE_AUTOMATIC_TAX", "true") or "true")},
             billing_address_collection=("required" if _truthy(_cfg("STRIPE_REQUIRE_BILLING_ADDRESS", "true") or "true") else "auto"),
-            customer_update={
-                "address": address_mode,  # <- 'auto' o 'never'
-                "name": name_mode,        # <- 'auto' o 'never'
-            },
-            # Puedes considerar prellenar email si no existe en Customer
+            customer_update={"address": address_mode, "name": name_mode},
             customer_email=None,
         )
     except stripe.error.AuthenticationError as e:
@@ -221,21 +239,92 @@ def create_checkout():
 
     return jsonify(checkout_url=session.url), 200
 
-@bp.post("/portal", endpoint="billing_create_portal")
+# Compat: tu endpoint existente (POST) para crear portal
+@bp.post("/portal")
 @_require_auth
-def create_portal():
+def create_portal_compat():
     _, err = _init_stripe()
     if err: return err
     user_id, _, _ = _derive_identity()
     try:
         customer_id = _ensure_customer_for_user(user_id)
-        ps = stripe.billing_portal.Session.create(customer=customer_id, return_url=f"{_front_base()}/account")
+        ps = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{_front_base()}/account"
+        )
         return jsonify(portal_url=ps.url), 200
     except Exception as e:
         current_app.logger.exception("Error creando portal")
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
-@bp.post("/sync", endpoint="billing_sync_after_success")
+# Nuevo: GET /api/billing/portal → { url }
+@bp.get("/billing/portal")
+@_require_auth
+def portal_get():
+    _, err = _init_stripe()
+    if err: return err
+    user_id, _, _ = _derive_identity()
+    try:
+        customer_id = _ensure_customer_for_user(user_id)
+        return_url = _cfg("STRIPE_BILLING_PORTAL_RETURN_URL") or f"{_front_base()}/account"
+        ps = stripe.billing_portal.Session.create(customer=customer_id, return_url=return_url)
+        return jsonify(url=ps.url), 200
+    except Exception as e:
+        current_app.logger.exception("Error creando portal (GET)")
+        return jsonify(error="portal creation failed", detail=str(e)), 502
+
+# Nuevo: GET /api/billing/summary
+@bp.get("/billing/summary")
+@_require_auth
+def summary_get():
+    _, err = _init_stripe()
+    if err: return err
+    user_id, _, _ = _derive_identity()
+    try:
+        customer_id = _ensure_customer_for_user(user_id)
+        data = _subscription_summary(customer_id)
+        # opcional: reflejar plan en Clerk
+        if clerk_svc:
+            try:
+                plan = "pro" if data["status"] in ("active", "trialing", "past_due") else "free"
+                clerk_svc.update_user_metadata(
+                    user_id,
+                    public={"plan": plan},
+                    private={"billing": {"stripeCustomerId": customer_id}},
+                )
+            except Exception:
+                pass
+        return jsonify(data), 200
+    except Exception as e:
+        current_app.logger.exception("summary_get error")
+        return jsonify(error="summary failed", detail=str(e)), 502
+
+# Nuevo: GET /api/billing/invoices
+@bp.get("/billing/invoices")
+@_require_auth
+def invoices_get():
+    _, err = _init_stripe()
+    if err: return err
+    user_id, _, _ = _derive_identity()
+    try:
+        customer_id = _ensure_customer_for_user(user_id)
+        invs = stripe.Invoice.list(customer=customer_id, limit=24)
+        data = [{
+            "id": inv.id,
+            "number": inv.number,
+            "status": inv.status,
+            "created": inv.created,
+            "total": inv.total,
+            "currency": inv.currency,
+            "invoice_pdf": inv.invoice_pdf,
+        } for inv in invs.auto_paging_iter()]
+        return jsonify({"data": data}), 200
+    except Exception as e:
+        current_app.logger.exception("invoices_get error")
+        return jsonify(error="invoices failed", detail=str(e)), 502
+
+# Compat: tu sync (actualiza metadata en Clerk tras éxito de Checkout)
+@bp.post("/sync")
 @_require_auth
 def sync_after_success():
     _, err = _init_stripe()
@@ -277,13 +366,9 @@ def sync_after_success():
 
     return jsonify(ok=True), 200
 
-# ───────── Endpoint de diagnóstico interno ─────────
+# Diagnóstico
 @bp.get("/_int/stripe-ping")
 def stripe_ping():
-    """
-    Diagnóstico: valida STRIPE_SECRET_KEY en runtime.
-    - Devuelve account id, email y country si la clave es válida.
-    """
     sk, err = _init_stripe()
     if err: return err
     try:
