@@ -378,7 +378,7 @@ def portal_get():
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
 
-# Nuevo: GET /api/billing/summary  (por defecto, del usuario; si quieres, añade ?scope=org)
+# Nuevo: GET /api/billing/summary  (por defecto, del usuario; admite ?scope=org)
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
@@ -392,7 +392,7 @@ def summary_get():
         else:
             customer_id = _ensure_customer_for_user(user_id)
         data = _subscription_summary(customer_id)
-        # Reflejar plan: si es user -> user.public_metadata.plan; si org -> org.public_metadata.seats (derivado)
+        # Reflejar plan/seats en Clerk
         if data.get("subscription_id"):
             if scope == "org" and org_id and _is_org_admin(user_id, org_id):
                 qty = int(data.get("quantity") or 1)
@@ -449,7 +449,15 @@ def invoices_get():
         return jsonify(error="invoices failed", detail=str(e)), 502
 
 
-# Compat (tu front ya lo llamaba): POST /api/sync
+# ── ALIAS ESTABLE: usado por el frontend moderno ──
+@bp.post("/billing/sync")
+@_require_auth
+def billing_sync_alias():
+    # reutiliza la misma lógica del handler principal
+    return sync_after_success()
+
+
+# Compat (fronts antiguos): POST /api/sync
 @bp.post("/sync")
 @_require_auth
 def sync_after_success():
