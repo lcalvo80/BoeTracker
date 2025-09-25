@@ -1,6 +1,6 @@
 import httpx
 from flask import current_app
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 API_BASE = "https://api.clerk.com/v1"
 
@@ -63,38 +63,22 @@ def create_org_for_user(user_id: str, name: str, public: dict | None=None, priva
     r.raise_for_status()
     return r.json()
 
-# Helpers de conveniencia
-def set_user_plan(
-    user_id: str,
-    plan: str,
-    status: str | None = None,
-    extra_private: dict | None=None,
-    extra_public: dict | None=None,
-):
+# Helpers
+def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_private: dict | None=None, extra_public: dict | None=None):
     pub = {"plan": plan}
-    if status is not None:
-        pub["status"] = status
-    if extra_public:
-        pub.update(extra_public)
+    if status is not None: pub["status"] = status
+    if extra_public: pub.update(extra_public)
     priv = extra_private or {}
     return update_user_metadata(user_id, public=pub, private=priv)
 
-def set_org_plan(
-    org_id: str,
-    plan: str,
-    status: str | None = None,
-    extra_private: dict | None=None,
-    extra_public: dict | None=None,
-):
+def set_org_plan(org_id: str, plan: str, status: str | None = None, extra_private: dict | None=None, extra_public: dict | None=None):
     pub = {"plan": plan}
-    if status is not None:
-        pub["status"] = status
-    if extra_public:
-        pub.update(extra_public)
+    if status is not None: pub["status"] = status
+    if extra_public: pub.update(extra_public)
     priv = extra_private or {}
     return update_org_metadata(org_id, public=pub, private=priv)
 
-# ─── Invitado por email: buscar/crear usuario ───
+# (Opcional) invitado enterprise por email
 def find_users_by_email(email: str) -> List[Dict[str, Any]]:
     r = httpx.get(f"{API_BASE}/users", params={"email_address": email}, headers=_headers(), timeout=10)
     r.raise_for_status()
@@ -102,10 +86,7 @@ def find_users_by_email(email: str) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else (data.get("data") or [])
 
 def create_user_skeleton(email: str) -> Dict[str, Any]:
-    payload = {
-        "email_address": [email],
-        "skip_password_requirement": True,  # alta sin password inicial
-    }
+    payload = {"email_address": [email], "skip_password_requirement": True}
     r = httpx.post(f"{API_BASE}/users", headers=_headers(), json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
