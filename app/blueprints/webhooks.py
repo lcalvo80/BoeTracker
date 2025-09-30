@@ -17,18 +17,21 @@ def _init_stripe():
     sk = _cfg("STRIPE_SECRET_KEY", "")
     if not sk:
         return None, (jsonify(error="STRIPE_SECRET_KEY missing"), 500)
-    stripe.api_key = sk
+    if stripe.api_key != sk:
+        stripe.api_key = sk
     return sk, None
 
-def _already_processed(event_id: str) -> bool: return False
-def _mark_processed(event_id: str): pass
+# (Opcional) marca procesados si implementas idempotencia fuera (aquí no persistimos)
+def _mark_processed(event_id: str):
+    # sin DB: no-op
+    return
 
 def _sum_seats_from_subscription(sub: dict) -> int:
-    qty = 0
-    for it in (sub.get("items", {}) or {}).get("data", []) or []:
-        try: qty += int(it.get("quantity") or 0)
-        except: pass
-    return max(qty, 1)
+    try:
+        items = (sub.get("items") or {}).get("data") or []
+        return max(int(items[0].get("quantity") or 0), 0) if items else 0
+    except Exception:
+        return 0
 
 def _ensure_customer_has_entity(customer_id: str, entity_type: str, entity_id: str, entity_email: str | None = None):
     try:
@@ -63,44 +66,44 @@ def stripe_webhook_api():
 
     event_id = event.get("id")
     etype = event.get("type")
-    obj = (event.get("data") or {}).get("object") or {}
-
-    if event_id and _already_processed(event_id):
-        current_app.logger.info(f"[Stripe] duplicate event {event_id} ({etype}) ignored")
-        return jsonify(received=True, dedup=True), 200
+    obj = event.get("data", {}).get("object") or {}
 
     try:
+        # checkout.session.completed
         if etype == "checkout.session.completed":
-            session = obj
-            sub_id = session.get("subscription")
-            customer_id = session.get("customer")
-            meta = session.get("metadata") or {}
-            entity_type = meta.get("entity_type")
-            entity_id = meta.get("entity_id") or meta.get("clerk_user_id") or meta.get("user_id") or meta.get("org_id")
-            entity_email = meta.get("entity_email") or session.get("customer_details", {}).get("email")
+            sess = obj
+            customer_id = sess.get("customer")
+            sub_id = sess.get("subscription")
+            meta = (sess.get("metadata") or {})
+            entity_type = (meta.get("entity_type") or "").strip() or (sess.get("metadata") or {}).get("entity_type")
+            entity_id = (meta.get("entity_id") or "").strip()
+            entity_email = (meta.get("entity_email") or "").strip() or None
+            plan = (meta.get("plan") or "").strip().lower()
 
-            sub = stripe.Subscription.retrieve(sub_id, expand=["items.data.price"]) if sub_id else None
-            status = (sub or {}).get("status") or "active"
-            seats = _sum_seats_from_subscription(sub or {})
-
-            # Invitado enterprise: crear user+org si aún no estaban ligados
-            if (entity_type == "org") and not entity_id and entity_email and customer_id:
+            # cuando fue público enterprise, entity_id puede venir vacío; lo creamos ahora
+            if entity_type == "org" and not entity_id:
                 try:
-                    u = clerk_svc.ensure_user_by_email(entity_email)
-                    uid = u.get("id")
-                    org = clerk_svc.create_org_for_user(uid, f"Org de {entity_email}",
-                        public={"plan": "enterprise", "subscription": "enterprise", "seats": seats})
-                    org_id = org.get("id")
-                    priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
-                    clerk_svc.set_org_plan(org_id, plan="enterprise", status=status, extra_private=priv)
-                    _ensure_customer_has_entity(customer_id, "org", org_id, entity_email)
-                    if event_id: _mark_processed(event_id)
-                    return jsonify(received=True), 200
+                    # buscar por email y/o crear org con comprador invitado luego
+                    # sin DB: creamos org con nombre básico
+                    name = (entity_email or "enterprise").split("@")[0]
+                    # nota: no podemos identificar al admin sin sesión; se gestionará posteriormente en UI
+                    org = clerk_svc.create_org_for_user(user_id=None, name=name)  # user_id=None -> org sin owner en Clerk
+                    entity_id = org.get("id")
+                    # liga customer->org
+                    _ensure_customer_has_entity(customer_id, "org", entity_id, entity_email)
                 except Exception:
                     current_app.logger.exception("[Stripe] guest enterprise provisioning failed")
 
-            if customer_id and entity_type and entity_id:
-                _ensure_customer_has_entity(customer_id, entity_type, entity_id, entity_email)
+            # Refleja estado en Clerk
+            sub = None
+            try:
+                if sub_id:
+                    sub = stripe.Subscription.retrieve(sub_id)
+            except Exception:
+                current_app.logger.exception("[Stripe] retrieve subscription failed")
+
+            status = (sub.get("status") if sub else None) or "active"
+            seats = _sum_seats_from_subscription(sub) if sub else int((meta.get("seats") or "1"))
 
             if entity_type == "user" and entity_id:
                 priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
@@ -113,6 +116,7 @@ def stripe_webhook_api():
                                        extra_private=priv,
                                        extra_public={"seats": seats, "subscription": "enterprise"})
 
+        # customer.subscription.{created,updated,deleted}
         elif etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
             sub = obj
             status = sub.get("status") or "canceled"
@@ -124,27 +128,25 @@ def stripe_webhook_api():
             except Exception:
                 current_app.logger.exception("[Stripe] error retrieving customer")
 
-            md_cust = (cust.get("metadata") if cust else {}) or {}
-            md_sub = (sub.get("metadata") or {}) or {}
-            entity_type = md_cust.get("entity_type") or md_sub.get("entity_type")
-            entity_id = (md_cust.get("entity_id") or md_sub.get("entity_id")
-                         or md_cust.get("clerk_user_id") or md_sub.get("clerk_user_id")
-                         or md_cust.get("user_id") or md_sub.get("user_id")
-                         or md_cust.get("org_id") or md_sub.get("org_id"))
-            entity_email = md_cust.get("entity_email") or md_sub.get("entity_email") or (cust.get("email") if cust else None)
+            md = (cust.get("metadata") if isinstance(cust, dict) else {}) or {}
+            entity_type = md.get("entity_type")
+            entity_id = md.get("entity_id")
+            entity_email = md.get("entity_email")
 
-            if (entity_type == "org") and not entity_id and entity_email and sub.get("customer"):
+            # Si es org “guest” creada por email, crea org y vincula
+            if entity_type == "org" and entity_id in (None, "", " "):
                 try:
-                    u = clerk_svc.ensure_user_by_email(entity_email)
-                    uid = u.get("id")
-                    is_active = status in ("active","trialing","past_due")
-                    org = clerk_svc.create_org_for_user(uid, f"Org de {entity_email}",
-                        public={"plan": ("enterprise" if is_active else "free"),
-                                "subscription": ("enterprise" if is_active else None),
-                                "seats": (seats if is_active else 0)})
+                    name = (entity_email or "enterprise").split("@")[0]
+                    org = clerk_svc.create_org_for_user(user_id=None, name=name)
+                    entity_id = org.get("id")
+                    # actualiza Clerk y Stripe con la relación
+                    clerk_svc.set_org_plan(entity_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
+                                           status=status,
+                                           extra_public={"subscription": ("enterprise" if status in ("active","trialing","past_due") else None),
+                                                         "seats": (seats if status in ("active","trialing","past_due") else 0)})
                     org_id = org.get("id")
                     priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
-                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if is_active else "free"), status=status, extra_private=priv)
+                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"), status=status, extra_private=priv)
                     _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
                     if event_id: _mark_processed(event_id)
                     return jsonify(received=True), 200
@@ -183,9 +185,12 @@ def clerk_webhook_api():
     }
     payload = request.get_data()
     try:
-        event = Webhook(secret).verify(payload, headers)
+        Webhook(secret).verify(payload, headers)
     except WebhookVerificationError:
-        return jsonify(error="invalid svix signature"), 400
+        return jsonify(error="invalid signature"), 400
+
+    try:
+        event = request.get_json() or {}
     except Exception:
         current_app.logger.exception("clerk webhook error")
         return jsonify(error="bad request"), 400
@@ -201,3 +206,9 @@ def clerk_webhook_api():
         current_app.logger.exception("clerk handler error")
 
     return jsonify(ok=True), 200
+
+
+# Alias recomendado: /api/billing/webhook (igual que /api/stripe)
+@bp.post("/billing/webhook")
+def stripe_webhook_api_alias():
+    return stripe_webhook_api()
