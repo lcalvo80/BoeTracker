@@ -8,19 +8,38 @@ import importlib
 from pathlib import Path
 from functools import wraps
 
-from flask import Flask, jsonify, make_response, request, g
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from flask_sock import Sock
 from dotenv import load_dotenv
 
 
+def _normalize_origin(o: str) -> str:
+    o = (o or "").strip()
+    # quita trailing slash
+    if o.endswith("/"):
+        o = o[:-1]
+    return o
+
+
 def _parse_origins():
+    """
+    Prioriza ALLOWED_ORIGINS (coma-separado). Si no, cae a FRONTEND_ORIGIN o FRONTEND_URL.
+    Devuelve una lista de orígenes válidos (sin slash final).
+    """
     raw = os.getenv("ALLOWED_ORIGINS", "").strip()
     if raw:
-        return [o.strip() for o in raw.split(",") if o.strip()]
-    single = os.getenv("FRONTEND_ORIGIN", "").strip()
-    if single:
-        return [single]
+        return [_normalize_origin(o) for o in raw.split(",") if o.strip()]
+
+    # Soporta ambas envs por compatibilidad
+    cand = [
+        os.getenv("FRONTEND_ORIGIN", "").strip(),
+        os.getenv("FRONTEND_URL", "").strip(),
+    ]
+    out = [_normalize_origin(o) for o in cand if o]
+    if out:
+        return out
+
     # fallback dev
     return ["http://localhost:3000", "http://localhost:5173"]
 
@@ -56,12 +75,6 @@ def create_app(config: dict | None = None):
         p = Path(app.root_path).parent / rel
         app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
 
-    # ── Preflight universal /api/* ──
-    @app.before_request
-    def _short_circuit_preflight():
-        if request.method == "OPTIONS" and request.path.startswith("/api/"):
-            return make_response(("", 204))
-
     # ── Config ──
     app.config.update(
         FRONTEND_URL=os.getenv("FRONTEND_URL", "http://localhost:5173"),
@@ -86,15 +99,26 @@ def create_app(config: dict | None = None):
 
     # ── CORS (solo /api/*) ──
     origins = _parse_origins()
+    app.logger.info(f"[init] CORS origins = {origins}")
+
+    # Importante:
+    # - allow_headers="*" para evitar problemas con mayúsculas/minúsculas y headers adicionales
+    # - supports_credentials=True (por si algún flujo usa cookies); para Authorization no es obligatorio
     CORS(
         app,
-        resources={r"/api/.*": {"origins": origins}},
+        resources={r"/api/*": {"origins": origins}},
         supports_credentials=True,
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Debug-Filters"],
+        allow_headers="*",
         expose_headers=["X-Total-Count", "Content-Range"],
         max_age=86400,
     )
+
+    # ❌ Eliminamos el short-circuit manual de preflight; dejamos que Flask-CORS gestione OPTIONS
+    # @app.before_request
+    # def _short_circuit_preflight():
+    #     if request.method == "OPTIONS" and request.path.startswith("/api/"):
+    #         return ("", 204)
 
     # ── Registro de blueprints de forma robusta ──
     MODULE_ROOTS = ["app.blueprints", "app.routes"]
@@ -142,7 +166,7 @@ def create_app(config: dict | None = None):
     register_bp("items", "bp")
     register_bp("comments", "bp")
     register_bp("compat", "bp")
-    register_bp("enterprise", "bp")  # ✅ registra Enterprise (gestión de usuarios/org)
+    register_bp("enterprise", "bp")  # ✅ enterprise
 
     # Alias coherentes bajo /api/* para endpoints legacy sin prefijo (si existe)
     register_bp("api_alias", "bp")
@@ -179,6 +203,7 @@ def create_app(config: dict | None = None):
         app.logger.info("[init] Auth decorator cargado: app.auth.require_clerk_auth")
     except Exception as e:
         app.logger.warning(f"[init] Auth no disponible ({e}); /api/_int/claims devolverá 501")
+
         def _auth_deco(fn):
             @wraps(fn)
             def wrapper(*args, **kwargs):
