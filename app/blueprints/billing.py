@@ -1,23 +1,36 @@
+# app/blueprints/billing.py
 from __future__ import annotations
-import os
-import stripe
-import requests
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
-
+import os, stripe, requests
+from typing import Optional, Dict, Any
 from flask import Blueprint, request, jsonify, current_app, g
-
-from app.services import clerk_svc  # <<< usamos helpers unificados
+from app.services import clerk_svc  # helpers de Clerk (get_user, get_org, update_*, create_org_for_user)
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
-# ─────────── helpers compatibilidad precios Stripe ───────────
+# ─────────── helpers config ───────────
+def _cfg(k: str, default: str | None = None) -> str | None:
+    try:
+        v = current_app.config.get(k)
+    except Exception:
+        v = None
+    if v is None or str(v).strip() == "":
+        v = os.getenv(k, default)
+    return v
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+def _front_base() -> str:
+    return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
+
+def _init_stripe():
+    sk = _cfg("STRIPE_SECRET_KEY")
+    if not sk:
+        return None, (jsonify(error="Missing STRIPE_SECRET_KEY"), 500)
+    stripe.api_key = sk
+    return sk, None
+
 def _get_price(kind: str) -> str | None:
-    """
-    Devuelve el price_id de Stripe aceptando múltiples nombres de env por compatibilidad.
-    kind: "pro_monthly" | "pro_yearly" | "enterprise_seat"
-    Prioridad: STRIPE_* luego *_ID legados.
-    """
     def first(*keys):
         for kk in keys:
             v = _cfg(kk)
@@ -33,38 +46,11 @@ def _get_price(kind: str) -> str | None:
         return first("STRIPE_PRICE_ENTERPRISE_SEAT", "STRIPE_PRICE_ENTERPRISE_SEAT_ID", "PRICE_ENTERPRISE_SEAT_ID")
     return None
 
-# ───────────────── helpers de config ─────────────────
-def _cfg(k: str, default: str | None = None) -> str | None:
-    try:
-        v = current_app.config.get(k)
-    except Exception:
-        v = None
-    if v is None or str(v).strip() == "":
-        v = os.getenv(k, default)
-    return v
-
-def _truthy(v: str | None) -> bool:
-    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
-
-def _init_stripe():
-    sk = _cfg("STRIPE_SECRET_KEY")
-    if not sk:
-        return None, (jsonify(error="Missing STRIPE_SECRET_KEY"), 500)
-    try:
-        stripe.api_key = sk
-        return sk, None
-    except Exception:
-        return None, (jsonify(error="Stripe init failed"), 500)
-
-def _front_base() -> str:
-    return (_cfg("FRONTEND_URL", "http://localhost:5173") or "").rstrip("/")
-
-# Solo valores válidos para Stripe: 'auto' | 'never'
 def _update_mode(v: str | None, default: str = "auto") -> str:
     s = (v or default).strip().lower()
     return "auto" if s in ("auto", "1", "true", "yes", "on") else "never"
 
-# ───────────────── auth guard ─────────────────
+# ─────────── auth guard ───────────
 def _load_auth_guard():
     if _truthy(_cfg("DISABLE_AUTH", "0") or "0"):
         def _noop(fn):
@@ -75,18 +61,12 @@ def _load_auth_guard():
         return _noop
     from app.auth import require_clerk_auth
     return require_clerk_auth
-
 _require_auth = _load_auth_guard()
 
-# ───────────────── helpers identidad/org ─────────────────
+# ─────────── identidad ───────────
 def _derive_identity():
     c = getattr(g, "clerk", {}) or {}
-    user_id = c.get("user_id")
-    email = c.get("email")
-    name = c.get("name")
-    org_id = c.get("org_id")
-    raw = c.get("raw_claims") or {}
-    return user_id, email, name, org_id, raw
+    return c.get("user_id"), c.get("email"), c.get("name"), c.get("org_id"), c.get("raw_claims") or {}
 
 def _is_org_admin(user_id: str, org_id: str) -> bool:
     try:
@@ -96,22 +76,10 @@ def _is_org_admin(user_id: str, org_id: str) -> bool:
     except Exception:
         return False
 
-# ───────────────── Stripe helpers (customer y estado) ─────────────────
-def _search_customer_by_email(email: str) -> Optional[str]:
-    _, err = _init_stripe()
-    if err: return None
-    try:
-        res = stripe.Customer.search(query=f"email:'{email}'", limit=1)
-        for c in res.auto_paging_iter():
-            return c.id
-    except Exception:
-        pass
-    return None
-
+# ─────────── customers helpers ───────────
 def _ensure_customer_for_user(user_id: str) -> str:
     _, err = _init_stripe()
     if err: raise RuntimeError("stripe init failed")
-
     try:
         u = clerk_svc.get_user(user_id)
         priv = (u.get("private_metadata") or {})
@@ -122,11 +90,6 @@ def _ensure_customer_for_user(user_id: str) -> str:
         name = ((u.get("first_name") or "") + " " + (u.get("last_name") or "")).strip() or u.get("username") or user_id
     except Exception:
         email, name = "", user_id
-
-    cid = _search_customer_by_email(email)
-    if cid:
-        return cid
-
     c = stripe.Customer.create(email=email or None, name=name or None, metadata={"entity_type": "user", "entity_id": user_id})
     try:
         clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": c.id}})
@@ -144,20 +107,17 @@ def _ensure_customer_for_org(org_id: str) -> str:
         if existing:
             return existing
         name = (org.get("name") or f"org-{org_id}")
-        email = None
     except Exception:
-        name, email = f"org-{org_id}", None
-
-    c = stripe.Customer.create(email=email or None, name=name or None, metadata={"entity_type": "org", "entity_id": org_id})
+        name = f"org-{org_id}"
+    c = stripe.Customer.create(name=name or None, metadata={"entity_type": "org", "entity_id": org_id})
     try:
         clerk_svc.update_org_metadata(org_id, private={"billing": {"stripeCustomerId": c.id}})
     except Exception:
         current_app.logger.exception("cannot persist stripeCustomerId on clerk org")
     return c.id
 
-# ───────────────── Endpoints ─────────────────
+# ─────────── Endpoints ───────────
 
-# POST /api/billing/portal { context: "user"|"org" }
 @bp.post("/billing/portal")
 @_require_auth
 def portal_post():
@@ -180,7 +140,6 @@ def portal_post():
         current_app.logger.exception("portal_post error")
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
-# Nuevo (GET): /api/billing/portal -> { url }
 @bp.get("/billing/portal")
 @_require_auth
 def portal_get():
@@ -199,7 +158,6 @@ def portal_get():
         current_app.logger.exception("Error creando portal (GET)")
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
-# GET /api/billing/summary  (user por defecto; admite ?scope=org)
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
@@ -215,31 +173,23 @@ def summary_get():
         else:
             customer_id = _ensure_customer_for_user(user_id)
 
-        subs = stripe.Subscription.list(customer=customer_id, limit=5, status="all")
-        sub = None
-        for s in subs.auto_paging_iter():
-            sub = s; break
-        status = (sub.get("status") or "canceled") if sub else "canceled"
-        plan = None
-        seats = 0
+        subs = stripe.Subscription.list(customer=customer_id, limit=1, status="all")
+        sub = next(iter(subs.auto_paging_iter()), None)
+        status = (sub.get("status") if sub else "canceled") or "canceled"
         if scope == "org":
             plan = "enterprise" if status in ("active","trialing","past_due") else "free"
-            if sub and sub.get("items", {}).get("data"):
-                seats = int(sub["items"]["data"][0]["quantity"] or 0)
+            seats = int(sub["items"]["data"][0]["quantity"] or 0) if sub and sub.get("items", {}).get("data") else 0
+            return jsonify({"status": status, "plan": plan, "seats": seats}), 200
         else:
             plan = "pro" if status in ("active","trialing","past_due") else "free"
-        return jsonify({"status": status, "plan": plan, "seats": seats}), 200
+            return jsonify({"status": status, "plan": plan}), 200
     except Exception as e:
         current_app.logger.exception("summary_get failed")
         return jsonify(error="summary failed", detail=str(e)), 502
 
-# POST /api/billing/sync
 @bp.post("/billing/sync")
 @_require_auth
 def billing_sync():
-    """
-    Relee Stripe (por customer) y refleja metadata en Clerk.
-    """
     _, err = _init_stripe()
     if err: return err
     body = request.get_json(silent=True) or {}
@@ -255,50 +205,38 @@ def billing_sync():
             customer_id = _ensure_customer_for_user(user_id)
 
         subs = stripe.Subscription.list(customer=customer_id, limit=1, status="all")
-        sub = None
-        for s in subs.auto_paging_iter():
-            sub = s; break
-
+        sub = next(iter(subs.auto_paging_iter()), None)
         status = (sub.get("status") if sub else "canceled") or "canceled"
+
         if scope == "org":
             org_id = _derive_identity()[3]
             qty = (sub["items"]["data"][0]["quantity"] if sub and sub["items"]["data"] else 0)
-            try:
-                clerk_svc.update_org_metadata(
-                    org_id,
-                    public={"subscription": ("enterprise" if status in ("active","trialing","past_due") else None),
-                            "seats": qty},
-                    private={"billing": {"stripeCustomerId": sub.get("customer") if sub else None,
-                                         "subscriptionId": sub.get("id") if sub else None,
-                                         "status": status}},
-                )
-            except Exception:
-                current_app.logger.exception("sync org metadata failed")
+            clerk_svc.update_org_metadata(
+                org_id,
+                public={"subscription": ("enterprise" if status in ("active","trialing","past_due") else None),
+                        "seats": qty},
+                private={"billing": {"stripeCustomerId": sub.get("customer") if sub else None,
+                                     "subscriptionId": sub.get("id") if sub else None,
+                                     "status": status}},
+            )
         else:
             user_id = _derive_identity()[0]
-            try:
-                clerk_svc.update_user_metadata(
-                    user_id,
-                    public={"subscription": ("pro" if status in ("active","trialing","past_due") else None)},
-                    private={"billing": {"stripeCustomerId": sub.get("customer") if sub else None,
-                                         "subscriptionId": sub.get("id") if sub else None,
-                                         "status": status}},
-                )
-            except Exception:
-                current_app.logger.exception("sync user metadata failed")
+            clerk_svc.update_user_metadata(
+                user_id,
+                public={"subscription": ("pro" if status in ("active","trialing","past_due") else None)},
+                private={"billing": {"stripeCustomerId": sub.get("customer") if sub else None,
+                                     "subscriptionId": sub.get("id") if sub else None,
+                                     "status": status}},
+            )
 
         return jsonify(ok=True, status=status), 200
     except Exception as e:
         current_app.logger.exception("billing_sync failed")
         return jsonify(error="sync failed", detail=str(e)), 502
 
-# POST /api/billing/checkout/pro
 @bp.post("/billing/checkout/pro")
 @_require_auth
 def checkout_pro():
-    """
-    Body: { interval: "monthly"|"yearly" (default monthly) }
-    """
     _, err = _init_stripe()
     if err: return err
     body = request.get_json(silent=True) or {}
@@ -339,12 +277,11 @@ def checkout_pro():
         current_app.logger.exception("create pro checkout failed")
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
-# POST /api/billing/checkout/enterprise
 @bp.post("/billing/checkout/enterprise")
 @_require_auth
 def checkout_enterprise():
     """
-    Body: { seats: number, org_id?: string } -> {url}
+    Body: { seats: number, org_id?: string } → { url }
     Si no se pasa org_id, se crea una organización para el comprador (admin).
     """
     _, err = _init_stripe()
@@ -354,7 +291,8 @@ def checkout_enterprise():
         seats = int(body.get("seats") or 1)
     except Exception:
         seats = 1
-    if seats < 1: seats = 1
+    if seats < 1:
+        seats = 1
 
     price_id = (_get_price("enterprise_seat") or "").strip()
     if not price_id:
@@ -388,9 +326,6 @@ def checkout_enterprise():
     success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
-    address_mode = _update_mode(_cfg("STRIPE_SAVE_ADDRESS_AUTO"), "auto")
-    name_mode    = _update_mode(_cfg("STRIPE_SAVE_NAME_AUTO"), "auto")
-
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
@@ -405,7 +340,8 @@ def checkout_enterprise():
                       "entity_email": user_email or "", "entity_name": user_name or "", "seats": str(seats)},
             tax_id_collection={"enabled": True},
             automatic_tax={"enabled": True},
-            customer_update={"address": address_mode, "name": name_mode},
+            customer_update={"address": _update_mode(_cfg("STRIPE_SAVE_ADDRESS_AUTO"), "auto"),
+                             "name": _update_mode(_cfg("STRIPE_SAVE_NAME_AUTO"), "auto")},
             locale=_cfg("STRIPE_CHECKOUT_LOCALE", "auto"),
         )
         return jsonify(url=session.url), 200
@@ -413,14 +349,8 @@ def checkout_enterprise():
         current_app.logger.exception("create enterprise checkout failed")
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
-# POST /api/public/enterprise-checkout  (guest flow)
 @bp.post("/public/enterprise-checkout")
 def public_enterprise_checkout():
-    """
-    Body: { email: string, seats?: number, price_id?: string } -> { url }
-    - Crea Customer "guest" con metadata (entity_type=org) y genera checkout de seats.
-    - En el webhook de Stripe se aprovisiona/actualiza la org.
-    """
     _, err = _init_stripe()
     if err: return err
 
@@ -469,7 +399,6 @@ def public_enterprise_checkout():
         current_app.logger.exception("create public enterprise checkout failed")
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
-# Diagnóstico
 @bp.get("/_int/stripe-ping")
 def stripe_ping():
     sk, err = _init_stripe()

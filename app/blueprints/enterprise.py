@@ -76,13 +76,13 @@ def _list_invitations(org_id: str) -> List[dict]:
 
 # ───────── endpoints ─────────
 
-# Alias doble por compatibilidad (/org/create y /create-org)
+# Alias por compatibilidad: /org/create y /create-org
 @bp.post("/org/create")
 @bp.post("/create-org")
 @require_clerk_auth
 def create_org():
     """
-    Crea la organización en Clerk y asigna al usuario actual como admin.
+    Crea la organización en Clerk y asigna al usuario actual como admin (created_by).
     Body: { name: string, seats?: number }
     """
     body = request.get_json(silent=True) or {}
@@ -95,23 +95,16 @@ def create_org():
         seats = 0
 
     try:
-        # 1) Crear organización
-        r = requests.post(f"{_base()}/organizations", headers=_headers_json(), json={"name": name}, timeout=10)
-        r.raise_for_status()
-        org = r.json()
+        user_id, _ = _current_user_ids()
+
+        # 1) Crear organización con created_by → Clerk crea membership admin automáticamente
+        create_payload = {"name": name, "created_by": user_id}
+        res = requests.post(f"{_base()}/organizations", headers=_headers_json(), json=create_payload, timeout=10)
+        res.raise_for_status()
+        org = res.json()
         org_id = org.get("id")
 
-        # 2) Asignar admin al caller
-        user_id, _ = _current_user_ids()
-        r2 = requests.post(
-            f"{_base()}/organizations/{org_id}/memberships",
-            headers=_headers_json(),
-            json={"user_id": user_id, "role": "admin"},
-            timeout=10,
-        )
-        r2.raise_for_status()
-
-        # 3) Metadata inicial
+        # 2) Metadata inicial
         public_md = {"plan": "enterprise_draft"}
         if seats > 0:
             public_md["seats"] = seats
@@ -123,12 +116,13 @@ def create_org():
                 timeout=10,
             )
         except Exception:
-            pass
+            current_app.logger.warning("[enterprise] org public_metadata patch failed (non-fatal)")
 
         return jsonify({"id": org_id, "name": org.get("name"), "seats": public_md.get("seats", 0)}), 201
+
     except requests.HTTPError:
         try:
-            return jsonify(error="clerk error", detail=r.text), r.status_code  # type: ignore[name-defined]
+            return jsonify(error="clerk error", detail=res.text), res.status_code  # type: ignore[name-defined]
         except Exception:
             return jsonify(error="clerk error"), 502
     except Exception as e:
@@ -213,7 +207,7 @@ def list_users():
 
 @bp.post("/invite")
 @require_clerk_auth
-def invite_user():  # ← mantenemos el nombre para que coincida con tu listado
+def invite_user():  # nombre alineado con tus rutas registradas
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify(error="organization required"), 403
@@ -234,7 +228,7 @@ def invite_user():  # ← mantenemos el nombre para que coincida con tu listado
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
-    # guard de seats
+    # seat guard
     try:
         org = _get_org(org_id)
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
