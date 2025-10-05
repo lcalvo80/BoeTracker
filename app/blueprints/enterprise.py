@@ -28,9 +28,7 @@ def _base() -> str:
 
 def _map_role_out(role: str) -> str:
     r = (role or "").strip().lower()
-    if r in ("basic_member", "member"):
-        return "member"
-    if r == "admin":
+    if r in ("admin", "owner"):
         return "admin"
     return "member"
 
@@ -39,7 +37,10 @@ def _map_role_in(role: str) -> str:
 
 def _current_user_ids() -> tuple[str, Optional[str]]:
     c = getattr(g, "clerk", {}) or {}
-    return c.get("user_id"), c.get("org_id")
+    # override opcional (útil para Postman y casos sin org activa todavía)
+    org_from_req = request.headers.get("X-Org-Id") or request.args.get("org_id")
+    org_id = org_from_req or c.get("org_id")
+    return c.get("user_id"), org_id
 
 def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
     try:
@@ -48,7 +49,8 @@ def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
         res.raise_for_status()
         data = res.json()
         arr = data if isinstance(data, list) else data.get("data") or []
-        return bool(arr and (arr[0].get("role") or "").lower() == "admin")
+        role = (arr[0].get("role") or "").lower() if arr else ""
+        return role in ("admin", "owner")
     except Exception as e:
         current_app.logger.warning(f"[enterprise] membership check skipped: {e}")
         return False
@@ -76,13 +78,13 @@ def _list_invitations(org_id: str) -> List[dict]:
 
 # ───────── endpoints ─────────
 
-# Alias por compatibilidad: /org/create y /create-org
+# Alias doble por compatibilidad (/org/create y /create-org)
 @bp.post("/org/create")
 @bp.post("/create-org")
 @require_clerk_auth
 def create_org():
     """
-    Crea la organización en Clerk y asigna al usuario actual como admin (created_by).
+    Crea la organización en Clerk y asigna al usuario actual como owner/admin.
     Body: { name: string, seats?: number }
     """
     body = request.get_json(silent=True) or {}
@@ -97,14 +99,18 @@ def create_org():
     try:
         user_id, _ = _current_user_ids()
 
-        # 1) Crear organización con created_by → Clerk crea membership admin automáticamente
-        create_payload = {"name": name, "created_by": user_id}
-        res = requests.post(f"{_base()}/organizations", headers=_headers_json(), json=create_payload, timeout=10)
-        res.raise_for_status()
-        org = res.json()
+        # 1) Crear org con created_by => el caller queda como owner automáticamente
+        r = requests.post(
+            f"{_base()}/organizations",
+            headers=_headers_json(),
+            json={"name": name, "created_by": user_id},
+            timeout=10,
+        )
+        r.raise_for_status()
+        org = r.json()
         org_id = org.get("id")
 
-        # 2) Metadata inicial
+        # 2) Metadata inicial (plan draft y seats tentativos)
         public_md = {"plan": "enterprise_draft"}
         if seats > 0:
             public_md["seats"] = seats
@@ -116,15 +122,16 @@ def create_org():
                 timeout=10,
             )
         except Exception:
-            current_app.logger.warning("[enterprise] org public_metadata patch failed (non-fatal)")
+            pass
 
         return jsonify({"id": org_id, "name": org.get("name"), "seats": public_md.get("seats", 0)}), 201
 
-    except requests.HTTPError:
+    except requests.HTTPError as e:
+        # devolvemos el cuerpo real del fallo de Clerk si existe
         try:
-            return jsonify(error="clerk error", detail=res.text), res.status_code  # type: ignore[name-defined]
+            return jsonify(error="clerk error", detail=e.response.json()), e.response.status_code  # type: ignore[attr-defined]
         except Exception:
-            return jsonify(error="clerk error"), 502
+            return jsonify(error="clerk error", detail=str(e)), 502
     except Exception as e:
         current_app.logger.exception("[enterprise] create_org failed: %s", e)
         return jsonify(error="create_org failed", detail=str(e)), 500
@@ -136,6 +143,7 @@ def org_info():
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify({"id": None, "name": None, "seats": 0, "used_seats": 0, "pending_invites": 0, "current_user_role": None})
+
     try:
         org = _get_org(org_id)
         members = _list_memberships(org_id)
@@ -207,7 +215,7 @@ def list_users():
 
 @bp.post("/invite")
 @require_clerk_auth
-def invite_user():  # nombre alineado con tus rutas registradas
+def invite_user():
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify(error="organization required"), 403
@@ -228,7 +236,7 @@ def invite_user():  # nombre alineado con tus rutas registradas
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
-    # seat guard
+    # guard de seats
     try:
         org = _get_org(org_id)
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
@@ -302,11 +310,11 @@ def remove_user():
         )
         res.raise_for_status()
         return jsonify({"ok": True}), 200
-    except requests.HTTPError:
+    except requests.HTTPError as e:
         try:
-            return jsonify(res.json()), res.status_code  # type: ignore[name-defined]
+            return jsonify(e.response.json()), e.response.status_code  # type: ignore[attr-defined]
         except Exception:
-            return jsonify(error="clerk membership delete failed"), res.status_code  # type: ignore[name-defined]
+            return jsonify(error="clerk membership delete failed"), 502
     except Exception as e:
         current_app.logger.exception("[enterprise] delete membership failed: %s", e)
         return jsonify(error="clerk membership delete failed"), 502
@@ -349,11 +357,11 @@ def update_role():
         )
         res.raise_for_status()
         return jsonify({"ok": True}), 200
-    except requests.HTTPError:
+    except requests.HTTPError as e:
         try:
-            return jsonify(res.json()), res.status_code  # type: ignore[name-defined]
+            return jsonify(e.response.json()), e.response.status_code  # type: ignore[attr-defined]
         except Exception:
-            return jsonify(error="clerk membership update failed"), res.status_code  # type: ignore[name-defined]
+            return jsonify(error="clerk membership update failed"), 502
     except Exception as e:
         current_app.logger.exception("[enterprise] update role failed: %s", e)
         return jsonify(error="clerk membership update failed"), 502
@@ -388,11 +396,11 @@ def set_seats():
         )
         res.raise_for_status()
         return jsonify({"ok": True}), 200
-    except requests.HTTPError:
+    except requests.HTTPError as e:
         try:
-            return jsonify(res.json()), res.status_code  # type: ignore[name-defined]
+            return jsonify(e.response.json()), e.response.status_code  # type: ignore[attr-defined]
         except Exception:
-            return jsonify(error="clerk org update failed"), res.status_code  # type: ignore[name-defined]
+            return jsonify(error="clerk org update failed"), 502
     except Exception as e:
         current_app.logger.exception("[enterprise] set seats failed: %s", e)
         return jsonify(error="clerk org update failed"), 502

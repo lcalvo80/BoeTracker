@@ -1,6 +1,6 @@
 # app/blueprints/billing.py
 from __future__ import annotations
-import os, stripe, requests
+import os, stripe, requests  # requests puede no usarse directamente; lo mantenemos por paridad con otros módulos
 from typing import Optional, Dict, Any
 from flask import Blueprint, request, jsonify, current_app, g
 from app.services import clerk_svc  # helpers de Clerk (get_user, get_org, update_*, create_org_for_user)
@@ -46,6 +46,7 @@ def _get_price(kind: str) -> str | None:
         return first("STRIPE_PRICE_ENTERPRISE_SEAT", "STRIPE_PRICE_ENTERPRISE_SEAT_ID", "PRICE_ENTERPRISE_SEAT_ID")
     return None
 
+# Solo valores válidos para Stripe portal/customer_update: 'auto' | 'never'
 def _update_mode(v: str | None, default: str = "auto") -> str:
     s = (v or default).strip().lower()
     return "auto" if s in ("auto", "1", "true", "yes", "on") else "never"
@@ -118,6 +119,7 @@ def _ensure_customer_for_org(org_id: str) -> str:
 
 # ─────────── Endpoints ───────────
 
+# POST /api/billing/portal { context: "user"|"org" }
 @bp.post("/billing/portal")
 @_require_auth
 def portal_post():
@@ -140,12 +142,15 @@ def portal_post():
         current_app.logger.exception("portal_post error")
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
+# GET /api/billing/portal
 @bp.get("/billing/portal")
 @_require_auth
 def portal_get():
     _, err = _init_stripe()
     if err: return err
-    user_id, _, _, org_id, _ = _derive_identity()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
+    # override opcional vía query (?org_id=) por si aún no está activa en la sesión
+    org_id = request.args.get("org_id") or ctx_org_id
     try:
         if org_id and _is_org_admin(user_id, org_id):
             customer_id = _ensure_customer_for_org(org_id)
@@ -158,17 +163,17 @@ def portal_get():
         current_app.logger.exception("Error creando portal (GET)")
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
+# GET /api/billing/summary  (?scope=user|org&org_id=org_...)
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
     _, err = _init_stripe()
     if err: return err
     scope = (request.args.get("scope") or "user").lower()
-    user_id, _, _, org_id, _ = _derive_identity()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
+    org_id = request.args.get("org_id") or ctx_org_id
     try:
-        if scope == "org":
-            if not org_id or not _is_org_admin(user_id, org_id):
-                return jsonify(error="forbidden"), 403
+        if scope == "org" and org_id and _is_org_admin(user_id, org_id):
             customer_id = _ensure_customer_for_org(org_id)
         else:
             customer_id = _ensure_customer_for_user(user_id)
@@ -177,16 +182,50 @@ def summary_get():
         sub = next(iter(subs.auto_paging_iter()), None)
         status = (sub.get("status") if sub else "canceled") or "canceled"
         if scope == "org":
-            plan = "enterprise" if status in ("active","trialing","past_due") else "free"
+            plan = "enterprise" if status in ("active", "trialing", "past_due") else "free"
             seats = int(sub["items"]["data"][0]["quantity"] or 0) if sub and sub.get("items", {}).get("data") else 0
             return jsonify({"status": status, "plan": plan, "seats": seats}), 200
         else:
-            plan = "pro" if status in ("active","trialing","past_due") else "free"
+            plan = "pro" if status in ("active", "trialing", "past_due") else "free"
             return jsonify({"status": status, "plan": plan}), 200
     except Exception as e:
         current_app.logger.exception("summary_get failed")
         return jsonify(error="summary failed", detail=str(e)), 502
 
+# GET /api/billing/invoices  (?scope=user|org&org_id=org_...)
+@bp.get("/billing/invoices")
+@_require_auth
+def invoices_get():
+    _, err = _init_stripe()
+    if err: return err
+    scope = (request.args.get("scope") or "user").lower()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
+    org_id = request.args.get("org_id") or ctx_org_id
+    try:
+        if scope == "org" and org_id and _is_org_admin(user_id, org_id):
+            customer_id = _ensure_customer_for_org(org_id)
+        else:
+            customer_id = _ensure_customer_for_user(user_id)
+
+        invs = stripe.Invoice.list(customer=customer_id, limit=24)
+        out = []
+        for inv in invs.auto_paging_iter():
+            out.append({
+                "id": inv.get("id"),
+                "number": inv.get("number"),
+                "status": inv.get("status"),
+                "paid": inv.get("paid"),
+                "total": inv.get("total"),
+                "currency": inv.get("currency"),
+                "hosted_invoice_url": inv.get("hosted_invoice_url"),
+                "created": inv.get("created"),
+            })
+        return jsonify({"data": out}), 200
+    except Exception as e:
+        current_app.logger.exception("invoices_get failed")
+        return jsonify(error="invoices failed", detail=str(e)), 502
+
+# POST /api/billing/sync
 @bp.post("/billing/sync")
 @_require_auth
 def billing_sync():
@@ -234,6 +273,7 @@ def billing_sync():
         current_app.logger.exception("billing_sync failed")
         return jsonify(error="sync failed", detail=str(e)), 502
 
+# POST /api/billing/checkout/pro
 @bp.post("/billing/checkout/pro")
 @_require_auth
 def checkout_pro():
@@ -277,6 +317,7 @@ def checkout_pro():
         current_app.logger.exception("create pro checkout failed")
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
+# POST /api/billing/checkout/enterprise
 @bp.post("/billing/checkout/enterprise")
 @_require_auth
 def checkout_enterprise():
@@ -349,6 +390,7 @@ def checkout_enterprise():
         current_app.logger.exception("create enterprise checkout failed")
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
+# POST /api/public/enterprise-checkout
 @bp.post("/public/enterprise-checkout")
 def public_enterprise_checkout():
     _, err = _init_stripe()
@@ -399,6 +441,7 @@ def public_enterprise_checkout():
         current_app.logger.exception("create public enterprise checkout failed")
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
+# Diagnóstico Stripe
 @bp.get("/_int/stripe-ping")
 def stripe_ping():
     sk, err = _init_stripe()
