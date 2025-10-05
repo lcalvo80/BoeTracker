@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 
 def _normalize_origin(o: str) -> str:
     o = (o or "").strip()
-    # quita trailing slash
     if o.endswith("/"):
         o = o[:-1]
     return o
@@ -31,7 +30,6 @@ def _parse_origins():
     if raw:
         return [_normalize_origin(o) for o in raw.split(",") if o.strip()]
 
-    # Soporta ambas envs por compatibilidad
     cand = [
         os.getenv("FRONTEND_ORIGIN", "").strip(),
         os.getenv("FRONTEND_URL", "").strip(),
@@ -61,7 +59,7 @@ def create_app(config: dict | None = None):
         "app/blueprints/comments.py",
         "app/blueprints/compat.py",
         "app/blueprints/api_alias.py",
-        "app/blueprints/enterprise.py",  # diagnóstico
+        "app/blueprints/enterprise.py",
         # legacy (si existieran, se intentarán registrar)
         "app/routes/debug.py",
         "app/routes/billing.py",
@@ -101,33 +99,20 @@ def create_app(config: dict | None = None):
     origins = _parse_origins()
     app.logger.info(f"[init] CORS origins = {origins}")
 
-    # Importante:
-    # - allow_headers="*" para evitar problemas con mayúsculas/minúsculas y headers adicionales
-    # - supports_credentials=True (por si algún flujo usa cookies); para Authorization no es obligatorio
     CORS(
         app,
         resources={r"/api/*": {"origins": origins}},
-        supports_credentials=True,
+        supports_credentials=True,                 # no necesario para Bearer, pero no molesta
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers="*",
+        allow_headers="*",                         # evita líos con Authorization/Content-Type
         expose_headers=["X-Total-Count", "Content-Range"],
         max_age=86400,
     )
-
-    # ❌ Eliminamos el short-circuit manual de preflight; dejamos que Flask-CORS gestione OPTIONS
-    # @app.before_request
-    # def _short_circuit_preflight():
-    #     if request.method == "OPTIONS" and request.path.startswith("/api/"):
-    #         return ("", 204)
 
     # ── Registro de blueprints de forma robusta ──
     MODULE_ROOTS = ["app.blueprints", "app.routes"]
 
     def register_bp(module_name: str, attr: str) -> bool:
-        """
-        Busca module_name en app.blueprints y app.routes; si lo encuentra,
-        registra su atributo 'attr' (normalmente 'bp').
-        """
         errors = []
         for root in MODULE_ROOTS:
             module_path = f"{root}.{module_name}"
@@ -146,7 +131,7 @@ def create_app(config: dict | None = None):
                 continue
 
             try:
-                app.register_blueprint(bp)  # respeta url_prefix del propio BP
+                app.register_blueprint(bp)
                 app.logger.info(f"[init] Registrado BP '{bp.name}' de {module_path}")
                 return True
             except Exception as e:
@@ -159,17 +144,15 @@ def create_app(config: dict | None = None):
             app.logger.info(f"[init] No se encontró módulo '{module_name}' en {MODULE_ROOTS}")
         return False
 
-    # Blueprints principales (si alguno no existe, no pasa nada)
+    # Blueprints
     register_bp("debug", "bp")
     register_bp("billing", "bp")
     register_bp("webhooks", "bp")
     register_bp("items", "bp")
     register_bp("comments", "bp")
     register_bp("compat", "bp")
-    register_bp("enterprise", "bp")  # ✅ enterprise
-
-    # Alias coherentes bajo /api/* para endpoints legacy sin prefijo (si existe)
-    register_bp("api_alias", "bp")
+    register_bp("enterprise", "bp")
+    register_bp("api_alias", "bp")  # alias coherentes
 
     # ── Fallback de debug GARANTIZADO en /api/_int ──
     from flask import Blueprint
@@ -197,7 +180,7 @@ def create_app(config: dict | None = None):
         }
         return jsonify(cfg), 200
 
-    # ── claims: SIEMPRE montado. Si no hay auth, responde 501 ──
+    # claims interno (protección condicional si no hay auth)
     try:
         from .auth import require_clerk_auth as _auth_deco
         app.logger.info("[init] Auth decorator cargado: app.auth.require_clerk_auth")

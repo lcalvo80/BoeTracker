@@ -37,7 +37,6 @@ def _map_role_in(role: str) -> str:
 
 def _current_user_ids() -> tuple[str, Optional[str]]:
     c = getattr(g, "clerk", {}) or {}
-    # override opcional (útil para Postman y casos sin org activa todavía)
     org_from_req = request.headers.get("X-Org-Id") or request.args.get("org_id")
     org_id = org_from_req or c.get("org_id")
     return c.get("user_id"), org_id
@@ -78,7 +77,6 @@ def _list_invitations(org_id: str) -> List[dict]:
 
 # ───────── endpoints ─────────
 
-# Alias doble por compatibilidad (/org/create y /create-org)
 @bp.post("/org/create")
 @bp.post("/create-org")
 @require_clerk_auth
@@ -99,7 +97,6 @@ def create_org():
     try:
         user_id, _ = _current_user_ids()
 
-        # 1) Crear org con created_by => el caller queda como owner automáticamente
         r = requests.post(
             f"{_base()}/organizations",
             headers=_headers_json(),
@@ -110,7 +107,6 @@ def create_org():
         org = r.json()
         org_id = org.get("id")
 
-        # 2) Metadata inicial (plan draft y seats tentativos)
         public_md = {"plan": "enterprise_draft"}
         if seats > 0:
             public_md["seats"] = seats
@@ -127,7 +123,6 @@ def create_org():
         return jsonify({"id": org_id, "name": org.get("name"), "seats": public_md.get("seats", 0)}), 201
 
     except requests.HTTPError as e:
-        # devolvemos el cuerpo real del fallo de Clerk si existe
         try:
             return jsonify(error="clerk error", detail=e.response.json()), e.response.status_code  # type: ignore[attr-defined]
         except Exception:
@@ -236,7 +231,6 @@ def invite_user():
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
-    # guard de seats
     try:
         org = _get_org(org_id)
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))

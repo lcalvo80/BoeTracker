@@ -1,3 +1,4 @@
+# app/blueprints/webhooks.py
 from __future__ import annotations
 import os
 import stripe
@@ -23,7 +24,6 @@ def _init_stripe():
 
 # (Opcional) marca procesados si implementas idempotencia fuera (aquí no persistimos)
 def _mark_processed(event_id: str):
-    # sin DB: no-op
     return
 
 def _sum_seats_from_subscription(sub: dict) -> int:
@@ -80,21 +80,16 @@ def stripe_webhook_api():
             entity_email = (meta.get("entity_email") or "").strip() or None
             plan = (meta.get("plan") or "").strip().lower()
 
-            # cuando fue público enterprise, entity_id puede venir vacío; lo creamos ahora
+            # Público enterprise sin org_id: provisiona org "guest"
             if entity_type == "org" and not entity_id:
                 try:
-                    # buscar por email y/o crear org con comprador invitado luego
-                    # sin DB: creamos org con nombre básico
                     name = (entity_email or "enterprise").split("@")[0]
-                    # nota: no podemos identificar al admin sin sesión; se gestionará posteriormente en UI
-                    org = clerk_svc.create_org_for_user(user_id=None, name=name)  # user_id=None -> org sin owner en Clerk
+                    org = clerk_svc.create_org_for_user(user_id=None, name=name)  # owner se gestionará tras onboarding
                     entity_id = org.get("id")
-                    # liga customer->org
                     _ensure_customer_has_entity(customer_id, "org", entity_id, entity_email)
                 except Exception:
                     current_app.logger.exception("[Stripe] guest enterprise provisioning failed")
 
-            # Refleja estado en Clerk
             sub = None
             try:
                 if sub_id:
@@ -133,20 +128,20 @@ def stripe_webhook_api():
             entity_id = md.get("entity_id")
             entity_email = md.get("entity_email")
 
-            # Si es org “guest” creada por email, crea org y vincula
+            # org “guest” → crea org y vincula
             if entity_type == "org" and entity_id in (None, "", " "):
                 try:
                     name = (entity_email or "enterprise").split("@")[0]
                     org = clerk_svc.create_org_for_user(user_id=None, name=name)
                     entity_id = org.get("id")
-                    # actualiza Clerk y Stripe con la relación
                     clerk_svc.set_org_plan(entity_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
                                            status=status,
                                            extra_public={"subscription": ("enterprise" if status in ("active","trialing","past_due") else None),
                                                          "seats": (seats if status in ("active","trialing","past_due") else 0)})
                     org_id = org.get("id")
                     priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
-                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"), status=status, extra_private=priv)
+                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
+                                           status=status, extra_private=priv)
                     _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
                     if event_id: _mark_processed(event_id)
                     return jsonify(received=True), 200

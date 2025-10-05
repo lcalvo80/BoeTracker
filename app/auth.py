@@ -17,7 +17,6 @@ from jose.exceptions import ExpiredSignatureError, JWTClaimsError
 def _cfg(key: str, default: Optional[str] = None) -> str:
     """
     Lee de current_app.config si hay app context, si no, de variables de entorno.
-    Nunca debe fallar fuera de contexto.
     """
     if has_app_context():
         try:
@@ -33,7 +32,7 @@ def _truthy(v: Any) -> bool:
     return str(v).lower() in ("1", "true", "yes", "on")
 
 
-# ───────────────── caché JWKS robusta ─────────────────
+# ───────────────── caché JWKS ─────────────────
 class _JWKSCache:
     def __init__(self) -> None:
         self._store: Dict[str, Dict[str, Any]] = {}
@@ -47,7 +46,6 @@ class _JWKSCache:
             at = self._at.get(url, 0)
             if jwks and (now - at) < ttl:
                 return jwks
-        # fetch fuera del lock para no bloquear
         data = self._fetch(url)
         with self._lock:
             self._store[url] = data
@@ -99,10 +97,6 @@ def _decode_token(
     issuer: Optional[str],
     alg: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Decodifica el JWT con verificación. Intenta con 'leeway' (python-jose 3.x).
-    Si la versión de la librería no soporta el kwarg, reintenta sin él.
-    """
     options = {
         "verify_aud": bool(audience),
         "verify_iat": True,
@@ -120,11 +114,9 @@ def _decode_token(
     if issuer:
         kwargs["issuer"] = issuer
 
-    # Intento 1: con leeway (python-jose 3.x)
     try:
-        return jwt.decode(token, leeway=leeway, **kwargs)  # type: ignore[arg-type]
+        return jwt.decode(token, leeway=leeway, **kwargs)  # python-jose 3.x
     except TypeError:
-        # Intento 2: sin leeway (compat libs antiguas)
         return jwt.decode(token, **kwargs)
 
 
@@ -132,19 +124,16 @@ def _bypass_enabled() -> bool:
     return _truthy(_cfg("DISABLE_AUTH", "0"))
 
 
-# ───────────────── decorador principal ─────────────────
+# ───────────────── decorador ─────────────────
 def require_clerk_auth(fn):
     """
     - Si DISABLE_AUTH=1 -> bypass (inyecta g.clerk mínimo).
     - Si no, valida Bearer JWT contra JWKS de Clerk.
-    - Variables soportadas:
-        CLERK_JWKS_URL (obligatoria si no hay bypass)
-        CLERK_AUDIENCE (opcional)
-        CLERK_ISSUER   (opcional)
-        CLERK_JWKS_TTL (opcional, default 3600)
-        CLERK_LEEWAY   (opcional, default 30)
-        CLERK_JWKS_TIMEOUT (opcional, default 5s)
-        EXPOSE_CLAIMS_DEBUG (opcional, "1" muestra claims completos en g.clerk)
+    Entorno soportado:
+      CLERK_JWKS_URL (obligatoria si no hay bypass)
+      CLERK_AUDIENCE, CLERK_ISSUER (opcionales)
+      CLERK_JWKS_TTL, CLERK_LEEWAY, CLERK_JWKS_TIMEOUT
+      EXPOSE_CLAIMS_DEBUG
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -166,7 +155,6 @@ def require_clerk_auth(fn):
         if not jwks_url:
             abort(500, "CLERK_JWKS_URL not configured")
 
-        # Config
         try:
             leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
         except Exception:
@@ -178,7 +166,6 @@ def require_clerk_auth(fn):
         except Exception:
             ttl = 3600
 
-        # Header sin verificar, para obtener kid/alg
         try:
             headers = jwt.get_unverified_header(token)
         except Exception as e:
@@ -189,7 +176,6 @@ def require_clerk_auth(fn):
         if not kid:
             abort(401, "Missing kid header")
 
-        # Selección de la key
         try:
             jwks = _JWKS.get(jwks_url, ttl=ttl)
             key = _pick_key_for_kid(jwks, kid) or _pick_key_for_kid(_JWKS.refresh(jwks_url), kid)
@@ -198,7 +184,6 @@ def require_clerk_auth(fn):
         except Exception as e:
             abort(503, f"JWKS fetch error: {e}")
 
-        # Decodificación / validación
         try:
             claims = _decode_token(token, key, leeway, audience, issuer, alg)
         except ExpiredSignatureError:
@@ -208,7 +193,6 @@ def require_clerk_auth(fn):
         except Exception as e:
             abort(401, f"Invalid token: {e}")
 
-        # Extraer identidad mínima
         user_id = claims.get("sub") or claims.get("user_id")
         org_id = claims.get("org_id")
         email = claims.get("email") or claims.get("primary_email_address")
@@ -217,7 +201,6 @@ def require_clerk_auth(fn):
         if not user_id:
             abort(401, "Missing user id in token")
 
-        # Sanitizar org_id (algunos emisores ponen placeholders)
         if isinstance(org_id, str):
             s = org_id.strip()
             if not s or s.startswith("{{") or not s.startswith("org_"):

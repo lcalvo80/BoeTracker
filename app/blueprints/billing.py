@@ -5,7 +5,7 @@ import stripe
 from typing import Optional, Dict, Any
 
 from flask import Blueprint, request, jsonify, current_app, g
-from app.services import clerk_svc  # helpers de Clerk (get_user, get_org, update_*, create_org_for_user)
+from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, set_* , get_membership
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
@@ -197,7 +197,6 @@ def summary_get():
 @bp.get("/billing/invoices")
 @_require_auth
 def invoices_get():
-    """Devuelve facturas del customer (user u org según ?scope)."""
     _, err = _init_stripe()
     if err: return err
     scope = (request.args.get("scope") or "user").lower()
@@ -230,8 +229,7 @@ def invoices_get():
         return jsonify({"data": out}), 200
     except Exception as e:
         current_app.logger.exception("invoices_get failed: %s", e)
-        # Devolvemos 200 con lista vacía para no romper la UI si no hay facturas
-        return jsonify({"data": []}), 200
+        return jsonify({"data": []}), 200  # no rompemos UI
 
 @bp.post("/billing/sync")
 @_require_auth
