@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import stripe
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
 from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, set_* , get_membership
@@ -54,6 +55,19 @@ def _update_mode(v: str | None, default: str = "auto") -> str:
     s = (v or default).strip().lower()
     return "auto" if s in ("auto", "1", "true", "yes", "on") else "never"
 
+# Añade parámetros al success_url (p.ej. scope/org_id)
+def _with_success_params(url: str, **params) -> str:
+    if not params:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query))
+    for k, v in params.items():
+        if v is None or v == "":
+            continue
+        q[str(k)] = str(v)
+    new_q = urlencode(q)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+
 # ─────────── auth guard ───────────
 def _load_auth_guard():
     if _truthy(_cfg("DISABLE_AUTH", "0") or "0"):
@@ -98,7 +112,6 @@ def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
 def _find_stripe_customer(entity_type: str, entity_id: str | None, email: str | None = None) -> str | None:
     _, err = _init_stripe()
     if err: return None
-    # 1) Busca por metadata si hay entity_id
     if entity_id:
         try:
             q = f"metadata['entity_type']:'{entity_type}' AND metadata['entity_id']:'{entity_id}'"
@@ -108,7 +121,6 @@ def _find_stripe_customer(entity_type: str, entity_id: str | None, email: str | 
                 return first["id"]
         except Exception:
             pass
-    # 2) Fallback: por email
     if email:
         try:
             lst = stripe.Customer.list(email=email, limit=1)
@@ -127,7 +139,7 @@ def _ensure_customer_metadata(customer_id: str, entity_type: str, entity_id: str
         if md.get("entity_type") != entity_type: md["entity_type"] = entity_type; changed = True
         if entity_id and md.get("entity_id") != entity_id: md["entity_id"] = entity_id; changed = True
         if entity_type == "user" and entity_id and md.get("clerk_user_id") != entity_id: md["clerk_user_id"] = entity_id; changed = True
-        if entity_type == "org" and entity_id and md.get("clerk_org_id") != entity_id: md["clerk_org_id"] = entity_id; changed = True
+        if entity_type == "org"  and entity_id and md.get("clerk_org_id")  != entity_id: md["clerk_org_id"]  = entity_id; changed = True
         if entity_email and md.get("entity_email") != entity_email: md["entity_email"] = entity_email; changed = True
         if changed:
             stripe.Customer.modify(customer_id, metadata=md)
@@ -151,7 +163,6 @@ def _ensure_customer_for_user(user_id: str) -> str:
     except Exception:
         pass
 
-    # dedupe
     found = _find_stripe_customer("user", user_id, email)
     if found:
         try:
@@ -184,7 +195,6 @@ def _ensure_customer_for_org(org_id: str) -> str:
     except Exception:
         pass
 
-    # dedupe
     found = _find_stripe_customer("org", org_id, org_email)
     if found:
         try:
@@ -210,7 +220,6 @@ def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
         if isinstance(pm, dict) and pm.get("card"):
             card = pm["card"]
             return {"brand": card.get("brand"), "last4": card.get("last4")}
-        # fallback: primer PM de tipo card
         pms = stripe.PaymentMethod.list(customer=customer_id, type="card", limit=1)
         first = next(iter(pms.auto_paging_iter()), None)
         if first and first.get("card"):
@@ -427,8 +436,9 @@ def checkout_pro():
         current_app.logger.exception("ensure customer failed: %s", e)
         return jsonify(error="cannot ensure stripe customer", detail=str(e)), 502
 
-    success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
+    base_success = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    success_url   = _with_success_params(base_success, scope="user")
+    cancel_url    = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
     try:
         session = stripe.checkout.Session.create(
@@ -502,8 +512,10 @@ def checkout_enterprise():
         current_app.logger.exception("ensure customer failed: %s", e)
         return jsonify(error="cannot ensure stripe customer", detail=str(e)), 502
 
-    success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
+    base_success = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    # ⬇️ añadimos pista para el frontend
+    success_url   = _with_success_params(base_success, scope="org", org_id=org_id)
+    cancel_url    = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
     try:
         session = stripe.checkout.Session.create(
@@ -554,8 +566,9 @@ def public_enterprise_checkout():
     if not buyer_email:
         return jsonify(error="email required"), 400
 
-    success_url = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url  = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
+    base_success = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    success_url   = _with_success_params(base_success, scope="org")  # org sin org_id (se creará post-webhook)
+    cancel_url    = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
     try:
         customer = stripe.Customer.create(
