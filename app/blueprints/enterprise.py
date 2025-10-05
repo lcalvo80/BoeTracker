@@ -1,12 +1,8 @@
 # app/blueprints/enterprise.py
 from __future__ import annotations
-
-import os
+import os, requests
 from typing import Any, Dict, List, Optional
-
-import requests
 from flask import Blueprint, jsonify, request, g, current_app
-
 from app.auth import require_clerk_auth
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
@@ -28,7 +24,6 @@ def _headers_json() -> Dict[str, str]:
     return {"Authorization": f"Bearer {sk}", "Content-Type": "application/json"}
 
 def _base() -> str:
-    # API estable de Clerk
     return "https://api.clerk.com/v1"
 
 def _map_role_out(role: str) -> str:
@@ -40,25 +35,20 @@ def _map_role_out(role: str) -> str:
     return "member"
 
 def _map_role_in(role: str) -> str:
-    r = (role or "").strip().lower()
-    return "admin" if r == "admin" else "basic_member"
+    return "admin" if (role or "").strip().lower() == "admin" else "basic_member"
 
 def _current_user_ids() -> tuple[str, Optional[str]]:
     c = getattr(g, "clerk", {}) or {}
     return c.get("user_id"), c.get("org_id")
 
 def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
-    """Comprueba membership en Clerk: el usuario debe ser admin de la organización."""
     try:
         url = f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={user_id}"
         res = requests.get(url, headers=_headers_json(), timeout=10)
         res.raise_for_status()
         data = res.json()
         arr = data if isinstance(data, list) else data.get("data") or []
-        if not arr:
-            return False
-        role = (arr[0].get("role") or "").lower()
-        return role == "admin"
+        return bool(arr and (arr[0].get("role") or "").lower() == "admin")
     except Exception as e:
         current_app.logger.warning(f"[enterprise] membership check skipped: {e}")
         return False
@@ -75,7 +65,6 @@ def _list_memberships(org_id: str) -> List[dict]:
     return data if isinstance(data, list) else data.get("data") or []
 
 def _list_invitations(org_id: str) -> List[dict]:
-    # Puede no estar disponible en todos los planes; degradamos a []
     try:
         r = requests.get(f"{_base()}/organizations/{org_id}/invitations?limit=200", headers=_headers_json(), timeout=10)
         if r.status_code not in (200, 201):
@@ -87,13 +76,14 @@ def _list_invitations(org_id: str) -> List[dict]:
 
 # ───────── endpoints ─────────
 
+# Alias doble por compatibilidad (/org/create y /create-org)
 @bp.post("/org/create")
+@bp.post("/create-org")
 @require_clerk_auth
 def create_org():
     """
     Crea la organización en Clerk y asigna al usuario actual como admin.
     Body: { name: string, seats?: number }
-    - Devuelve { id, name, seats }.
     """
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
@@ -111,7 +101,7 @@ def create_org():
         org = r.json()
         org_id = org.get("id")
 
-        # 2) Asegurar membership admin para el caller
+        # 2) Asignar admin al caller
         user_id, _ = _current_user_ids()
         r2 = requests.post(
             f"{_base()}/organizations/{org_id}/memberships",
@@ -121,19 +111,22 @@ def create_org():
         )
         r2.raise_for_status()
 
-        # 3) Metadata inicial: plan draft + seats tentativos (el webhook de Stripe fijará plan=enterprise)
+        # 3) Metadata inicial
         public_md = {"plan": "enterprise_draft"}
         if seats > 0:
             public_md["seats"] = seats
-        requests.patch(
-            f"{_base()}/organizations/{org_id}",
-            headers=_headers_json(),
-            json={"public_metadata": public_md},
-            timeout=10,
-        )
+        try:
+            requests.patch(
+                f"{_base()}/organizations/{org_id}",
+                headers=_headers_json(),
+                json={"public_metadata": public_md},
+                timeout=10,
+            )
+        except Exception:
+            pass
 
         return jsonify({"id": org_id, "name": org.get("name"), "seats": public_md.get("seats", 0)}), 201
-    except requests.HTTPError as e:
+    except requests.HTTPError:
         try:
             return jsonify(error="clerk error", detail=r.text), r.status_code  # type: ignore[name-defined]
         except Exception:
@@ -146,14 +139,9 @@ def create_org():
 @bp.get("/org")
 @require_clerk_auth
 def org_info():
-    """
-    Devuelve info de la organización activa del caller (o mínima si no hay).
-    { id, name, seats, used_seats, current_user_role, pending_invites }
-    """
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify({"id": None, "name": None, "seats": 0, "used_seats": 0, "pending_invites": 0, "current_user_role": None})
-
     try:
         org = _get_org(org_id)
         members = _list_memberships(org_id)
@@ -162,14 +150,12 @@ def org_info():
         current_app.logger.exception("[enterprise] fetch org/members failed: %s", e)
         return jsonify(error="clerk org fetch failed"), 502
 
-    # seats en public_metadata
     seats = 0
     try:
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
     except Exception:
         seats = 0
 
-    # rol actual
     cur_role = "member"
     try:
         m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
@@ -191,13 +177,9 @@ def org_info():
 @bp.get("/users")
 @require_clerk_auth
 def list_users():
-    """
-    Lista los miembros actuales de la organización activa (o ?org_id).
-    """
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify({"data": []})
-
     try:
         memberships = _list_memberships(org_id)
     except Exception as e:
@@ -216,12 +198,12 @@ def list_users():
             name = (first + " " + last).strip() or None
             email = pud.get("identifier") or ""
             out.append({
-                "id": membership_id,   # id de membership (lo usamos en updates)
+                "id": membership_id,
                 "user_id": uid,
                 "name": name or "—",
                 "email": email,
                 "role": role,
-                "licensed": True,      # si gestionas seats estrictos: ajusta aquí
+                "licensed": True,
             })
         except Exception:
             continue
@@ -231,13 +213,7 @@ def list_users():
 
 @bp.post("/invite")
 @require_clerk_auth
-def invite_users():
-    """
-    Crea invitaciones (soporta 1 o varias).
-    Body: { emails: string | string[], role?: "member"|"admin", redirect_url?: string, allow_overbook?: bool }
-    - Valida seats: miembros + invitaciones pendientes <= seats (salvo allow_overbook=true)
-    - Requiere ser admin de la organización activa.
-    """
+def invite_user():  # ← mantenemos el nombre para que coincida con tu listado
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify(error="organization required"), 403
@@ -258,7 +234,7 @@ def invite_users():
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
-    # Seat guard: miembros + invitaciones pendientes <= seats
+    # guard de seats
     try:
         org = _get_org(org_id)
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
@@ -271,19 +247,18 @@ def invite_users():
                 detail=f"Usados (miembros + invitaciones): {used}, intentas {len(emails)}, límite seats={seats}"
             ), 409
     except Exception:
-        # Si algo falla al comprobar seats, seguimos adelante (degradación amable)
         pass
 
     results: List[Dict[str, Any]] = []
     for email in emails:
-        payload = {"email_address": email, "role": role}
+        body = {"email_address": email, "role": role}
         if redirect_url:
-            payload["redirect_url"] = redirect_url
+            body["redirect_url"] = redirect_url
         try:
             res = requests.post(
                 f"{_base()}/organizations/{org_id}/invitations",
                 headers=_headers_json(),
-                json=payload,
+                json=body,
                 timeout=10,
             )
             ok = res.status_code in (200, 201)
@@ -393,9 +368,6 @@ def update_role():
 @bp.post("/set-seat-limit")
 @require_clerk_auth
 def set_seats():
-    """
-    Fija el límite de seats en public_metadata.seats.
-    """
     user_id, org_id = _current_user_ids()
     if not org_id:
         return jsonify(error="organization required"), 403
