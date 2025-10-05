@@ -81,6 +81,19 @@ def _is_org_admin(user_id: str, org_id: str) -> bool:
     except Exception:
         return False
 
+def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
+    """Prioriza body.org_id, header X-Org-Id, query org_id y por último la org del JWT."""
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    return (
+        (str(body.get("org_id") or "").strip())
+        or (request.headers.get("X-Org-Id") or "").strip()
+        or (request.args.get("org_id") or "").strip()
+        or (default_org_id or "")
+    ) or None
+
 # ─────────── customers helpers ───────────
 def _ensure_customer_for_user(user_id: str) -> str:
     _, err = _init_stripe()
@@ -148,9 +161,10 @@ def portal_post():
     if err: return err
     body = request.get_json(silent=True) or {}
     context = (body.get("context") or "user").lower()
-    user_id, _, _, org_id, _ = _derive_identity()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
     try:
         if context == "org":
+            org_id = _org_from_req(ctx_org_id)
             if not org_id or not _is_org_admin(user_id, org_id):
                 return jsonify(error="forbidden: organization admin required"), 403
             customer_id = _ensure_customer_for_org(org_id)
@@ -168,8 +182,9 @@ def portal_post():
 def portal_get():
     _, err = _init_stripe()
     if err: return err
-    user_id, _, _, org_id, _ = _derive_identity()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
     try:
+        org_id = _org_from_req(ctx_org_id)
         if org_id and _is_org_admin(user_id, org_id):
             customer_id = _ensure_customer_for_org(org_id)
         else:
@@ -187,9 +202,10 @@ def summary_get():
     _, err = _init_stripe()
     if err: return err
     scope = (request.args.get("scope") or "user").lower()
-    user_id, _, _, org_id, _ = _derive_identity()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
     try:
         if scope == "org":
+            org_id = _org_from_req(ctx_org_id)
             if not org_id or not _is_org_admin(user_id, org_id):
                 return jsonify(error="forbidden"), 403
             customer_id = _ensure_customer_for_org(org_id)
@@ -201,8 +217,7 @@ def summary_get():
         status = (sub.get("status") if sub else "canceled") or "canceled"
         is_active = status in ("active", "trialing", "past_due")
 
-        # enriquecido
-        current_period_end = sub.get("current_period_end") if sub else None  # unix ts
+        current_period_end = sub.get("current_period_end") if sub else None
         payment_method = _payment_method_summary(customer_id)
 
         if scope == "org":
@@ -233,9 +248,10 @@ def invoices_get():
     _, err = _init_stripe()
     if err: return err
     scope = (request.args.get("scope") or "user").lower()
-    user_id, _, _, org_id, _ = _derive_identity()
+    user_id, _, _, ctx_org_id, _ = _derive_identity()
     try:
         if scope == "org":
+            org_id = _org_from_req(ctx_org_id)
             if not org_id or not _is_org_admin(user_id, org_id):
                 return jsonify(error="forbidden"), 403
             customer_id = _ensure_customer_for_org(org_id)
@@ -273,7 +289,8 @@ def billing_sync():
     scope = (body.get("scope") or "user").lower()
     try:
         if scope == "org":
-            user_id, _, _, org_id, _ = _derive_identity()
+            user_id, _, _, ctx_org_id, _ = _derive_identity()
+            org_id = _org_from_req(ctx_org_id)
             if not org_id or not _is_org_admin(user_id, org_id):
                 return jsonify(error="forbidden"), 403
             customer_id = _ensure_customer_for_org(org_id)
@@ -287,13 +304,12 @@ def billing_sync():
         is_active = status in ("active", "trialing", "past_due")
 
         if scope == "org":
-            org_id = _derive_identity()[3]
             qty = (sub["items"]["data"][0]["quantity"] if sub and sub.get("items") and sub["items"].get("data") else 0)
             clerk_svc.update_org_metadata(
                 org_id,
                 public={
                     "subscription": ("enterprise" if is_active else None),
-                    "plan": ("enterprise" if is_active else "free"),  # 👈 añade plan consistente
+                    "plan": ("enterprise" if is_active else "free"),
                     "seats": int(qty or 0),
                 },
                 private={
@@ -310,7 +326,7 @@ def billing_sync():
                 user_id,
                 public={
                     "subscription": ("pro" if is_active else None),
-                    "plan": ("pro" if is_active else "free"),          # 👈 también para usuario
+                    "plan": ("pro" if is_active else "free"),
                 },
                 private={
                     "billing": {

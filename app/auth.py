@@ -124,6 +124,44 @@ def _bypass_enabled() -> bool:
     return _truthy(_cfg("DISABLE_AUTH", "0"))
 
 
+# ───────────────── helpers de claims ─────────────────
+def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
+    """
+    Clerk puede enviar la org activa en varias formas:
+      - org_id / organization_id
+      - o: { id, ... } / org: { id, ... } / organization: { id, ... }
+      - orgs / organizations: [ { id, ... }, ... ]
+    """
+    if not isinstance(claims, dict):
+        return None
+
+    # directos
+    for k in ("org_id", "organization_id"):
+        v = claims.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # objetos anidados
+    for k in ("o", "org", "organization"):
+        o = claims.get(k)
+        if isinstance(o, dict):
+            vid = o.get("id")
+            if isinstance(vid, str) and vid.strip():
+                return vid.strip()
+
+    # listas
+    for k in ("orgs", "organizations"):
+        arr = claims.get(k)
+        if isinstance(arr, list):
+            for it in arr:
+                if isinstance(it, dict):
+                    vid = it.get("id")
+                    if isinstance(vid, str) and vid.strip():
+                        return vid.strip()
+
+    return None
+
+
 # ───────────────── decorador ─────────────────
 def require_clerk_auth(fn):
     """
@@ -193,14 +231,25 @@ def require_clerk_auth(fn):
         except Exception as e:
             abort(401, f"Invalid token: {e}")
 
+        # Identidad
         user_id = claims.get("sub") or claims.get("user_id")
-        org_id = claims.get("org_id")
-        email = claims.get("email") or claims.get("primary_email_address")
-        name = claims.get("name") or claims.get("full_name")
+        org_id = _extract_org_id(claims)
+
+        email = (
+            claims.get("email")
+            or claims.get("primary_email_address")
+            or (claims.get("email_addresses") or [{}])[0].get("email_address")
+        )
+        name = (
+            claims.get("name")
+            or claims.get("full_name")
+            or " ".join([claims.get("first_name") or "", claims.get("last_name") or ""]).strip()
+        )
 
         if not user_id:
             abort(401, "Missing user id in token")
 
+        # Sanitizar org_id
         if isinstance(org_id, str):
             s = org_id.strip()
             if not s or s.startswith("{{") or not s.startswith("org_"):
