@@ -122,6 +122,23 @@ def _ensure_customer_for_org(org_id: str) -> str:
         current_app.logger.exception("cannot persist stripeCustomerId on clerk org")
     return c.id
 
+def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
+    """Intenta devolver {'brand': 'visa', 'last4': '4242'} del método por defecto."""
+    try:
+        cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
+        pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
+        if isinstance(pm, dict) and pm.get("card"):
+            card = pm["card"]
+            return {"brand": card.get("brand"), "last4": card.get("last4")}
+        # fallback: primer PM de tipo card
+        pms = stripe.PaymentMethod.list(customer=customer_id, type="card", limit=1)
+        first = next(iter(pms.auto_paging_iter()), None)
+        if first and first.get("card"):
+            return {"brand": first["card"].get("brand"), "last4": first["card"].get("last4")}
+    except Exception:
+        pass
+    return None
+
 # ─────────── Endpoints ───────────
 
 @bp.post("/billing/portal")
@@ -182,14 +199,30 @@ def summary_get():
         subs = stripe.Subscription.list(customer=customer_id, limit=1, status="all")
         sub = next(iter(subs.auto_paging_iter()), None)
         status = (sub.get("status") if sub else "canceled") or "canceled"
+        is_active = status in ("active", "trialing", "past_due")
+
+        # enriquecido
+        current_period_end = sub.get("current_period_end") if sub else None  # unix ts
+        payment_method = _payment_method_summary(customer_id)
 
         if scope == "org":
-            plan = "enterprise" if status in ("active", "trialing", "past_due") else "free"
+            plan = "enterprise" if is_active else "free"
             seats = int(sub["items"]["data"][0]["quantity"] or 0) if sub and sub.get("items", {}).get("data") else 0
-            return jsonify({"status": status, "plan": plan, "seats": seats}), 200
+            return jsonify({
+                "status": status,
+                "plan": plan,
+                "seats": seats,
+                "current_period_end": current_period_end,
+                "payment_method": payment_method,
+            }), 200
         else:
-            plan = "pro" if status in ("active", "trialing", "past_due") else "free"
-            return jsonify({"status": status, "plan": plan}), 200
+            plan = "pro" if is_active else "free"
+            return jsonify({
+                "status": status,
+                "plan": plan,
+                "current_period_end": current_period_end,
+                "payment_method": payment_method,
+            }), 200
     except Exception as e:
         current_app.logger.exception("summary_get failed: %s", e)
         return jsonify(error="summary failed", detail=str(e)), 502
@@ -251,26 +284,41 @@ def billing_sync():
         subs = stripe.Subscription.list(customer=customer_id, limit=1, status="all")
         sub = next(iter(subs.auto_paging_iter()), None)
         status = (sub.get("status") if sub else "canceled") or "canceled"
+        is_active = status in ("active", "trialing", "past_due")
 
         if scope == "org":
             org_id = _derive_identity()[3]
-            qty = (sub["items"]["data"][0]["quantity"] if sub and sub["items"]["data"] else 0)
+            qty = (sub["items"]["data"][0]["quantity"] if sub and sub.get("items") and sub["items"].get("data") else 0)
             clerk_svc.update_org_metadata(
                 org_id,
-                public={"subscription": ("enterprise" if status in ("active","trialing","past_due") else None),
-                        "seats": qty},
-                private={"billing": {"stripeCustomerId": sub.get("customer") if sub else None,
-                                     "subscriptionId": sub.get("id") if sub else None,
-                                     "status": status}},
+                public={
+                    "subscription": ("enterprise" if is_active else None),
+                    "plan": ("enterprise" if is_active else "free"),  # 👈 añade plan consistente
+                    "seats": int(qty or 0),
+                },
+                private={
+                    "billing": {
+                        "stripeCustomerId": sub.get("customer") if sub else None,
+                        "subscriptionId": sub.get("id") if sub else None,
+                        "status": status
+                    }
+                },
             )
         else:
             user_id = _derive_identity()[0]
             clerk_svc.update_user_metadata(
                 user_id,
-                public={"subscription": ("pro" if status in ("active","trialing","past_due") else None)},
-                private={"billing": {"stripeCustomerId": sub.get("customer") if sub else None,
-                                     "subscriptionId": sub.get("id") if sub else None,
-                                     "status": status}},
+                public={
+                    "subscription": ("pro" if is_active else None),
+                    "plan": ("pro" if is_active else "free"),          # 👈 también para usuario
+                },
+                private={
+                    "billing": {
+                        "stripeCustomerId": sub.get("customer") if sub else None,
+                        "subscriptionId": sub.get("id") if sub else None,
+                        "status": status
+                    }
+                },
             )
 
         return jsonify(ok=True, status=status), 200

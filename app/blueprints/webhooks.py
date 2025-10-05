@@ -78,6 +78,7 @@ def stripe_webhook_api():
             entity_type = (meta.get("entity_type") or "").strip() or (sess.get("metadata") or {}).get("entity_type")
             entity_id = (meta.get("entity_id") or "").strip()
             entity_email = (meta.get("entity_email") or "").strip() or None
+            # plan puede ser "pro" o "enterprise" según el flujo
             plan = (meta.get("plan") or "").strip().lower()
 
             # Público enterprise sin org_id: provisiona org "guest"
@@ -98,23 +99,37 @@ def stripe_webhook_api():
                 current_app.logger.exception("[Stripe] retrieve subscription failed")
 
             status = (sub.get("status") if sub else None) or "active"
+            is_active = status in ("active", "trialing", "past_due")
             seats = _sum_seats_from_subscription(sub) if sub else int((meta.get("seats") or "1"))
 
             if entity_type == "user" and entity_id:
                 priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
-                clerk_svc.set_user_plan(entity_id, plan=("pro" if status in ("active","trialing","past_due") else "free"),
-                                        status=status, extra_private=priv)
+                clerk_svc.set_user_plan(
+                    entity_id,
+                    plan=("pro" if is_active else "free"),
+                    status=status,
+                    extra_private=priv
+                )
 
             elif entity_type == "org" and entity_id:
                 priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
-                clerk_svc.set_org_plan(entity_id, plan="enterprise", status=status,
-                                       extra_private=priv,
-                                       extra_public={"seats": seats, "subscription": "enterprise"})
+                clerk_svc.set_org_plan(
+                    entity_id,
+                    plan=("enterprise" if is_active else "free"),
+                    status=status,
+                    extra_private=priv,
+                    extra_public={
+                        "seats": seats,
+                        "subscription": ("enterprise" if is_active else None),
+                        "plan": ("enterprise" if is_active else "free"),  # 👈 asegura plan público
+                    },
+                )
 
         # customer.subscription.{created,updated,deleted}
         elif etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
             sub = obj
             status = sub.get("status") or "canceled"
+            is_active = status in ("active","trialing","past_due")
             seats = _sum_seats_from_subscription(sub)
             cust = None
             try:
@@ -134,14 +149,19 @@ def stripe_webhook_api():
                     name = (entity_email or "enterprise").split("@")[0]
                     org = clerk_svc.create_org_for_user(user_id=None, name=name)
                     entity_id = org.get("id")
-                    clerk_svc.set_org_plan(entity_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
-                                           status=status,
-                                           extra_public={"subscription": ("enterprise" if status in ("active","trialing","past_due") else None),
-                                                         "seats": (seats if status in ("active","trialing","past_due") else 0)})
-                    org_id = org.get("id")
+                    clerk_svc.set_org_plan(
+                        entity_id,
+                        plan=("enterprise" if is_active else "free"),
+                        status=status,
+                        extra_public={
+                            "subscription": ("enterprise" if is_active else None),
+                            "plan": ("enterprise" if is_active else "free"),
+                            "seats": (seats if is_active else 0),
+                        }
+                    )
+                    org_id = entity_id
                     priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
-                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
-                                           status=status, extra_private=priv)
+                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if is_active else "free"), status=status, extra_private=priv)
                     _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
                     if event_id: _mark_processed(event_id)
                     return jsonify(received=True), 200
@@ -150,14 +170,26 @@ def stripe_webhook_api():
 
             if entity_type == "user" and entity_id:
                 priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
-                clerk_svc.set_user_plan(entity_id, plan=("pro" if status in ("active","trialing","past_due") else "free"),
-                                        status=status, extra_private=priv)
+                clerk_svc.set_user_plan(
+                    entity_id,
+                    plan=("pro" if is_active else "free"),
+                    status=status,
+                    extra_private=priv
+                )
 
             elif entity_type == "org" and entity_id:
                 priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
-                clerk_svc.set_org_plan(entity_id, plan=("enterprise" if status in ("active","trialing","past_due") else "free"),
-                                       status=status, extra_private=priv,
-                                       extra_public={"seats": seats, "subscription": ("enterprise" if status in ("active","trialing","past_due") else None)})
+                clerk_svc.set_org_plan(
+                    entity_id,
+                    plan=("enterprise" if is_active else "free"),
+                    status=status,
+                    extra_private=priv,
+                    extra_public={
+                        "seats": seats,
+                        "subscription": ("enterprise" if is_active else None),
+                        "plan": ("enterprise" if is_active else "free"),
+                    }
+                )
 
         if event_id: _mark_processed(event_id)
         return jsonify(received=True), 200
