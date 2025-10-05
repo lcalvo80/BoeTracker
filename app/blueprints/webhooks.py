@@ -1,4 +1,3 @@
-# app/blueprints/webhooks.py
 from __future__ import annotations
 import os
 import stripe
@@ -78,7 +77,6 @@ def stripe_webhook_api():
             entity_type = (meta.get("entity_type") or "").strip() or (sess.get("metadata") or {}).get("entity_type")
             entity_id = (meta.get("entity_id") or "").strip()
             entity_email = (meta.get("entity_email") or "").strip() or None
-            # plan puede ser "pro" o "enterprise" según el flujo
             plan = (meta.get("plan") or "").strip().lower()
 
             # Público enterprise sin org_id: provisiona org "guest"
@@ -121,7 +119,7 @@ def stripe_webhook_api():
                     extra_public={
                         "seats": seats,
                         "subscription": ("enterprise" if is_active else None),
-                        "plan": ("enterprise" if is_active else "free"),  # 👈 asegura plan público
+                        "plan": ("enterprise" if is_active else "free"),
                     },
                 )
 
@@ -234,8 +232,11 @@ def clerk_webhook_api():
 
     return jsonify(ok=True), 200
 
-
-# Alias recomendado: /api/billing/webhook (igual que /api/stripe)
+# Alias recomendados del webhook de Stripe
 @bp.post("/billing/webhook")
 def stripe_webhook_api_alias():
+    return stripe_webhook_api()
+
+@bp.post("/billing/stripe")
+def stripe_webhook_api_compat2():
     return stripe_webhook_api()

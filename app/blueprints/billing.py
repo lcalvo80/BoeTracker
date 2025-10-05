@@ -1,4 +1,3 @@
-# app/blueprints/billing.py
 from __future__ import annotations
 import os
 import stripe
@@ -29,7 +28,8 @@ def _init_stripe():
     sk = _cfg("STRIPE_SECRET_KEY")
     if not sk:
         return None, (jsonify(error="Missing STRIPE_SECRET_KEY"), 500)
-    stripe.api_key = sk
+    if stripe.api_key != sk:
+        stripe.api_key = sk
     return sk, None
 
 def _get_price(kind: str) -> str | None:
@@ -94,45 +94,112 @@ def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
         or (default_org_id or "")
     ) or None
 
+# ─────────── Stripe customers: dedupe + metadata ───────────
+def _find_stripe_customer(entity_type: str, entity_id: str | None, email: str | None = None) -> str | None:
+    _, err = _init_stripe()
+    if err: return None
+    # 1) Busca por metadata si hay entity_id
+    if entity_id:
+        try:
+            q = f"metadata['entity_type']:'{entity_type}' AND metadata['entity_id']:'{entity_id}'"
+            res = stripe.Customer.search(query=q, limit=1)
+            first = next(iter(res.auto_paging_iter()), None)
+            if first and first.get("id"):
+                return first["id"]
+        except Exception:
+            pass
+    # 2) Fallback: por email
+    if email:
+        try:
+            lst = stripe.Customer.list(email=email, limit=1)
+            first = next(iter(lst.auto_paging_iter()), None)
+            if first and first.get("id"):
+                return first["id"]
+        except Exception:
+            pass
+    return None
+
+def _ensure_customer_metadata(customer_id: str, entity_type: str, entity_id: str | None, entity_email: str | None):
+    try:
+        cust = stripe.Customer.retrieve(customer_id)
+        md = (cust.get("metadata") or {}).copy()
+        changed = False
+        if md.get("entity_type") != entity_type: md["entity_type"] = entity_type; changed = True
+        if entity_id and md.get("entity_id") != entity_id: md["entity_id"] = entity_id; changed = True
+        if entity_type == "user" and entity_id and md.get("clerk_user_id") != entity_id: md["clerk_user_id"] = entity_id; changed = True
+        if entity_type == "org" and entity_id and md.get("clerk_org_id") != entity_id: md["clerk_org_id"] = entity_id; changed = True
+        if entity_email and md.get("entity_email") != entity_email: md["entity_email"] = entity_email; changed = True
+        if changed:
+            stripe.Customer.modify(customer_id, metadata=md)
+    except Exception:
+        current_app.logger.warning("Cannot ensure stripe customer metadata")
+
 # ─────────── customers helpers ───────────
 def _ensure_customer_for_user(user_id: str) -> str:
     _, err = _init_stripe()
     if err: raise RuntimeError("stripe init failed")
+    email, name = "", user_id
     try:
         u = clerk_svc.get_user(user_id)
         priv = (u.get("private_metadata") or {})
         existing = (priv.get("billing") or {}).get("stripeCustomerId")
         if existing:
+            _ensure_customer_metadata(existing, "user", user_id, ((u.get("email_addresses") or [{}])[0].get("email_address") or "").strip().lower())
             return existing
         email = ((u.get("email_addresses") or [{}])[0].get("email_address") or "").strip().lower()
         name = ((u.get("first_name") or "") + " " + (u.get("last_name") or "")).strip() or u.get("username") or user_id
     except Exception:
-        email, name = "", user_id
+        pass
+
+    # dedupe
+    found = _find_stripe_customer("user", user_id, email)
+    if found:
+        try:
+            clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": found}})
+        except Exception:
+            current_app.logger.exception("cannot persist stripeCustomerId on clerk user (existing)")
+        _ensure_customer_metadata(found, "user", user_id, email)
+        return found
+
     c = stripe.Customer.create(email=email or None, name=name or None,
-                               metadata={"entity_type": "user", "entity_id": user_id})
+                               metadata={"entity_type": "user", "entity_id": user_id, "entity_email": email or ""})
     try:
         clerk_svc.update_user_metadata(user_id, private={"billing": {"stripeCustomerId": c.id}})
     except Exception:
-        current_app.logger.exception("cannot persist stripeCustomerId on clerk user")
+        current_app.logger.exception("cannot persist stripeCustomerId on clerk user (new)")
     return c.id
 
 def _ensure_customer_for_org(org_id: str) -> str:
     _, err = _init_stripe()
     if err: raise RuntimeError("stripe init failed")
+    org_email, org_name = None, f"org-{org_id}"
     try:
         org = clerk_svc.get_org(org_id)
         priv = (org.get("private_metadata") or {})
         existing = (priv.get("billing") or {}).get("stripeCustomerId")
         if existing:
+            _ensure_customer_metadata(existing, "org", org_id, None)
             return existing
-        name = (org.get("name") or f"org-{org_id}")
+        org_name = (org.get("name") or org_name)
     except Exception:
-        name = f"org-{org_id}"
-    c = stripe.Customer.create(name=name or None, metadata={"entity_type": "org", "entity_id": org_id})
+        pass
+
+    # dedupe
+    found = _find_stripe_customer("org", org_id, org_email)
+    if found:
+        try:
+            clerk_svc.update_org_metadata(org_id, private={"billing": {"stripeCustomerId": found}})
+        except Exception:
+            current_app.logger.exception("cannot persist stripeCustomerId on clerk org (existing)")
+        _ensure_customer_metadata(found, "org", org_id, org_email)
+        return found
+
+    c = stripe.Customer.create(name=org_name or None,
+                               metadata={"entity_type": "org", "entity_id": org_id})
     try:
         clerk_svc.update_org_metadata(org_id, private={"billing": {"stripeCustomerId": c.id}})
     except Exception:
-        current_app.logger.exception("cannot persist stripeCustomerId on clerk org")
+        current_app.logger.exception("cannot persist stripeCustomerId on clerk org (new)")
     return c.id
 
 def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
