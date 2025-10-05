@@ -1,11 +1,16 @@
+# app/services/clerk_svc.py
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List
+
 import httpx
 from flask import current_app
-from typing import Any, Dict, List
 
 API_BASE = "https://api.clerk.com/v1"
 
 def _headers():
-    sk = current_app.config.get("CLERK_SECRET_KEY") or ""
+    sk = current_app.config.get("CLERK_SECRET_KEY") or os.getenv("CLERK_SECRET_KEY") or ""
     if not sk:
         raise RuntimeError("CLERK_SECRET_KEY not configured")
     return {
@@ -13,12 +18,14 @@ def _headers():
         "Content-Type": "application/json",
     }
 
-def get_user(user_id: str):
+# ─────────── Lectura ───────────
+
+def get_user(user_id: str) -> dict:
     r = httpx.get(f"{API_BASE}/users/{user_id}", headers=_headers(), timeout=10)
     r.raise_for_status()
     return r.json()
 
-def get_org(org_id: str):
+def get_org(org_id: str) -> dict:
     r = httpx.get(f"{API_BASE}/organizations/{org_id}", headers=_headers(), timeout=10)
     r.raise_for_status()
     return r.json()
@@ -33,52 +40,82 @@ def get_user_memberships(user_id: str) -> List[Dict[str, Any]]:
     data = r.json()
     return data if isinstance(data, list) else (data.get("data") or [])
 
-def update_user_metadata(user_id: str, public: dict | None=None, private: dict | None=None):
-    payload = {}
-    if public is not None: payload["public_metadata"] = public
-    if private is not None: payload["private_metadata"] = private
+# ─────────── Metadata ───────────
+
+def update_user_metadata(user_id: str, public: dict | None = None, private: dict | None = None) -> dict:
+    payload: Dict[str, Any] = {}
+    if public is not None:
+        payload["public_metadata"] = public
+    if private is not None:
+        payload["private_metadata"] = private
     if not payload:
         return get_user(user_id)
     r = httpx.patch(f"{API_BASE}/users/{user_id}", headers=_headers(), json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
 
-def update_org_metadata(org_id: str, public: dict | None=None, private: dict | None=None):
-    payload = {}
-    if public is not None: payload["public_metadata"] = public
-    if private is not None: payload["private_metadata"] = private
+def update_org_metadata(org_id: str, public: dict | None = None, private: dict | None = None) -> dict:
+    payload: Dict[str, Any] = {}
+    if public is not None:
+        payload["public_metadata"] = public
+    if private is not None:
+        payload["private_metadata"] = private
     if not payload:
         return get_org(org_id)
     r = httpx.patch(f"{API_BASE}/organizations/{org_id}", headers=_headers(), json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
 
-def create_org_for_user(user_id: str, name: str, public: dict | None=None, private: dict | None=None):
-    payload: Dict[str, Any] = {"name": name, "created_by": user_id}
-    if public is not None:
-        payload["public_metadata"] = public
-    if private is not None:
-        payload["private_metadata"] = private
-    r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
+# ─────────── Creación organización + admin ───────────
 
-# Helpers
-def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_private: dict | None=None, extra_public: dict | None=None):
+def create_org_for_user(user_id: str, name: str, public: dict | None = None, private: dict | None = None) -> dict:
+    """
+    Crea la organización y añade al usuario como admin.
+    No usa 'created_by' para maximizar compatibilidad con la API.
+    """
+    # 1) Crear la organización
+    r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json={"name": name}, timeout=10)
+    r.raise_for_status()
+    org = r.json()
+    org_id = org.get("id")
+
+    # 2) Añadir membership admin
+    r2 = httpx.post(
+        f"{API_BASE}/organizations/{org_id}/memberships",
+        headers=_headers(),
+        json={"user_id": user_id, "role": "admin"},
+        timeout=10,
+    )
+    r2.raise_for_status()
+
+    # 3) Metadata opcional
+    if public or private:
+        update_org_metadata(org_id, public, private)
+
+    return org
+
+# ─────────── Helpers de plan ───────────
+
+def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_private: dict | None = None, extra_public: dict | None = None) -> dict:
     pub = {"plan": plan}
-    if status is not None: pub["status"] = status
-    if extra_public: pub.update(extra_public)
+    if status is not None:
+        pub["status"] = status
+    if extra_public:
+        pub.update(extra_public)
     priv = extra_private or {}
     return update_user_metadata(user_id, public=pub, private=priv)
 
-def set_org_plan(org_id: str, plan: str, status: str | None = None, extra_private: dict | None=None, extra_public: dict | None=None):
+def set_org_plan(org_id: str, plan: str, status: str | None = None, extra_private: dict | None = None, extra_public: dict | None = None) -> dict:
     pub = {"plan": plan}
-    if status is not None: pub["status"] = status
-    if extra_public: pub.update(extra_public)
+    if status is not None:
+        pub["status"] = status
+    if extra_public:
+        pub.update(extra_public)
     priv = extra_private or {}
     return update_org_metadata(org_id, public=pub, private=priv)
 
-# (Opcional) invitado enterprise por email
+# ─────────── Invitado enterprise (opcional) ───────────
+
 def find_users_by_email(email: str) -> List[Dict[str, Any]]:
     r = httpx.get(f"{API_BASE}/users", params={"email_address": email}, headers=_headers(), timeout=10)
     r.raise_for_status()
