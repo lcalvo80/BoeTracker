@@ -78,11 +78,10 @@ def stripe_webhook_api():
             entity_email = (meta.get("entity_email") or "").strip() or None
             plan = (meta.get("plan") or "").strip().lower()
 
-            # Público enterprise sin org_id: provisiona org "guest"
             if entity_type == "org" and not entity_id:
                 try:
                     name = (entity_email or "enterprise").split("@")[0]
-                    org = clerk_svc.create_org_for_user(user_id=None, name=name)  # owner se gestionará tras onboarding
+                    org = clerk_svc.create_org_for_user(user_id=None, name=name)
                     entity_id = org.get("id")
                     _ensure_customer_has_entity(customer_id, "org", entity_id, entity_email)
                 except Exception:
@@ -121,7 +120,7 @@ def stripe_webhook_api():
                         "plan": ("enterprise" if is_active else "free"),
                     },
                 )
-                # ⇣ NUEVO: propagar entitlement a miembros
+                current_app.logger.info(f"[Stripe] propagando entitlement a miembros de {entity_id} (active={is_active})")
                 try:
                     clerk_svc.set_entitlement_for_org_members(
                         entity_id,
@@ -148,7 +147,6 @@ def stripe_webhook_api():
             entity_id = md.get("entity_id")
             entity_email = md.get("entity_email")
 
-            # org “guest” → crea org y vincula
             if entity_type == "org" and entity_id in (None, "", " "):
                 try:
                     name = (entity_email or "enterprise").split("@")[0]
@@ -168,7 +166,7 @@ def stripe_webhook_api():
                     priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
                     clerk_svc.set_org_plan(org_id, plan=("enterprise" if is_active else "free"), status=status, extra_private=priv)
                     _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
-                    # Propaga entitlement
+                    current_app.logger.info(f"[Stripe] propagando entitlement a miembros de {org_id} (active={is_active})")
                     try:
                         clerk_svc.set_entitlement_for_org_members(
                             org_id,
@@ -203,7 +201,7 @@ def stripe_webhook_api():
                         "plan": ("enterprise" if is_active else "free"),
                     }
                 )
-                # ⇣ NUEVO: propagar entitlement a miembros
+                current_app.logger.info(f"[Stripe] propagando entitlement a miembros de {entity_id} (active={is_active})")
                 try:
                     clerk_svc.set_entitlement_for_org_members(
                         entity_id,
@@ -255,6 +253,22 @@ def clerk_webhook_api():
 
     return jsonify(ok=True), 200
 
+# ─────────── Endpoint interno para re-sincronizar entitlements ───────────
+@bp.post("/_int/entitlements/sync")
+def _int_sync_entitlements():
+    data = request.get_json(silent=True) or {}
+    org_id = (data.get("org_id") or request.args.get("org_id") or "").strip()
+    ent = (data.get("entitlement") or "enterprise_member").strip() or None
+    if not org_id:
+        return jsonify(error="org_id required"), 400
+    try:
+        clerk_svc.set_entitlement_for_org_members(org_id, ent)
+        return jsonify(ok=True, org_id=org_id, entitlement=ent), 200
+    except Exception as e:
+        current_app.logger.exception("[_int] sync entitlements error")
+        return jsonify(error=str(e)), 500
+
+# Alias recomendados del webhook de Stripe
 @bp.post("/billing/webhook")
 def stripe_webhook_api_alias():
     return stripe_webhook_api()

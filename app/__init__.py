@@ -12,6 +12,7 @@ from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from flask_sock import Sock
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 
 def _normalize_origin(o: str) -> str:
@@ -46,6 +47,9 @@ def create_app(config: dict | None = None):
     load_dotenv()
     app = Flask(__name__)
     app.url_map.strict_slashes = False
+
+    # Confiar en cabeceras de proxy (Railway/Fly/NGINX) para URL/Origin correctos
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
     # ── Logs de diagnóstico de archivos existentes ──
     app.logger.info(f"[init] cwd={os.getcwd()} root_path={app.root_path} sys.path[0]={sys.path[0]}")
@@ -98,6 +102,7 @@ def create_app(config: dict | None = None):
     # ── CORS (solo /api/*) ──
     origins = _parse_origins()
     app.logger.info(f"[init] CORS origins = {origins}")
+    app.logger.info("[init] FRONTEND_URL=%s", app.config.get("FRONTEND_URL"))
 
     CORS(
         app,
@@ -147,7 +152,7 @@ def create_app(config: dict | None = None):
     # Blueprints
     register_bp("debug", "bp")
     register_bp("billing", "bp")
-    register_bp("webhooks", "bp")
+    register_bp("webhooks", "bp")   # <- Stripe + Clerk + _int/entitlements/sync
     register_bp("items", "bp")
     register_bp("comments", "bp")
     register_bp("compat", "bp")
@@ -218,7 +223,7 @@ def create_app(config: dict | None = None):
         return jsonify({
             "method": request.method,
             "path": request.path,
-            "headers": {k: v for k, v in request.headers.items()},
+            "headers": {k: v for k, v in request.headers.items() if k.lower() != "authorization"},
             "json": request.get_json(silent=True),
             "args": request.args.to_dict(flat=True),
         }), 200

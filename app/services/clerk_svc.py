@@ -104,7 +104,7 @@ def create_org_for_user(user_id: str | None, name: str, public: dict | None = No
 # ─────────── Helpers de plan ───────────
 
 def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_private: dict | None = None, extra_public: dict | None = None) -> dict:
-    # Merge del public_metadata para no machacar otras claves (ej: entitlement)
+    # Merge para no machacar otras claves (ej: entitlement)
     curr = get_user(user_id)
     pub = dict((curr.get("public_metadata") or {}))
     pub.update({"plan": plan})
