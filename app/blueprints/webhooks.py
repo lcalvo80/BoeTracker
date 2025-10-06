@@ -31,10 +31,20 @@ def _sum_seats_from_subscription(sub: dict) -> int:
     except Exception:
         return 0
 
-def _ensure_customer_has_entity(customer_id: str, entity_type: str, entity_id: str, entity_email: str | None = None):
+def _ensure_customer_has_entity(customer_id: str, entity_type: str, entity_id: str, entity_email: str | None = None, strict: bool = True):
+    """
+    Por seguridad: si el customer ya tiene metadatos de otra entidad, NO los giramos.
+    """
     try:
         cust = stripe.Customer.retrieve(customer_id)
         md = cust.get("metadata") or {}
+        if strict and md.get("entity_type") and md.get("entity_id"):
+            if md.get("entity_type") != entity_type or md.get("entity_id") != entity_id:
+                current_app.logger.warning(
+                    "[Stripe] customer %s ya pertenece a %s:%s; NO se sobreescribe a %s:%s",
+                    customer_id, md.get("entity_type"), md.get("entity_id"), entity_type, entity_id
+                )
+                return
         changed = False
         if md.get("entity_type") != entity_type: md["entity_type"] = entity_type; changed = True
         if md.get("entity_id") != entity_id: md["entity_id"] = entity_id; changed = True
@@ -67,26 +77,17 @@ def stripe_webhook_api():
     obj = event.get("data", {}).get("object") or {}
 
     try:
-        # checkout.session.completed
+        # ───────────────── checkout.session.completed ─────────────────
         if etype == "checkout.session.completed":
             sess = obj
             customer_id = sess.get("customer")
             sub_id = sess.get("subscription")
             meta = (sess.get("metadata") or {})
-            entity_type = (meta.get("entity_type") or "").strip() or (sess.get("metadata") or {}).get("entity_type")
+            entity_type = (meta.get("entity_type") or "").strip()
             entity_id = (meta.get("entity_id") or "").strip()
             entity_email = (meta.get("entity_email") or "").strip() or None
-            plan = (meta.get("plan") or "").strip().lower()
 
-            if entity_type == "org" and not entity_id:
-                try:
-                    name = (entity_email or "enterprise").split("@")[0]
-                    org = clerk_svc.create_org_for_user(user_id=None, name=name)
-                    entity_id = org.get("id")
-                    _ensure_customer_has_entity(customer_id, "org", entity_id, entity_email)
-                except Exception:
-                    current_app.logger.exception("[Stripe] guest enterprise provisioning failed")
-
+            # Rescatamos la suscripción (para seats y status)
             sub = None
             try:
                 if sub_id:
@@ -108,6 +109,9 @@ def stripe_webhook_api():
                 )
 
             elif entity_type == "org" and entity_id:
+                # NO giramos metadata del customer si ya pertenece a otro scope
+                _ensure_customer_has_entity(customer_id, "org", entity_id, entity_email, strict=True)
+
                 priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
                 clerk_svc.set_org_plan(
                     entity_id,
@@ -129,55 +133,29 @@ def stripe_webhook_api():
                 except Exception:
                     current_app.logger.exception("[Stripe] no se pudo propagar entitlement a miembros (checkout.completed)")
 
-        # customer.subscription.{created,updated,deleted}
+        # ───────────────── customer.subscription.* ─────────────────
         elif etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
             sub = obj
             status = sub.get("status") or "canceled"
             is_active = status in ("active","trialing","past_due")
             seats = _sum_seats_from_subscription(sub)
+
+            # Preferimos metadatos de la suscripción (confiables e inmutables)
+            sub_md = (sub.get("metadata") or {})
+
+            # Contexto del customer solo como respaldo
             cust = None
+            cust_md = {}
             try:
                 if sub.get("customer"):
                     cust = stripe.Customer.retrieve(sub["customer"])
+                    cust_md = (cust.get("metadata") if isinstance(cust, dict) else {}) or {}
             except Exception:
                 current_app.logger.exception("[Stripe] error retrieving customer")
 
-            md = (cust.get("metadata") if isinstance(cust, dict) else {}) or {}
-            entity_type = md.get("entity_type")
-            entity_id = md.get("entity_id")
-            entity_email = md.get("entity_email")
-
-            if entity_type == "org" and entity_id in (None, "", " "):
-                try:
-                    name = (entity_email or "enterprise").split("@")[0]
-                    org = clerk_svc.create_org_for_user(user_id=None, name=name)
-                    entity_id = org.get("id")
-                    clerk_svc.set_org_plan(
-                        entity_id,
-                        plan=("enterprise" if is_active else "free"),
-                        status=status,
-                        extra_public={
-                            "subscription": ("enterprise" if is_active else None),
-                            "plan": ("enterprise" if is_active else "free"),
-                            "seats": (seats if is_active else 0),
-                        }
-                    )
-                    org_id = entity_id
-                    priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
-                    clerk_svc.set_org_plan(org_id, plan=("enterprise" if is_active else "free"), status=status, extra_private=priv)
-                    _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
-                    current_app.logger.info(f"[Stripe] propagando entitlement a miembros de {org_id} (active={is_active})")
-                    try:
-                        clerk_svc.set_entitlement_for_org_members(
-                            org_id,
-                            "enterprise_member" if is_active else None
-                        )
-                    except Exception:
-                        current_app.logger.exception("[Stripe] no se pudo propagar entitlement a miembros (guest org)")
-                    if event_id: _mark_processed(event_id)
-                    return jsonify(received=True), 200
-                except Exception:
-                    current_app.logger.exception("[Stripe] guest enterprise provisioning (subs.*) failed")
+            entity_type = sub_md.get("entity_type") or cust_md.get("entity_type")
+            entity_id = sub_md.get("entity_id") or cust_md.get("entity_id")
+            entity_email = sub_md.get("entity_email") or cust_md.get("entity_email")
 
             if entity_type == "user" and entity_id:
                 priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
