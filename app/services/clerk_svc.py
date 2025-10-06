@@ -1,4 +1,3 @@
-# app/services/clerk_svc.py
 from __future__ import annotations
 
 import os
@@ -40,6 +39,17 @@ def get_user_memberships(user_id: str) -> List[Dict[str, Any]]:
     data = r.json()
     return data if isinstance(data, list) else (data.get("data") or [])
 
+def list_org_memberships(org_id: str) -> List[Dict[str, Any]]:
+    """Lista los memberships de una organización."""
+    r = httpx.get(
+        f"{API_BASE}/organizations/{org_id}/memberships",
+        headers=_headers(),
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else (data.get("data") or [])
+
 # ─────────── Metadata ───────────
 
 def update_user_metadata(user_id: str, public: dict | None = None, private: dict | None = None) -> dict:
@@ -68,27 +78,24 @@ def update_org_metadata(org_id: str, public: dict | None = None, private: dict |
 
 # ─────────── Creación organización + admin ───────────
 
-def create_org_for_user(user_id: str, name: str, public: dict | None = None, private: dict | None = None) -> dict:
+def create_org_for_user(user_id: str | None, name: str, public: dict | None = None, private: dict | None = None) -> dict:
     """
-    Crea la organización y añade al usuario como admin.
-    No usa 'created_by' para maximizar compatibilidad con la API.
+    Crea la organización y (si user_id) añade al usuario como admin.
     """
-    # 1) Crear la organización
     r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json={"name": name}, timeout=10)
     r.raise_for_status()
     org = r.json()
     org_id = org.get("id")
 
-    # 2) Añadir membership admin
-    r2 = httpx.post(
-        f"{API_BASE}/organizations/{org_id}/memberships",
-        headers=_headers(),
-        json={"user_id": user_id, "role": "admin"},
-        timeout=10,
-    )
-    r2.raise_for_status()
+    if user_id:
+        r2 = httpx.post(
+            f"{API_BASE}/organizations/{org_id}/memberships",
+            headers=_headers(),
+            json={"user_id": user_id, "role": "admin"},
+            timeout=10,
+        )
+        r2.raise_for_status()
 
-    # 3) Metadata opcional
     if public or private:
         update_org_metadata(org_id, public, private)
 
@@ -97,7 +104,10 @@ def create_org_for_user(user_id: str, name: str, public: dict | None = None, pri
 # ─────────── Helpers de plan ───────────
 
 def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_private: dict | None = None, extra_public: dict | None = None) -> dict:
-    pub = {"plan": plan}
+    # Merge del public_metadata para no machacar otras claves (ej: entitlement)
+    curr = get_user(user_id)
+    pub = dict((curr.get("public_metadata") or {}))
+    pub.update({"plan": plan})
     if status is not None:
         pub["status"] = status
     if extra_public:
@@ -106,13 +116,38 @@ def set_user_plan(user_id: str, plan: str, status: str | None = None, extra_priv
     return update_user_metadata(user_id, public=pub, private=priv)
 
 def set_org_plan(org_id: str, plan: str, status: str | None = None, extra_private: dict | None = None, extra_public: dict | None = None) -> dict:
-    pub = {"plan": plan}
+    curr = get_org(org_id)
+    pub = dict((curr.get("public_metadata") or {}))
+    pub.update({"plan": plan})
     if status is not None:
         pub["status"] = status
     if extra_public:
         pub.update(extra_public)
     priv = extra_private or {}
     return update_org_metadata(org_id, public=pub, private=priv)
+
+# ─────────── Propagación de entitlement a miembros ───────────
+
+def set_entitlement_for_org_members(org_id: str, entitlement: str | None):
+    """
+    Propaga public_metadata.entitlement a todos los usuarios miembros de la org.
+    Mantiene el resto de claves de public_metadata (merge).
+    """
+    members = list_org_memberships(org_id)
+    for m in members:
+        uid = (
+            (m.get("public_user_data") or {}).get("user_id")
+            or m.get("user_id")
+        )
+        if not uid:
+            continue
+        u = get_user(uid)
+        pub = dict((u.get("public_metadata") or {}))
+        if entitlement is None:
+            pub.pop("entitlement", None)
+        else:
+            pub["entitlement"] = entitlement
+        update_user_metadata(uid, public=pub)
 
 # ─────────── Invitado enterprise (opcional) ───────────
 

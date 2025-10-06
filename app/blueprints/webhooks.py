@@ -21,7 +21,6 @@ def _init_stripe():
         stripe.api_key = sk
     return sk, None
 
-# (Opcional) marca procesados si implementas idempotencia fuera (aquí no persistimos)
 def _mark_processed(event_id: str):
     return
 
@@ -122,6 +121,14 @@ def stripe_webhook_api():
                         "plan": ("enterprise" if is_active else "free"),
                     },
                 )
+                # ⇣ NUEVO: propagar entitlement a miembros
+                try:
+                    clerk_svc.set_entitlement_for_org_members(
+                        entity_id,
+                        "enterprise_member" if is_active else None
+                    )
+                except Exception:
+                    current_app.logger.exception("[Stripe] no se pudo propagar entitlement a miembros (checkout.completed)")
 
         # customer.subscription.{created,updated,deleted}
         elif etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
@@ -161,6 +168,14 @@ def stripe_webhook_api():
                     priv = {"billing": {"stripeCustomerId": sub.get("customer"), "subscriptionId": sub.get("id"), "status": status}}
                     clerk_svc.set_org_plan(org_id, plan=("enterprise" if is_active else "free"), status=status, extra_private=priv)
                     _ensure_customer_has_entity(sub.get("customer"), "org", org_id, entity_email)
+                    # Propaga entitlement
+                    try:
+                        clerk_svc.set_entitlement_for_org_members(
+                            org_id,
+                            "enterprise_member" if is_active else None
+                        )
+                    except Exception:
+                        current_app.logger.exception("[Stripe] no se pudo propagar entitlement a miembros (guest org)")
                     if event_id: _mark_processed(event_id)
                     return jsonify(received=True), 200
                 except Exception:
@@ -188,6 +203,14 @@ def stripe_webhook_api():
                         "plan": ("enterprise" if is_active else "free"),
                     }
                 )
+                # ⇣ NUEVO: propagar entitlement a miembros
+                try:
+                    clerk_svc.set_entitlement_for_org_members(
+                        entity_id,
+                        "enterprise_member" if is_active else None
+                    )
+                except Exception:
+                    current_app.logger.exception("[Stripe] no se pudo propagar entitlement a miembros (subs.*)")
 
         if event_id: _mark_processed(event_id)
         return jsonify(received=True), 200
@@ -232,7 +255,6 @@ def clerk_webhook_api():
 
     return jsonify(ok=True), 200
 
-# Alias recomendados del webhook de Stripe
 @bp.post("/billing/webhook")
 def stripe_webhook_api_alias():
     return stripe_webhook_api()
