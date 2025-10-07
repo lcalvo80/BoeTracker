@@ -15,9 +15,6 @@ from jose.exceptions import ExpiredSignatureError, JWTClaimsError
 
 # ───────────────── helpers de config ─────────────────
 def _cfg(key: str, default: Optional[str] = None) -> str:
-    """
-    Lee de current_app.config si hay app context, si no, de variables de entorno.
-    """
     if has_app_context():
         try:
             val = current_app.config.get(key)
@@ -115,7 +112,7 @@ def _decode_token(
         kwargs["issuer"] = issuer
 
     try:
-        return jwt.decode(token, leeway=leeway, **kwargs)  # python-jose 3.x
+        return jwt.decode(token, leeway=leeway, **kwargs)
     except TypeError:
         return jwt.decode(token, **kwargs)
 
@@ -126,10 +123,6 @@ def _bypass_enabled() -> bool:
 
 # ───────────────── helpers de claims ─────────────────
 def _merge_inner_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Algunas plantillas meten las custom claims bajo el claim 'claims'.
-    Este mergea ese objeto interno con el nivel raíz (sin pisar claves existentes).
-    """
     if isinstance(claims, dict) and isinstance(claims.get("claims"), dict):
         merged = dict(claims)
         inner = dict(claims["claims"])
@@ -141,30 +134,18 @@ def _merge_inner_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
-    """
-    Clerk puede enviar la org activa en varias formas:
-      - org_id / organization_id
-      - o: { id, ... } / org: { id, ... } / organization: { id, ... }
-      - orgs / organizations: [ { id, ... }, ... ]
-    """
     if not isinstance(claims, dict):
         return None
-
-    # directos
     for k in ("org_id", "organization_id"):
         v = claims.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-
-    # objetos anidados
     for k in ("o", "org", "organization"):
         o = claims.get(k)
         if isinstance(o, dict):
             vid = o.get("id")
             if isinstance(vid, str) and vid.strip():
                 return vid.strip()
-
-    # listas
     for k in ("orgs", "organizations"):
         arr = claims.get(k)
         if isinstance(arr, list):
@@ -173,32 +154,21 @@ def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
                     vid = it.get("id")
                     if isinstance(vid, str) and vid.strip():
                         return vid.strip()
-
     return None
 
 
 def _extract_org_role(claims: Dict[str, Any]) -> Optional[str]:
-    """
-    Intenta extraer el rol de la organización activa:
-      - Directo: org_role / organization_role
-      - Nested: organization.membership.role / org.membership.role
-      - organization_membership.role (si alguna plantilla lo añade como objeto dedicado)
-    """
     if not isinstance(claims, dict):
         return None
-
     for k in ("org_role", "organization_role"):
         v = claims.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-
-    # organization_membership: { role: ... }
     om = claims.get("organization_membership")
     if isinstance(om, dict):
         r = om.get("role")
         if isinstance(r, str) and r.strip():
             return r.strip()
-
     for k in ("organization", "org"):
         obj = claims.get(k)
         if isinstance(obj, dict):
@@ -206,14 +176,10 @@ def _extract_org_role(claims: Dict[str, Any]) -> Optional[str]:
             r = mem.get("role")
             if isinstance(r, str) and r.strip():
                 return r.strip()
-
     return None
 
 
 def _normalize_org_role(v: Optional[str]) -> Optional[str]:
-    """
-    Normaliza rol de org a 'admin' | 'member' (None si vacío).
-    """
     if v is None:
         return None
     r = str(v).strip().lower()
@@ -223,21 +189,11 @@ def _normalize_org_role(v: Optional[str]) -> Optional[str]:
         return "admin"
     if r in ("basic_member", "member", "org:member"):
         return "member"
-    # Si Clerk en futuro añade alias, mantenemos por compat:
     return "admin" if r == "admin" else "member"
 
 
 # ───────────────── decorador ─────────────────
 def require_clerk_auth(fn):
-    """
-    - Si DISABLE_AUTH=1 -> bypass (inyecta g.clerk mínimo).
-    - Si no, valida Bearer JWT contra JWKS de Clerk.
-    Entorno soportado:
-      CLERK_JWKS_URL (obligatoria si no hay bypass)
-      CLERK_AUDIENCE, CLERK_ISSUER (opcionales)
-      CLERK_JWKS_TTL, CLERK_LEEWAY, CLERK_JWKS_TIMEOUT
-      EXPOSE_CLAIMS_DEBUG
-    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if _bypass_enabled():
@@ -263,7 +219,7 @@ def require_clerk_auth(fn):
             leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
         except Exception:
             leeway = 30
-        audience = _cfg("CLERK_AUDIENCE", "") or None  # normalmente 'backend'
+        audience = _cfg("CLERK_AUDIENCE", "") or None
         issuer = _cfg("CLERK_ISSUER", "") or None
         try:
             ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
@@ -297,13 +253,11 @@ def require_clerk_auth(fn):
         except Exception as e:
             abort(401, f"Invalid token: {e}")
 
-        # Soportar tokens con custom claims dentro de 'claims'
         claims = _merge_inner_claims(claims)
 
-        # Identidad
         user_id = claims.get("sub") or claims.get("user_id")
         org_id = _extract_org_id(claims)
-        org_role = _normalize_org_role(_extract_org_role(claims))  # ← normalizado aquí
+        org_role = _normalize_org_role(_extract_org_role(claims))
 
         email = (
             claims.get("email")
@@ -319,13 +273,11 @@ def require_clerk_auth(fn):
         if not user_id:
             abort(401, "Missing user id in token")
 
-        # Sanitizar org_id de plantillas sin resolver
         if isinstance(org_id, str):
             s = org_id.strip()
             if not s or s.startswith("{{") or not s.startswith("org_"):
                 org_id = None
 
-        # Fallback por cabecera si no vino en el token
         if not org_id:
             xhdr = (request.headers.get("X-Org-Id") or "").strip()
             if xhdr.startswith("org_"):
@@ -334,7 +286,7 @@ def require_clerk_auth(fn):
         g.clerk = {
             "user_id": user_id,
             "org_id": org_id,
-            "org_role": org_role,  # ← ya 'admin' | 'member'
+            "org_role": org_role,  # admin | member
             "email": email,
             "name": name,
             "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,
