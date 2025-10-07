@@ -36,7 +36,6 @@ def _truthy(v: Any) -> bool:
 class _JWKSCache:
     def __init__(self) -> None:
         self._store: Dict[str, Dict[str, Any]] = {}
-        a = {}  # just to keep lints quiet
         self._at: Dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -126,6 +125,21 @@ def _bypass_enabled() -> bool:
 
 
 # ───────────────── helpers de claims ─────────────────
+def _merge_inner_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Algunas plantillas meten las custom claims bajo el claim 'claims'.
+    Este mergea ese objeto interno con el nivel raíz (sin pisar claves existentes).
+    """
+    if isinstance(claims, dict) and isinstance(claims.get("claims"), dict):
+        merged = dict(claims)
+        inner = dict(claims["claims"])
+        for k, v in inner.items():
+            if k not in merged:
+                merged[k] = v
+        return merged
+    return claims
+
+
 def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
     """
     Clerk puede enviar la org activa en varias formas:
@@ -165,24 +179,33 @@ def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
 
 def _extract_org_role(claims: Dict[str, Any]) -> Optional[str]:
     """
-    Intenta extraer el rol de la organización activa.
-    - Directo: org_role
-    - Nested: organization.membership.role / org.membership.role
+    Intenta extraer el rol de la organización activa:
+      - Directo: org_role / organization_role
+      - Nested: organization.membership.role / org.membership.role
+      - organization_membership.role (si alguna plantilla lo añade como objeto dedicado)
     """
     if not isinstance(claims, dict):
         return None
 
-    direct = claims.get("org_role")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
+    for k in ("org_role", "organization_role"):
+        v = claims.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # organization_membership: { role: ... }
+    om = claims.get("organization_membership")
+    if isinstance(om, dict):
+        r = om.get("role")
+        if isinstance(r, str) and r.strip():
+            return r.strip()
 
     for k in ("organization", "org"):
         obj = claims.get(k)
         if isinstance(obj, dict):
             mem = obj.get("membership") or {}
-            role = mem.get("role")
-            if isinstance(role, str) and role.strip():
-                return role.strip()
+            r = mem.get("role")
+            if isinstance(r, str) and r.strip():
+                return r.strip()
 
     return None
 
@@ -200,95 +223,104 @@ def require_clerk_auth(fn):
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
-      if _bypass_enabled():
-          g.clerk = {
-              "user_id": "dev_user",
-              "org_id": None,
-              "org_role": None,
-              "email": "dev@example.com",
-              "name": "Dev User",
-              "raw_claims": None,
-          }
-          return fn(*args, **kwargs)
+        if _bypass_enabled():
+            g.clerk = {
+                "user_id": "dev_user",
+                "org_id": None,
+                "org_role": None,
+                "email": "dev@example.com",
+                "name": "Dev User",
+                "raw_claims": None,
+            }
+            return fn(*args, **kwargs)
 
-      token = _get_bearer_token()
-      if not token:
-          abort(401, "Missing bearer token")
+        token = _get_bearer_token()
+        if not token:
+            abort(401, "Missing bearer token")
 
-      jwks_url = _cfg("CLERK_JWKS_URL", "")
-      if not jwks_url:
-          abort(500, "CLERK_JWKS_URL not configured")
+        jwks_url = _cfg("CLERK_JWKS_URL", "")
+        if not jwks_url:
+            abort(500, "CLERK_JWKS_URL not configured")
 
-      try:
-          leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
-      except Exception:
-          leeway = 30
-      audience = _cfg("CLERK_AUDIENCE", "") or None  # ← aquí debe ser "backend"
-      issuer = _cfg("CLERK_ISSUER", "") or None
-      try:
-          ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
-      except Exception:
-          ttl = 3600
+        try:
+            leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
+        except Exception:
+            leeway = 30
+        audience = _cfg("CLERK_AUDIENCE", "") or None  # ← debe ser 'backend'
+        issuer = _cfg("CLERK_ISSUER", "") or None
+        try:
+            ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
+        except Exception:
+            ttl = 3600
 
-      try:
-          headers = jwt.get_unverified_header(token)
-      except Exception as e:
-          abort(401, f"Invalid token header: {e}")
+        try:
+            headers = jwt.get_unverified_header(token)
+        except Exception as e:
+            abort(401, f"Invalid token header: {e}")
 
-      kid = headers.get("kid")
-      alg = headers.get("alg", "RS256")
-      if not kid:
-          abort(401, "Missing kid header")
+        kid = headers.get("kid")
+        alg = headers.get("alg", "RS256")
+        if not kid:
+            abort(401, "Missing kid header")
 
-      try:
-          jwks = _JWKS.get(jwks_url, ttl=ttl)
-          key = _pick_key_for_kid(jwks, kid) or _pick_key_for_kid(_JWKS.refresh(jwks_url), kid)
-          if key is None:
-              abort(401, "Unknown token kid")
-      except Exception as e:
-          abort(503, f"JWKS fetch error: {e}")
+        try:
+            jwks = _JWKS.get(jwks_url, ttl=ttl)
+            key = _pick_key_for_kid(jwks, kid) or _pick_key_for_kid(_JWKS.refresh(jwks_url), kid)
+            if key is None:
+                abort(401, "Unknown token kid")
+        except Exception as e:
+            abort(503, f"JWKS fetch error: {e}")
 
-      try:
-          claims = _decode_token(token, key, leeway, audience, issuer, alg)
-      except ExpiredSignatureError:
-          abort(401, "Token expired")
-      except JWTClaimsError as e:
-          abort(401, f"Invalid claims: {e}")
-      except Exception as e:
-          abort(401, f"Invalid token: {e}")
+        try:
+            claims = _decode_token(token, key, leeway, audience, issuer, alg)
+        except ExpiredSignatureError:
+            abort(401, "Token expired")
+        except JWTClaimsError as e:
+            abort(401, f"Invalid claims: {e}")
+        except Exception as e:
+            abort(401, f"Invalid token: {e}")
 
-      # Identidad
-      user_id = claims.get("sub") or claims.get("user_id")
-      org_id = _extract_org_id(claims)
-      org_role = _extract_org_role(claims)
+        # Soportar tokens con custom claims dentro de 'claims'
+        claims = _merge_inner_claims(claims)
 
-      email = (
-          claims.get("email")
-          or claims.get("primary_email_address")
-          or (claims.get("email_addresses") or [{}])[0].get("email_address")
-      )
-      name = (
-          claims.get("name")
-          or claims.get("full_name")
-          or " ".join([claims.get("first_name") or "", claims.get("last_name") or ""]).strip()
-      )
+        # Identidad
+        user_id = claims.get("sub") or claims.get("user_id")
+        org_id = _extract_org_id(claims)
+        org_role = _extract_org_role(claims)
 
-      if not user_id:
-          abort(401, "Missing user id in token")
+        email = (
+            claims.get("email")
+            or claims.get("primary_email_address")
+            or (claims.get("email_addresses") or [{}])[0].get("email_address")
+        )
+        name = (
+            claims.get("name")
+            or claims.get("full_name")
+            or " ".join([claims.get("first_name") or "", claims.get("last_name") or ""]).strip()
+        )
 
-      # Sanitizar org_id
-      if isinstance(org_id, str):
-          s = org_id.strip()
-          if not s or s.startswith("{{") or not s.startswith("org_"):
-              org_id = None
+        if not user_id:
+            abort(401, "Missing user id in token")
 
-      g.clerk = {
-          "user_id": user_id,
-          "org_id": org_id,
-          "org_role": org_role,
-          "email": email,
-          "name": name,
-          "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,
-      }
-      return fn(*args, **kwargs)
+        # Sanitizar org_id de plantillas sin resolver
+        if isinstance(org_id, str):
+            s = org_id.strip()
+            if not s or s.startswith("{{") or not s.startswith("org_"):
+                org_id = None
+
+        # Fallback por cabecera si no vino en el token
+        if not org_id:
+            xhdr = (request.headers.get("X-Org-Id") or "").strip()
+            if xhdr.startswith("org_"):
+                org_id = xhdr
+
+        g.clerk = {
+            "user_id": user_id,
+            "org_id": org_id,
+            "org_role": org_role,
+            "email": email,
+            "name": name,
+            "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,
+        }
+        return fn(*args, **kwargs)
     return wrapper
