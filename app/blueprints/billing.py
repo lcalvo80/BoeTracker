@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
-from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, set_* , get_membership
+from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, get_membership
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
@@ -82,16 +82,27 @@ def _load_auth_guard():
 
 _require_auth = _load_auth_guard()
 
-# ─────────── identidad ───────────
+# ─────────── identidad / roles ───────────
+def _role_is_admin(raw: str) -> bool:
+    r = (raw or "").lower()
+    return r in ("admin", "org:admin", "owner")
+
 def _derive_identity():
     c = getattr(g, "clerk", {}) or {}
     return c.get("user_id"), c.get("email"), c.get("name"), c.get("org_id"), c.get("raw_claims") or {}
 
 def _is_org_admin(user_id: str, org_id: str) -> bool:
+    # 1) intenta con las claims ya presentes en g.clerk
+    try:
+        cl = getattr(g, "clerk", {}) or {}
+        if cl.get("org_id") == org_id and _role_is_admin(cl.get("org_role")):
+            return True
+    except Exception:
+        pass
+    # 2) fallback: consulta a Clerk
     try:
         m = clerk_svc.get_membership(user_id, org_id)
-        role = (m.get("role") or "member").lower()
-        return role in ("admin", "owner")
+        return _role_is_admin(m.get("role"))
     except Exception:
         return False
 
@@ -513,7 +524,6 @@ def checkout_enterprise():
         return jsonify(error="cannot ensure stripe customer", detail=str(e)), 502
 
     base_success = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    # ⬇️ añadimos pista para el frontend
     success_url   = _with_success_params(base_success, scope="org", org_id=org_id)
     cancel_url    = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
 
