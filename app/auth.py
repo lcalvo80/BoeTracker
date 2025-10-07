@@ -36,6 +36,7 @@ def _truthy(v: Any) -> bool:
 class _JWKSCache:
     def __init__(self) -> None:
         self._store: Dict[str, Dict[str, Any]] = {}
+        a = {}  # just to keep lints quiet
         self._at: Dict[str, int] = {}
         self._lock = threading.Lock()
 
@@ -162,6 +163,30 @@ def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_org_role(claims: Dict[str, Any]) -> Optional[str]:
+    """
+    Intenta extraer el rol de la organización activa.
+    - Directo: org_role
+    - Nested: organization.membership.role / org.membership.role
+    """
+    if not isinstance(claims, dict):
+        return None
+
+    direct = claims.get("org_role")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    for k in ("organization", "org"):
+        obj = claims.get(k)
+        if isinstance(obj, dict):
+            mem = obj.get("membership") or {}
+            role = mem.get("role")
+            if isinstance(role, str) and role.strip():
+                return role.strip()
+
+    return None
+
+
 # ───────────────── decorador ─────────────────
 def require_clerk_auth(fn):
     """
@@ -175,92 +200,95 @@ def require_clerk_auth(fn):
     """
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if _bypass_enabled():
-            g.clerk = {
-                "user_id": "dev_user",
-                "org_id": None,
-                "email": "dev@example.com",
-                "name": "Dev User",
-                "raw_claims": None,
-            }
-            return fn(*args, **kwargs)
+      if _bypass_enabled():
+          g.clerk = {
+              "user_id": "dev_user",
+              "org_id": None,
+              "org_role": None,
+              "email": "dev@example.com",
+              "name": "Dev User",
+              "raw_claims": None,
+          }
+          return fn(*args, **kwargs)
 
-        token = _get_bearer_token()
-        if not token:
-            abort(401, "Missing bearer token")
+      token = _get_bearer_token()
+      if not token:
+          abort(401, "Missing bearer token")
 
-        jwks_url = _cfg("CLERK_JWKS_URL", "")
-        if not jwks_url:
-            abort(500, "CLERK_JWKS_URL not configured")
+      jwks_url = _cfg("CLERK_JWKS_URL", "")
+      if not jwks_url:
+          abort(500, "CLERK_JWKS_URL not configured")
 
-        try:
-            leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
-        except Exception:
-            leeway = 30
-        audience = _cfg("CLERK_AUDIENCE", "") or None
-        issuer = _cfg("CLERK_ISSUER", "") or None
-        try:
-            ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
-        except Exception:
-            ttl = 3600
+      try:
+          leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
+      except Exception:
+          leeway = 30
+      audience = _cfg("CLERK_AUDIENCE", "") or None  # ← aquí debe ser "backend"
+      issuer = _cfg("CLERK_ISSUER", "") or None
+      try:
+          ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
+      except Exception:
+          ttl = 3600
 
-        try:
-            headers = jwt.get_unverified_header(token)
-        except Exception as e:
-            abort(401, f"Invalid token header: {e}")
+      try:
+          headers = jwt.get_unverified_header(token)
+      except Exception as e:
+          abort(401, f"Invalid token header: {e}")
 
-        kid = headers.get("kid")
-        alg = headers.get("alg", "RS256")
-        if not kid:
-            abort(401, "Missing kid header")
+      kid = headers.get("kid")
+      alg = headers.get("alg", "RS256")
+      if not kid:
+          abort(401, "Missing kid header")
 
-        try:
-            jwks = _JWKS.get(jwks_url, ttl=ttl)
-            key = _pick_key_for_kid(jwks, kid) or _pick_key_for_kid(_JWKS.refresh(jwks_url), kid)
-            if key is None:
-                abort(401, "Unknown token kid")
-        except Exception as e:
-            abort(503, f"JWKS fetch error: {e}")
+      try:
+          jwks = _JWKS.get(jwks_url, ttl=ttl)
+          key = _pick_key_for_kid(jwks, kid) or _pick_key_for_kid(_JWKS.refresh(jwks_url), kid)
+          if key is None:
+              abort(401, "Unknown token kid")
+      except Exception as e:
+          abort(503, f"JWKS fetch error: {e}")
 
-        try:
-            claims = _decode_token(token, key, leeway, audience, issuer, alg)
-        except ExpiredSignatureError:
-            abort(401, "Token expired")
-        except JWTClaimsError as e:
-            abort(401, f"Invalid claims: {e}")
-        except Exception as e:
-            abort(401, f"Invalid token: {e}")
+      try:
+          claims = _decode_token(token, key, leeway, audience, issuer, alg)
+      except ExpiredSignatureError:
+          abort(401, "Token expired")
+      except JWTClaimsError as e:
+          abort(401, f"Invalid claims: {e}")
+      except Exception as e:
+          abort(401, f"Invalid token: {e}")
 
-        # Identidad
-        user_id = claims.get("sub") or claims.get("user_id")
-        org_id = _extract_org_id(claims)
+      # Identidad
+      user_id = claims.get("sub") or claims.get("user_id")
+      org_id = _extract_org_id(claims)
+      org_role = _extract_org_role(claims)
 
-        email = (
-            claims.get("email")
-            or claims.get("primary_email_address")
-            or (claims.get("email_addresses") or [{}])[0].get("email_address")
-        )
-        name = (
-            claims.get("name")
-            or claims.get("full_name")
-            or " ".join([claims.get("first_name") or "", claims.get("last_name") or ""]).strip()
-        )
+      email = (
+          claims.get("email")
+          or claims.get("primary_email_address")
+          or (claims.get("email_addresses") or [{}])[0].get("email_address")
+      )
+      name = (
+          claims.get("name")
+          or claims.get("full_name")
+          or " ".join([claims.get("first_name") or "", claims.get("last_name") or ""]).strip()
+      )
 
-        if not user_id:
-            abort(401, "Missing user id in token")
+      if not user_id:
+          abort(401, "Missing user id in token")
 
-        # Sanitizar org_id
-        if isinstance(org_id, str):
-            s = org_id.strip()
-            if not s or s.startswith("{{") or not s.startswith("org_"):
-                org_id = None
+      # Sanitizar org_id
+      if isinstance(org_id, str):
+          s = org_id.strip()
+          if not s or s.startswith("{{") or not s.startswith("org_"):
+              org_id = None
 
-        g.clerk = {
-            "user_id": user_id,
-            "org_id": org_id,
-            "email": email,
-            "name": name,
-            "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,
-        }
-        return fn(*args, **kwargs)
+      g.clerk = {
+          "user_id": user_id,
+          "org_id": org_id,
+          "org_role": org_role,
+          "email": email,
+          "name": name,
+          "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,
+      }
+      return fn(*args, **kwargs)
     return wrapper
