@@ -210,6 +210,23 @@ def _extract_org_role(claims: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _normalize_org_role(v: Optional[str]) -> Optional[str]:
+    """
+    Normaliza rol de org a 'admin' | 'member' (None si vacío).
+    """
+    if v is None:
+        return None
+    r = str(v).strip().lower()
+    if not r:
+        return None
+    if r in ("org:admin", "owner", "organization_admin"):
+        return "admin"
+    if r in ("basic_member", "member", "org:member"):
+        return "member"
+    # Si Clerk en futuro añade alias, mantenemos por compat:
+    return "admin" if r == "admin" else "member"
+
+
 # ───────────────── decorador ─────────────────
 def require_clerk_auth(fn):
     """
@@ -246,7 +263,7 @@ def require_clerk_auth(fn):
             leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
         except Exception:
             leeway = 30
-        audience = _cfg("CLERK_AUDIENCE", "") or None  # ← debe ser 'backend'
+        audience = _cfg("CLERK_AUDIENCE", "") or None  # normalmente 'backend'
         issuer = _cfg("CLERK_ISSUER", "") or None
         try:
             ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
@@ -286,7 +303,7 @@ def require_clerk_auth(fn):
         # Identidad
         user_id = claims.get("sub") or claims.get("user_id")
         org_id = _extract_org_id(claims)
-        org_role = _extract_org_role(claims)
+        org_role = _normalize_org_role(_extract_org_role(claims))  # ← normalizado aquí
 
         email = (
             claims.get("email")
@@ -317,7 +334,7 @@ def require_clerk_auth(fn):
         g.clerk = {
             "user_id": user_id,
             "org_id": org_id,
-            "org_role": org_role,
+            "org_role": org_role,  # ← ya 'admin' | 'member'
             "email": email,
             "name": name,
             "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,

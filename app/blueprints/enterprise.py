@@ -1,7 +1,12 @@
+# app/blueprints/enterprise.py
 from __future__ import annotations
-import os, requests
+
+import os
 from typing import Any, Dict, List, Optional
+
+import requests
 from flask import Blueprint, jsonify, request, g, current_app
+
 from app.auth import require_clerk_auth
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
@@ -26,12 +31,14 @@ def _base() -> str:
     return "https://api.clerk.com/v1"
 
 def _map_role_out(role: str) -> str:
+    """Normaliza el rol a 'admin' | 'member' (UI)."""
     r = (role or "").strip().lower()
-    if r in ("admin", "owner"):
+    if r in ("admin", "owner", "org:admin", "organization_admin"):
         return "admin"
     return "member"
 
 def _map_role_in(role: str) -> str:
+    """Mapea rol de UI -> Clerk API ('admin'|'basic_member')."""
     return "admin" if (role or "").strip().lower() == "admin" else "basic_member"
 
 def _current_user_ids() -> tuple[str, Optional[str]]:
@@ -41,6 +48,7 @@ def _current_user_ids() -> tuple[str, Optional[str]]:
     return c.get("user_id"), org_id
 
 def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
+    """Comprueba en Clerk el rol real del usuario en esa org."""
     try:
         url = f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={user_id}"
         res = requests.get(url, headers=_headers_json(), timeout=10)
@@ -48,7 +56,7 @@ def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
         data = res.json()
         arr = data if isinstance(data, list) else data.get("data") or []
         role = (arr[0].get("role") or "").lower() if arr else ""
-        return role in ("admin", "owner")
+        return role in ("admin", "owner", "organization_admin", "org:admin")
     except Exception as e:
         current_app.logger.warning(f"[enterprise] membership check skipped: {e}")
         return False
@@ -152,13 +160,21 @@ def org_info():
     except Exception:
         seats = 0
 
-    cur_role = "member"
-    try:
-        m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
-        if m:
-            cur_role = _map_role_out(m[0].get("role"))
-    except Exception:
-        pass
+    # Rol del usuario actual: prioriza el del token (g.clerk.org_role)
+    token_role = (getattr(g, "clerk", {}) or {}).get("org_role") or None
+    cur_role = token_role or "member"
+    if _map_role_out(cur_role) != "admin":
+        # si el token no venía con admin, reconcilia con membership real
+        try:
+            m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
+            if m:
+                cur_role = _map_role_out(m[0].get("role"))
+            else:
+                cur_role = "member"
+        except Exception:
+            cur_role = "member"
+    else:
+        cur_role = "admin"
 
     return jsonify({
         "id": org.get("id"),
@@ -166,7 +182,7 @@ def org_info():
         "seats": seats,
         "used_seats": len(members),
         "pending_invites": len(invites),
-        "current_user_role": cur_role,
+        "current_user_role": _map_role_out(cur_role),
     }), 200
 
 
@@ -182,19 +198,30 @@ def list_users():
         current_app.logger.exception("[enterprise] list memberships failed: %s", e)
         return jsonify(error="clerk memberships fetch failed"), 502
 
+    # rol del token (para reconciliar tu propia fila)
+    me = getattr(g, "clerk", {}) or {}
+    me_id = me.get("user_id")
+    me_role = _map_role_out(me.get("org_role") or "")
+
     out: List[Dict[str, Any]] = []
     for m in memberships:
         try:
             membership_id = m.get("id")
-            uid = (m.get("public_user_data") or {}).get("user_id") or m.get("user_id")
-            role = _map_role_out(m.get("role", "member"))
             pud = m.get("public_user_data") or {}
-            first = pud.get("first_name") or ""
-            last = pud.get("last_name") or ""
-            name = (first + " " + last).strip() or None
+            uid = pud.get("user_id") or m.get("user_id")
             email = pud.get("identifier") or ""
+            first = (pud.get("first_name") or "").strip()
+            last = (pud.get("last_name") or "").strip()
+            name = (first + " " + last).strip() or None
+
+            role = _map_role_out(m.get("role", "member"))
+            # Si es mi fila y el token ya dice admin, prioriza admin
+            if uid and me_id and uid == me_id and me_role == "admin":
+                role = "admin"
+
             out.append({
-                "id": membership_id,
+                "id": membership_id,             # compat UI
+                "membership_id": membership_id,  # explícito
                 "user_id": uid,
                 "name": name or "—",
                 "email": email,
@@ -280,8 +307,8 @@ def remove_user():
         return jsonify(error="forbidden: organization admin required"), 403
 
     payload = request.get_json(silent=True) or {}
-    membership_id = payload.get("membership_id")
-    target_user_id = payload.get("user_id")
+    membership_id = payload.get("membership_id") or payload.get("id")
+    target_user_id = payload.get("user_id") or payload.get("userId")
 
     try:
         if not membership_id and target_user_id:
@@ -289,12 +316,14 @@ def remove_user():
                 f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={target_user_id}",
                 headers=_headers_json(),
                 timeout=10,
-            ).json()
-            arr = q if isinstance(q, list) else q.get("data") or []
-            if arr:
-                membership_id = arr[0].get("id")
+            )
+            q.raise_for_status()
+            data = q.json()
+            arr = data if isinstance(data, list) else data.get("data") or []
+            membership_id = arr[0].get("id") if arr else None
+
         if not membership_id:
-            return jsonify(error="membership_id o user_id requerido"), 400
+            return jsonify(error="membership not found"), 404
 
         res = requests.delete(
             f"{_base()}/organizations/{org_id}/memberships/{membership_id}",
@@ -323,9 +352,13 @@ def update_role():
         return jsonify(error="forbidden: organization admin required"), 403
 
     payload = request.get_json(silent=True) or {}
-    membership_id = payload.get("membership_id")
-    target_user_id = payload.get("user_id")
+    membership_id = payload.get("membership_id") or payload.get("id")
+    target_user_id = payload.get("user_id") or payload.get("userId")
     role_ui = (payload.get("role") or "").strip().lower()
+
+    # Normaliza alias de rol de entrada
+    if role_ui in ("org:admin", "owner", "organization_admin"):
+        role_ui = "admin"
     if role_ui not in ("member", "admin"):
         return jsonify(error="role inválido (member|admin)"), 400
 
@@ -335,12 +368,14 @@ def update_role():
                 f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={target_user_id}",
                 headers=_headers_json(),
                 timeout=10,
-            ).json()
-            arr = q if isinstance(q, list) else q.get("data") or []
-            if arr:
-                membership_id = arr[0].get("id")
+            )
+            q.raise_for_status()
+            data = q.json()
+            arr = data if isinstance(data, list) else data.get("data") or []
+            membership_id = arr[0].get("id") if arr else None
+
         if not membership_id:
-            return jsonify(error="membership_id o user_id requerido"), 400
+            return jsonify(error="membership not found"), 404
 
         res = requests.patch(
             f"{_base()}/organizations/{org_id}/memberships/{membership_id}",
