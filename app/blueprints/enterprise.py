@@ -4,6 +4,7 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 from flask import Blueprint, jsonify, request, g, current_app
 from app.auth import require_clerk_auth
+from app.services.entitlements import maybe_sync_current_user_entitlement  # 👈 NUEVO
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 
@@ -53,6 +54,14 @@ def _current_user_ids() -> tuple[str, Optional[str]]:
     return c.get("user_id"), org_id
 
 def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
+    # 1) intenta con las claims ya presentes en g.clerk (más rápido)
+    try:
+        cl = getattr(g, "clerk", {}) or {}
+        if cl.get("org_id") == org_id and (cl.get("org_role") or "").lower() in ("admin", "owner", "org:admin", "orgadmin", "organization_admin"):
+            return True
+    except Exception:
+        pass
+    # 2) fallback: consulta a Clerk
     try:
         url = f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={user_id}"
         res = requests.get(url, headers=_headers_json(), timeout=10)
@@ -148,6 +157,12 @@ def org_info():
     if not org_id:
         return jsonify({"id": None, "name": None, "seats": 0, "used_seats": 0, "pending_invites": 0, "current_user_role": None})
 
+    # 👇 Sincroniza de forma silenciosa el entitlement del usuario actual si la org es Enterprise
+    try:
+        maybe_sync_current_user_entitlement(org_id)
+    except Exception:
+        pass
+
     try:
         org = _get_org(org_id)
         members = _list_memberships(org_id)
@@ -156,19 +171,28 @@ def org_info():
         current_app.logger.exception("[enterprise] fetch org/members failed: %s", e)
         return jsonify(error="clerk org fetch failed"), 502
 
+    # seats desde public_metadata
     seats = 0
     try:
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
     except Exception:
         seats = 0
 
-    cur_role = "member"
-    try:
-        m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
-        if m:
-            cur_role = _map_role_out(m[0].get("role"))
-    except Exception:
-        pass
+    # Rol desde JWT (fuente de verdad) con fallback al membership server-side
+    role_from_claims = ((getattr(g, "clerk", {}) or {}).get("org_role") or "").strip().lower()
+    if role_from_claims in ("org:admin", "orgadmin", "organization_admin"):
+        role_from_claims = "admin"
+    elif role_from_claims in ("org:owner",):
+        role_from_claims = "owner"
+
+    cur_role = role_from_claims or "member"
+    if cur_role == "member":
+        try:
+            m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
+            if m:
+                cur_role = _map_role_out(m[0].get("role"))
+        except Exception:
+            pass
 
     return jsonify({
         "id": org.get("id"),
@@ -176,7 +200,7 @@ def org_info():
         "seats": seats,
         "used_seats": len(members),
         "pending_invites": len(invites),
-        "current_user_role": cur_role,
+        "current_user_role": cur_role,  # ← ahora refleja el JWT
     }), 200
 
 

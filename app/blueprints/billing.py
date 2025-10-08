@@ -6,6 +6,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
 from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, get_membership
+from app.services.entitlements import sync_entitlements_for_org  # 👈 NUEVO
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
@@ -407,6 +408,11 @@ def billing_sync():
                     }
                 },
             )
+            # 👇 NUEVO: armoniza entitlements de todos los miembros cuando la org está/queda activa
+            try:
+                sync_entitlements_for_org(org_id)
+            except Exception:
+                pass
         else:
             user_id = _derive_identity()[0]
             clerk_svc.update_user_metadata(
@@ -594,7 +600,7 @@ def public_enterprise_checkout():
             cancel_url=cancel_url,
             allow_promotion_codes=True,
             subscription_data={"metadata": {"entity_type": "org", "entity_id": "", "plan_scope": "org", "plan": "enterprise"}},
-            metadata={"entity_type": "org", "entity_id": "", "plan_scope": "org", "plan": "enterprise",
+            metadata={"entity_type": "org", "entity_id": "", "plan": "enterprise", "plan_scope": "org",
                       "price_id": price_id, "entity_email": buyer_email, "seats": str(quantity)},
             tax_id_collection={"enabled": True},
             automatic_tax={"enabled": True},
