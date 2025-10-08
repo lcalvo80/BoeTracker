@@ -45,3 +45,19 @@ def api_add_item_comment(ident):
     return _call_endpoint("comments.add_item_comment", ident)
 
 # ⚠️ Nada de /checkout /portal /sync aquí. Billing ya los expone directamente.
+
+# === FE compatibility aliases: enterprise & billing ===
+
+# El front pide /api/enterprise/org/info → mapea a enterprise.org_info (tu ruta real es /api/enterprise/org)
+@bp.get("/enterprise/org/info")
+def api_enterprise_org_info_alias():
+    return _call_endpoint("enterprise.org_info")
+
+# El front pide /api/billing/open-customer-portal → mapea a billing.portal_post / billing.portal_get
+@bp.post("/billing/open-customer-portal")
+def api_billing_open_portal_post():
+    return _call_endpoint("billing.portal_post")
+
+@bp.get("/billing/open-customer-portal")
+def api_billing_open_portal_get():
+    return _call_endpoint("billing.portal_get")
