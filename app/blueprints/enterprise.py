@@ -4,7 +4,6 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 from flask import Blueprint, jsonify, request, g, current_app
 from app.auth import require_clerk_auth
-from app.services.entitlements import maybe_sync_current_user_entitlement  # 👈 NUEVO
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 
@@ -33,19 +32,29 @@ def _require_clerk_secret(fn):
     return wrapper
 
 def _headers_json() -> Dict[str, str]:
-    # Solo se llama si ya pasó el guard
     sk = _cfg("CLERK_SECRET_KEY", "")
     return {"Authorization": f"Bearer {sk}", "Content-Type": "application/json"}
 
 def _base() -> str:
     return "https://api.clerk.com/v1"
 
+# ────────────────────────────────────────────────────────────────
+#  Roles: Clerk puede devolver slugs 'admin'/'basic_member' o 'org:admin'/'org:member'
+#  Normalizamos siempre a ('admin'|'member') hacia fuera,
+#  y hacia Clerk enviamos ('org:admin'|'org:member') para máxima compatibilidad.
+# ────────────────────────────────────────────────────────────────
 def _map_role_out(role: str) -> str:
     r = (role or "").strip().lower()
-    return "admin" if r in ("admin", "owner") else "member"
+    if r in ("admin", "owner", "org:admin", "organization_admin", "orgadmin"):
+        return "admin"
+    return "member"
 
 def _map_role_in(role: str) -> str:
-    return "admin" if (role or "").strip().lower() == "admin" else "basic_member"
+    r = (role or "").strip().lower()
+    if r in ("admin", "owner", "org:admin"):
+        return "org:admin"
+    # 'member' | 'basic_member' | 'org:member' → org:member
+    return "org:member"
 
 def _current_user_ids() -> tuple[str, Optional[str]]:
     c = getattr(g, "clerk", {}) or {}
@@ -54,14 +63,6 @@ def _current_user_ids() -> tuple[str, Optional[str]]:
     return c.get("user_id"), org_id
 
 def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
-    # 1) intenta con las claims ya presentes en g.clerk (más rápido)
-    try:
-        cl = getattr(g, "clerk", {}) or {}
-        if cl.get("org_id") == org_id and (cl.get("org_role") or "").lower() in ("admin", "owner", "org:admin", "orgadmin", "organization_admin"):
-            return True
-    except Exception:
-        pass
-    # 2) fallback: consulta a Clerk
     try:
         url = f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={user_id}"
         res = requests.get(url, headers=_headers_json(), timeout=10)
@@ -69,7 +70,7 @@ def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
         data = res.json()
         arr = data if isinstance(data, list) else data.get("data") or []
         role = (arr[0].get("role") or "").lower() if arr else ""
-        return role in ("admin", "owner")
+        return role in ("admin", "owner", "org:admin", "organization_admin", "orgadmin")
     except Exception as e:
         current_app.logger.warning(f"[enterprise] membership check skipped: {e}")
         return False
@@ -157,12 +158,6 @@ def org_info():
     if not org_id:
         return jsonify({"id": None, "name": None, "seats": 0, "used_seats": 0, "pending_invites": 0, "current_user_role": None})
 
-    # 👇 Sincroniza de forma silenciosa el entitlement del usuario actual si la org es Enterprise
-    try:
-        maybe_sync_current_user_entitlement(org_id)
-    except Exception:
-        pass
-
     try:
         org = _get_org(org_id)
         members = _list_memberships(org_id)
@@ -171,28 +166,19 @@ def org_info():
         current_app.logger.exception("[enterprise] fetch org/members failed: %s", e)
         return jsonify(error="clerk org fetch failed"), 502
 
-    # seats desde public_metadata
     seats = 0
     try:
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
     except Exception:
         seats = 0
 
-    # Rol desde JWT (fuente de verdad) con fallback al membership server-side
-    role_from_claims = ((getattr(g, "clerk", {}) or {}).get("org_role") or "").strip().lower()
-    if role_from_claims in ("org:admin", "orgadmin", "organization_admin"):
-        role_from_claims = "admin"
-    elif role_from_claims in ("org:owner",):
-        role_from_claims = "owner"
-
-    cur_role = role_from_claims or "member"
-    if cur_role == "member":
-        try:
-            m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
-            if m:
-                cur_role = _map_role_out(m[0].get("role"))
-        except Exception:
-            pass
+    cur_role = "member"
+    try:
+        m = [x for x in members if (x.get("public_user_data") or {}).get("user_id") == user_id or x.get("user_id") == user_id]
+        if m:
+            cur_role = _map_role_out(m[0].get("role"))
+    except Exception:
+        pass
 
     return jsonify({
         "id": org.get("id"),
@@ -200,7 +186,7 @@ def org_info():
         "seats": seats,
         "used_seats": len(members),
         "pending_invites": len(invites),
-        "current_user_role": cur_role,  # ← ahora refleja el JWT
+        "current_user_role": cur_role,
     }), 200
 
 
@@ -262,7 +248,7 @@ def invite_user():
         return jsonify(error="emails requerido"), 400
 
     role_ui = (payload.get("role") or "member").strip().lower()
-    role = _map_role_in(role_ui)
+    role = _map_role_in(role_ui)  # ← envía org:admin/org:member
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
@@ -366,6 +352,7 @@ def update_role():
     role_ui = (payload.get("role") or "").strip().lower()
     if role_ui not in ("member", "admin"):
         return jsonify(error="role inválido (member|admin)"), 400
+    role_slug = _map_role_in(role_ui)  # ← envía org:*
 
     try:
         if not membership_id and target_user_id:
@@ -383,7 +370,7 @@ def update_role():
         res = requests.patch(
             f"{_base()}/organizations/{org_id}/memberships/{membership_id}",
             headers=_headers_json(),
-            json={"role": _map_role_in(role_ui)},
+            json={"role": role_slug},
             timeout=10,
         )
         res.raise_for_status()
