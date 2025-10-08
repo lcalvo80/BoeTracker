@@ -6,7 +6,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
 from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, get_membership
-from app.services.entitlements import sync_entitlements_for_org  # 👈 NUEVO
+from app.services.entitlements import sync_entitlements_for_org  # 👈 sincronización masiva
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
@@ -373,17 +373,24 @@ def invoices_get():
 def billing_sync():
     _, err = _init_stripe()
     if err: return err
+
     body = request.get_json(silent=True) or {}
-    scope = (body.get("scope") or "user").lower()
+    # 👇 Si hay organización en el contexto (body/header/query/JWT),
+    #    el scope por defecto pasa a 'org' en lugar de 'user'.
+    _, _, _, ctx_org_id, _ = _derive_identity()
+    derived_org_id = _org_from_req(ctx_org_id)
+    scope = (body.get("scope") or ("org" if derived_org_id else "user")).lower()
+
     try:
         if scope == "org":
-            user_id, _, _, ctx_org_id, _ = _derive_identity()
-            org_id = _org_from_req(ctx_org_id)
+            user_id, _, _, _, _ = _derive_identity()
+            org_id = derived_org_id  # ya resuelto arriba
             if not org_id or not _is_org_admin(user_id, org_id):
                 return jsonify(error="forbidden"), 403
             customer_id = _ensure_customer_for_org(org_id)
         else:
             user_id, _, _, _, _ = _derive_identity()
+            org_id = None
             customer_id = _ensure_customer_for_user(user_id)
 
         subs = stripe.Subscription.list(customer=customer_id, limit=1, status="all")
@@ -391,7 +398,7 @@ def billing_sync():
         status = (sub.get("status") if sub else "canceled") or "canceled"
         is_active = status in ("active", "trialing", "past_due")
 
-        if scope == "org":
+        if scope == "org" and org_id:
             qty = (sub["items"]["data"][0]["quantity"] if sub and sub.get("items") and sub["items"].get("data") else 0)
             clerk_svc.update_org_metadata(
                 org_id,
@@ -408,13 +415,12 @@ def billing_sync():
                     }
                 },
             )
-            # 👇 NUEVO: armoniza entitlements de todos los miembros cuando la org está/queda activa
+            # 👇 armoniza entitlements de todos los miembros (idempotente)
             try:
                 sync_entitlements_for_org(org_id)
             except Exception:
                 pass
         else:
-            user_id = _derive_identity()[0]
             clerk_svc.update_user_metadata(
                 user_id,
                 public={
