@@ -10,7 +10,7 @@ from app.services.entitlements import sync_entitlements_for_org  # 👈 sincroni
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
-# Preflight local (extra blindaje)
+# Preflight local (extra blindaje para CORS)
 @bp.before_request
 def _billing_allow_options():
     if request.method == "OPTIONS":
@@ -294,6 +294,7 @@ def portal_get():
         current_app.logger.exception("portal_get error: %s", e)
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
+# ---------- SUMMARY (principal + aliases) ----------
 @bp.route("/billing/summary", methods=["OPTIONS"])
 def summary_options():
     return ("", 204)
@@ -301,9 +302,22 @@ def summary_options():
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
+    """Resumen por scope (user|org) vía query ?scope=... y/o header X-Org-Id."""
+    return _summary_impl(scope=(request.args.get("scope") or "user").lower())
+
+@bp.route("/billing/org/summary", methods=["OPTIONS"])
+def summary_org_options():
+    return ("", 204)
+
+@bp.get("/billing/org/summary")
+@_require_auth
+def summary_get_org_alias():
+    """Alias: /api/billing/org/summary (frontend legacy)"""
+    return _summary_impl(scope="org")
+
+def _summary_impl(scope: str):
     _, err = _init_stripe()
     if err: return err
-    scope = (request.args.get("scope") or "user").lower()
     user_id, _, _, ctx_org_id, _ = _derive_identity()
     try:
         if scope == "org":
@@ -344,6 +358,7 @@ def summary_get():
         current_app.logger.exception("summary_get failed: %s", e)
         return jsonify(error="summary failed", detail=str(e)), 502
 
+# ---------- INVOICES (principal + aliases) ----------
 @bp.route("/billing/invoices", methods=["OPTIONS"])
 def invoices_options():
     return ("", 204)
@@ -351,9 +366,22 @@ def invoices_options():
 @bp.get("/billing/invoices")
 @_require_auth
 def invoices_get():
+    """Facturas por scope (user|org) vía query ?scope=... y/o header X-Org-Id."""
+    return _invoices_impl(scope=(request.args.get("scope") or "user").lower())
+
+@bp.route("/billing/org/invoices", methods=["OPTIONS"])
+def invoices_org_options():
+    return ("", 204)
+
+@bp.get("/billing/org/invoices")
+@_require_auth
+def invoices_get_org_alias():
+    """Alias: /api/billing/org/invoices (frontend legacy)"""
+    return _invoices_impl(scope="org")
+
+def _invoices_impl(scope: str):
     _, err = _init_stripe()
     if err: return err
-    scope = (request.args.get("scope") or "user").lower()
     user_id, _, _, ctx_org_id, _ = _derive_identity()
     try:
         if scope == "org":
@@ -386,6 +414,7 @@ def invoices_get():
         current_app.logger.exception("invoices_get failed: %s", e)
         return jsonify({"data": []}), 200  # no rompemos UI
 
+# ---------- SYNC ----------
 @bp.post("/billing/sync")
 @_require_auth
 def billing_sync():
@@ -456,6 +485,7 @@ def billing_sync():
         current_app.logger.exception("billing_sync failed: %s", e)
         return jsonify(error="sync failed", detail=str(e)), 502
 
+# ---------- CHECKOUTS ----------
 @bp.post("/billing/checkout/pro")
 @_require_auth
 def checkout_pro():
