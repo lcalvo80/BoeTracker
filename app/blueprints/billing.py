@@ -10,6 +10,12 @@ from app.services.entitlements import sync_entitlements_for_org  # 👈 sincroni
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
+# Preflight local (extra blindaje)
+@bp.before_request
+def _billing_allow_options():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
 # ─────────── helpers config ───────────
 def _cfg(k: str, default: str | None = None) -> str | None:
     try:
@@ -86,21 +92,21 @@ _require_auth = _load_auth_guard()
 # ─────────── identidad / roles ───────────
 def _role_is_admin(raw: str) -> bool:
     r = (raw or "").lower()
-    return r in ("admin", "org:admin", "owner")
+    return r in ("admin", "org:admin", "owner", "organization_admin", "orgadmin")
 
 def _derive_identity():
     c = getattr(g, "clerk", {}) or {}
     return c.get("user_id"), c.get("email"), c.get("name"), c.get("org_id"), c.get("raw_claims") or {}
 
 def _is_org_admin(user_id: str, org_id: str) -> bool:
-    # 1) intenta con las claims ya presentes en g.clerk
+    # 1) intenta con claims presentes
     try:
         cl = getattr(g, "clerk", {}) or {}
         if cl.get("org_id") == org_id and _role_is_admin(cl.get("org_role")):
             return True
     except Exception:
         pass
-    # 2) fallback: consulta a Clerk
+    # 2) fallback a Clerk
     try:
         m = clerk_svc.get_membership(user_id, org_id)
         return _role_is_admin(m.get("role"))
@@ -225,7 +231,7 @@ def _ensure_customer_for_org(org_id: str) -> str:
     return c.id
 
 def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
-    """Intenta devolver {'brand': 'visa', 'last4': '4242'} del método por defecto."""
+    """{'brand': 'visa', 'last4': '4242'} del método por defecto si existe."""
     try:
         cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
         pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
@@ -241,6 +247,10 @@ def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
     return None
 
 # ─────────── Endpoints ───────────
+
+@bp.route("/billing/portal", methods=["OPTIONS"])
+def portal_options():
+    return ("", 204)
 
 @bp.post("/billing/portal")
 @_require_auth
@@ -283,6 +293,10 @@ def portal_get():
     except Exception as e:
         current_app.logger.exception("portal_get error: %s", e)
         return jsonify(error="portal creation failed", detail=str(e)), 502
+
+@bp.route("/billing/summary", methods=["OPTIONS"])
+def summary_options():
+    return ("", 204)
 
 @bp.get("/billing/summary")
 @_require_auth
@@ -330,6 +344,10 @@ def summary_get():
         current_app.logger.exception("summary_get failed: %s", e)
         return jsonify(error="summary failed", detail=str(e)), 502
 
+@bp.route("/billing/invoices", methods=["OPTIONS"])
+def invoices_options():
+    return ("", 204)
+
 @bp.get("/billing/invoices")
 @_require_auth
 def invoices_get():
@@ -375,8 +393,6 @@ def billing_sync():
     if err: return err
 
     body = request.get_json(silent=True) or {}
-    # 👇 Si hay organización en el contexto (body/header/query/JWT),
-    #    el scope por defecto pasa a 'org' en lugar de 'user'.
     _, _, _, ctx_org_id, _ = _derive_identity()
     derived_org_id = _org_from_req(ctx_org_id)
     scope = (body.get("scope") or ("org" if derived_org_id else "user")).lower()
@@ -384,7 +400,7 @@ def billing_sync():
     try:
         if scope == "org":
             user_id, _, _, _, _ = _derive_identity()
-            org_id = derived_org_id  # ya resuelto arriba
+            org_id = derived_org_id
             if not org_id or not _is_org_admin(user_id, org_id):
                 return jsonify(error="forbidden"), 403
             customer_id = _ensure_customer_for_org(org_id)
@@ -415,7 +431,6 @@ def billing_sync():
                     }
                 },
             )
-            # 👇 armoniza entitlements de todos los miembros (idempotente)
             try:
                 sync_entitlements_for_org(org_id)
             except Exception:

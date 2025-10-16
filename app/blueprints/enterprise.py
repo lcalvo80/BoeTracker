@@ -39,9 +39,7 @@ def _base() -> str:
     return "https://api.clerk.com/v1"
 
 # ────────────────────────────────────────────────────────────────
-#  Roles: Clerk puede devolver slugs 'admin'/'basic_member' o 'org:admin'/'org:member'
-#  Normalizamos siempre a ('admin'|'member') hacia fuera,
-#  y hacia Clerk enviamos ('org:admin'|'org:member') para máxima compatibilidad.
+#  Roles: normaliza 'admin'/'owner'/'org:admin' → 'admin' | else 'member'
 # ────────────────────────────────────────────────────────────────
 def _map_role_out(role: str) -> str:
     r = (role or "").strip().lower()
@@ -53,7 +51,6 @@ def _map_role_in(role: str) -> str:
     r = (role or "").strip().lower()
     if r in ("admin", "owner", "org:admin"):
         return "org:admin"
-    # 'member' | 'basic_member' | 'org:member' → org:member
     return "org:member"
 
 def _current_user_ids() -> tuple[str, Optional[str]]:

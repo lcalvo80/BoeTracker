@@ -38,22 +38,20 @@ def api_items():
 
 @bp.get("/items/<ident>/comments")
 def api_list_item_comments(ident):
-    return _call_endpoint("comments.list_item_comment", ident)  # si tu endpoint se llama distinto, ajusta aquí
+    return _call_endpoint("comments.list_item_comment", ident)
 
 @bp.post("/items/<ident>/comments")
 def api_add_item_comment(ident):
     return _call_endpoint("comments.add_item_comment", ident)
 
-# ⚠️ Nada de /checkout /portal /sync aquí. Billing ya los expone directamente.
-
 # === FE compatibility aliases: enterprise & billing ===
 
-# El front pide /api/enterprise/org/info → mapea a enterprise.org_info (tu ruta real es /api/enterprise/org)
+# /api/enterprise/org/info → enterprise.org_info
 @bp.get("/enterprise/org/info")
 def api_enterprise_org_info_alias():
     return _call_endpoint("enterprise.org_info")
 
-# El front pide /api/billing/open-customer-portal → mapea a billing.portal_post / billing.portal_get
+# /api/billing/open-customer-portal → billing.portal_post / billing.portal_get
 @bp.post("/billing/open-customer-portal")
 def api_billing_open_portal_post():
     return _call_endpoint("billing.portal_post")

@@ -109,7 +109,6 @@ def stripe_webhook_api():
                 )
 
             elif entity_type == "org" and entity_id:
-                # NO giramos metadata del customer si ya pertenece a otro scope
                 _ensure_customer_has_entity(customer_id, "org", entity_id, entity_email, strict=True)
 
                 priv = {"billing": {"stripeCustomerId": customer_id, "subscriptionId": sub.get("id") if sub else None, "status": status}}
@@ -140,7 +139,7 @@ def stripe_webhook_api():
             is_active = status in ("active","trialing","past_due")
             seats = _sum_seats_from_subscription(sub)
 
-            # Preferimos metadatos de la suscripción (confiables e inmutables)
+            # Preferimos metadatos de la suscripción
             sub_md = (sub.get("metadata") or {})
 
             # Contexto del customer solo como respaldo

@@ -1,4 +1,3 @@
-# app/__init__.py
 from __future__ import annotations
 
 import os
@@ -54,6 +53,7 @@ def create_app(config: dict | None = None):
     "app/blueprints/compat.py",
     "app/blueprints/api_alias.py",
     "app/blueprints/enterprise.py",
+    "app/blueprints/account.py",
     "app/routes/debug.py",
     "app/routes/billing.py",
     "app/routes/webhooks.py",
@@ -96,12 +96,18 @@ def create_app(config: dict | None = None):
   CORS(
     app,
     resources={r"/api/*": {"origins": origins}},
-    supports_credentials=True,
+    supports_credentials=True,  # usamos Bearer, no requiere credenciales; mantener True no rompe
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Org-Id"],
-    expose_headers=["X-Total-Count", "Content-Range"],
+    allow_headers=["Authorization", "Content-Type", "X-Org-Id", "X-Requested-With"],
+    expose_headers=["X-Total-Count", "Content-Range", "Link", "Content-Length"],
     max_age=86400,
   )
+
+  # --- Preflight global: 204 para OPTIONS en /api/* (antes de auth) ---
+  @app.before_request
+  def _allow_cors_preflight():
+    if request.method == "OPTIONS" and request.path.startswith("/api/"):
+      return ("", 204)
 
   # ── Registro de blueprints (robusto) ──
   MODULE_ROOTS = ["app.blueprints", "app.routes"]
@@ -146,6 +152,7 @@ def create_app(config: dict | None = None):
   register_bp("compat", "bp")
   register_bp("enterprise", "bp")
   register_bp("api_alias", "bp")
+  register_bp("account", "bp")  # ← añadido
 
   # ── Fallback de debug en /api/_int ──
   from flask import Blueprint

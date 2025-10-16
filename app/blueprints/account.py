@@ -1,4 +1,3 @@
-# app/blueprints/account.py
 from __future__ import annotations
 
 import os
@@ -18,9 +17,7 @@ def _headers_json():
 @bp.delete("/me")
 @require_clerk_auth
 def delete_me():
-    """Borra datos propios en la aplicación y opcionalmente el usuario en Clerk.
-    Habilitar borrado en Clerk poniendo ALLOW_CLERK_USER_DELETE=1 (o true).
-    """
+    """Borra datos propios y opcionalmente el usuario en Clerk (ALLOW_CLERK_USER_DELETE=1)."""
     user_id = getattr(g, "clerk", {}).get("user_id")
     if not user_id:
         return jsonify(error="unauthorized"), 401
@@ -35,7 +32,6 @@ def delete_me():
     except Exception as e:
         current_app.logger.exception("[account] delete comments failed: %s", e)
 
-    # Opcional: eliminar usuario en Clerk SI explícitamente habilitado
     allow = (os.getenv("ALLOW_CLERK_USER_DELETE", "") or "").strip().lower() in ("1","true","yes")
     if allow:
         try:
