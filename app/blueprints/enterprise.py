@@ -116,8 +116,7 @@ def _list_invitations(org_id: str, *, statuses: Optional[Sequence[str]] = None, 
   data = r.json()
   arr = data if isinstance(data, list) else data.get("data") or []
   for it in arr:
-    st = (it.get("status") or "").lower()
-    it["status"] = st
+    it["status"] = (it.get("status") or "").lower()
   return arr
 
 # ───────── endpoints ─────────
@@ -156,7 +155,7 @@ def create_org():
       requests.patch(
         f"{_base()}/organizations/{org_id}",
         headers=_headers_json(),
-        json({"public_metadata": public_md}),
+        json={"public_metadata": public_md},  # ← FIX
         timeout=10,
       )
     except Exception:
@@ -190,7 +189,6 @@ def org_info():
     current_app.logger.exception("[enterprise] fetch org/members failed: %s", e)
     return jsonify(error="clerk org fetch failed"), 502
 
-  seats = 0
   try:
     seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
   except Exception:
@@ -325,7 +323,7 @@ def invite_user():
   if isinstance(emails_raw, str):
     emails = [e.strip().lower() for e in emails_raw.replace(";", ",").replace("\n", ",").split(",") if e.strip()]
   else:
-    emails = [str(e).strip().lower() for e in (emails_raw or []) if str(e).trim()]
+    emails = [str(e).strip().lower() for e in (emails_raw or []) if str(e).strip()]  # ← FIX
   if not emails:
     single = (payload.get("email") or "").strip().lower()
     if single:

@@ -1,3 +1,4 @@
+# app/__init__.py
 from __future__ import annotations
 
 import os
@@ -45,6 +46,8 @@ def create_app(config: dict | None = None):
   app.logger.info(f"[init] cwd={os.getcwd()} root_path={app.root_path} sys.path[0]={sys.path[0]}")
   for rel in [
     "app/__init__.py",
+    "app/enterprise.py",               # ← añadida (por si no está en app/blueprints)
+    "app/blueprints/enterprise.py",
     "app/blueprints/debug.py",
     "app/blueprints/billing.py",
     "app/blueprints/webhooks.py",
@@ -52,7 +55,6 @@ def create_app(config: dict | None = None):
     "app/blueprints/comments.py",
     "app/blueprints/compat.py",
     "app/blueprints/api_alias.py",
-    "app/blueprints/enterprise.py",
     "app/blueprints/account.py",
     "app/routes/debug.py",
     "app/routes/billing.py",
@@ -74,7 +76,7 @@ def create_app(config: dict | None = None):
     CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
     CLERK_WEBHOOK_SECRET=os.getenv("CLERK_WEBHOOK_SECRET", ""),
     CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),
-    # Default importante para validar el JWT de plantilla "backend"
+    # Default para validar el JWT de plantilla "backend"
     CLERK_AUDIENCE=os.getenv("CLERK_AUDIENCE", "backend"),
     CLERK_LEEWAY=os.getenv("CLERK_LEEWAY", "30"),
     CLERK_JWKS_TTL=os.getenv("CLERK_JWKS_TTL", "3600"),
@@ -96,21 +98,22 @@ def create_app(config: dict | None = None):
   CORS(
     app,
     resources={r"/api/*": {"origins": origins}},
-    supports_credentials=True,  # usamos Bearer, no requiere credenciales; mantener True no rompe
+    supports_credentials=True,
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Org-Id", "X-Requested-With"],
     expose_headers=["X-Total-Count", "Content-Range", "Link", "Content-Length"],
     max_age=86400,
   )
 
-  # --- Preflight global: 204 para OPTIONS en /api/* (antes de auth) ---
+  # --- Preflight global
   @app.before_request
   def _allow_cors_preflight():
     if request.method == "OPTIONS" and request.path.startswith("/api/"):
       return ("", 204)
 
   # ── Registro de blueprints (robusto) ──
-  MODULE_ROOTS = ["app.blueprints", "app.routes"]
+  # Añadimos "app" para capturar app/enterprise.py
+  MODULE_ROOTS = ["app.blueprints", "app.routes", "app"]
 
   def register_bp(module_name: str, attr: str) -> bool:
     errors = []
@@ -150,9 +153,9 @@ def create_app(config: dict | None = None):
   register_bp("items", "bp")
   register_bp("comments", "bp")
   register_bp("compat", "bp")
-  register_bp("enterprise", "bp")
+  register_bp("enterprise", "bp")  # ← asegurado
   register_bp("api_alias", "bp")
-  register_bp("account", "bp")  # ← añadido
+  register_bp("account", "bp")
 
   # ── Fallback de debug en /api/_int ──
   from flask import Blueprint
