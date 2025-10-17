@@ -38,18 +38,21 @@ def _headers_json() -> Dict[str, str]:
 def _base() -> str:
     return "https://api.clerk.com/v1"
 
-# ────────────────────────────────────────────────────────────────
-#  Roles: normaliza 'admin'/'owner'/'org:admin' → 'admin' | else 'member'
-# ────────────────────────────────────────────────────────────────
-def _map_role_out(role: str) -> str:
+# ───────── roles ─────────
+def _is_admin_slug(role: str) -> bool:
     r = (role or "").strip().lower()
-    if r in ("admin", "owner", "org:admin", "organization_admin", "orgadmin"):
-        return "admin"
-    return "member"
+    return r in {
+        "admin", "owner",
+        "org:admin", "org_admin", "orgadmin", "organization_admin",
+        "org:owner", "org_owner", "orgowner", "organization_owner",
+    }
+
+def _map_role_out(role: str) -> str:
+    return "admin" if _is_admin_slug(role) else "member"
 
 def _map_role_in(role: str) -> str:
     r = (role or "").strip().lower()
-    if r in ("admin", "owner", "org:admin"):
+    if r in ("admin", "owner", "org:admin", "org_admin"):
         return "org:admin"
     return "org:member"
 
@@ -67,7 +70,7 @@ def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
         data = res.json()
         arr = data if isinstance(data, list) else data.get("data") or []
         role = (arr[0].get("role") or "").lower() if arr else ""
-        return role in ("admin", "owner", "org:admin", "organization_admin", "orgadmin")
+        return _is_admin_slug(role)
     except Exception as e:
         current_app.logger.warning(f"[enterprise] membership check skipped: {e}")
         return False
@@ -93,7 +96,7 @@ def _list_invitations(org_id: str) -> List[dict]:
     except Exception:
         return []
 
-# ───────── endpoints ─────────
+# ───────── endpoints (resto igual salvo uso de _is_admin_slug) ─────────
 
 @bp.post("/org/create")
 @bp.post("/create-org")
@@ -245,7 +248,7 @@ def invite_user():
         return jsonify(error="emails requerido"), 400
 
     role_ui = (payload.get("role") or "member").strip().lower()
-    role = _map_role_in(role_ui)  # ← envía org:admin/org:member
+    role = _map_role_in(role_ui)
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
@@ -349,7 +352,7 @@ def update_role():
     role_ui = (payload.get("role") or "").strip().lower()
     if role_ui not in ("member", "admin"):
         return jsonify(error="role inválido (member|admin)"), 400
-    role_slug = _map_role_in(role_ui)  # ← envía org:*
+    role_slug = _map_role_in(role_ui)
 
     try:
         if not membership_id and target_user_id:

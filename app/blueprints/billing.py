@@ -6,11 +6,13 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
 from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, get_membership
-from app.services.entitlements import sync_entitlements_for_org  # 👈 sincronización masiva
+from app.services.entitlements import sync_entitlements_for_org
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
-# Preflight local (extra blindaje para CORS)
+# ────────────────────────────────────────────────────────────────
+# Preflight rápido (CORS) para este blueprint
+# ────────────────────────────────────────────────────────────────
 @bp.before_request
 def _billing_allow_options():
     if request.method == "OPTIONS":
@@ -91,27 +93,40 @@ _require_auth = _load_auth_guard()
 
 # ─────────── identidad / roles ───────────
 def _role_is_admin(raw: str) -> bool:
-    r = (raw or "").lower()
-    return r in ("admin", "org:admin", "owner", "organization_admin", "orgadmin")
+    """Normaliza variaciones típicas que devuelve Clerk."""
+    r = (raw or "").strip().lower()
+    return r in {
+        "admin", "owner",
+        "org:admin", "org_admin", "orgadmin", "organization_admin",
+        "org:owner", "org_owner", "orgowner", "organization_owner",
+    }
 
 def _derive_identity():
     c = getattr(g, "clerk", {}) or {}
     return c.get("user_id"), c.get("email"), c.get("name"), c.get("org_id"), c.get("raw_claims") or {}
 
 def _is_org_admin(user_id: str, org_id: str) -> bool:
-    # 1) intenta con claims presentes
+    """
+    1) Autoridad: consulta a Clerk (secret key) la membership real.
+       Si hay rol admin → True (robusto frente a JWTs sin claims de org correctas).
+    2) Fallback: acepta claim 'org_role' admin del JWT si viene.
+    """
+    # 1) membership real en Clerk
     try:
-        cl = getattr(g, "clerk", {}) or {}
-        if cl.get("org_id") == org_id and _role_is_admin(cl.get("org_role")):
+        m = clerk_svc.get_membership(user_id, org_id)
+        if _role_is_admin(m.get("role")):
             return True
     except Exception:
         pass
-    # 2) fallback a Clerk
+
+    # 2) fallback a claims
     try:
-        m = clerk_svc.get_membership(user_id, org_id)
-        return _role_is_admin(m.get("role"))
+        cl = getattr(g, "clerk", {}) or {}
+        if _role_is_admin(cl.get("org_role")):
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
     """Prioriza body.org_id, header X-Org-Id, query org_id y por último la org del JWT."""
@@ -610,58 +625,6 @@ def checkout_enterprise():
         return jsonify(url=session.url), 200
     except Exception as e:
         current_app.logger.exception("create enterprise checkout failed: %s", e)
-        return jsonify(error="checkout creation failed", detail=str(e)), 502
-
-@bp.post("/public/enterprise-checkout")
-def public_enterprise_checkout():
-    _, err = _init_stripe()
-    if err: return err
-
-    body = request.get_json(silent=True) or {}
-    price_id = (body.get("price_id") or _get_price("enterprise_seat") or "").strip()
-    if not price_id:
-        return jsonify(error="price_id required or STRIPE_PRICE_ENTERPRISE_SEAT missing"), 400
-
-    try:
-        quantity = int(body.get("seats") or 1)
-    except Exception:
-        quantity = 1
-    if quantity < 1:
-        quantity = 1
-
-    buyer_email = (body.get("email") or "").strip().lower()
-    if not buyer_email:
-        return jsonify(error="email required"), 400
-
-    base_success = _cfg("CHECKOUT_SUCCESS_URL") or f"{_front_base()}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
-    success_url   = _with_success_params(base_success, scope="org")  # org sin org_id (se creará post-webhook)
-    cancel_url    = _cfg("CHECKOUT_CANCEL_URL")  or f"{_front_base()}/pricing?canceled=1"
-
-    try:
-        customer = stripe.Customer.create(
-            email=buyer_email,
-            metadata={"entity_type": "org", "entity_id": "", "plan_scope": "org", "plan": "enterprise",
-                      "entity_email": buyer_email},
-        )
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            customer=customer.id,
-            line_items=[{"price": price_id, "quantity": quantity}],
-            success_url=success_url,
-            cancel_url=cancel_url,
-            allow_promotion_codes=True,
-            subscription_data={"metadata": {"entity_type": "org", "entity_id": "", "plan_scope": "org", "plan": "enterprise"}},
-            metadata={"entity_type": "org", "entity_id": "", "plan": "enterprise", "plan_scope": "org",
-                      "price_id": price_id, "entity_email": buyer_email, "seats": str(quantity)},
-            tax_id_collection={"enabled": True},
-            automatic_tax={"enabled": True},
-            customer_update={"address": _update_mode(_cfg("STRIPE_SAVE_ADDRESS_AUTO"), "auto"),
-                             "name": _update_mode(_cfg("STRIPE_SAVE_NAME_AUTO"), "auto")},
-            locale=_cfg("STRIPE_CHECKOUT_LOCALE", "auto"),
-        )
-        return jsonify(url=session.url), 200
-    except Exception as e:
-        current_app.logger.exception("create public enterprise checkout failed: %s", e)
         return jsonify(error="checkout creation failed", detail=str(e)), 502
 
 @bp.get("/_int/stripe-ping")
