@@ -1,4 +1,3 @@
-# app/services/entitlements.py
 from __future__ import annotations
 import os
 import requests
@@ -41,10 +40,7 @@ def ensure_user_enterprise_member(user_id: str, org: Dict[str, Any]) -> bool:
             return False  # ya correcto, no tocar
         clerk_svc.update_user_metadata(
             user_id,
-            public={
-                "plan": "enterprise",
-                "entitlement": "enterprise_member",
-            }
+            public={"plan": "enterprise", "entitlement": "enterprise_member"},
         )
         return True
     except Exception:

@@ -108,7 +108,6 @@ def _derive_identity():
 def _is_org_admin(user_id: str, org_id: str) -> bool:
     """
     1) Autoridad: consulta a Clerk (secret key) la membership real.
-       Si hay rol admin → True (robusto frente a JWTs sin claims de org correctas).
     2) Fallback: acepta claim 'org_role' admin del JWT si viene.
     """
     # 1) membership real en Clerk
@@ -118,7 +117,6 @@ def _is_org_admin(user_id: str, org_id: str) -> bool:
             return True
     except Exception:
         pass
-
     # 2) fallback a claims
     try:
         cl = getattr(g, "clerk", {}) or {}
