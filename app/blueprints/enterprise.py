@@ -1,13 +1,19 @@
+# app/enterprise.py
 from __future__ import annotations
-import os, requests
+
+import os
 from functools import wraps
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 from flask import Blueprint, jsonify, request, g, current_app
-from app.auth import require_clerk_auth
+
+from app.auth import require_clerk_auth  # Decorador que te mete g.clerk desde el JWT
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 
-# ───────── helpers ─────────
+# ───────────────────────── helpers config ─────────────────────────
+
 def _cfg(k: str, default: Optional[str] = None) -> str:
     try:
         v = current_app.config.get(k)  # type: ignore[attr-defined]
@@ -38,7 +44,8 @@ def _headers_json() -> Dict[str, str]:
 def _base() -> str:
     return "https://api.clerk.com/v1"
 
-# ───────── roles ─────────
+# ───────────────────────── helpers roles ─────────────────────────
+
 def _is_admin_slug(role: str) -> bool:
     r = (role or "").strip().lower()
     return r in {
@@ -48,22 +55,35 @@ def _is_admin_slug(role: str) -> bool:
     }
 
 def _map_role_out(role: str) -> str:
+    """De slug Clerk → 'admin'|'member' (frontend-friendly)."""
     return "admin" if _is_admin_slug(role) else "member"
 
 def _map_role_in(role: str) -> str:
+    """De 'admin'|'member' → slug esperado por Clerk."""
     r = (role or "").strip().lower()
     if r in ("admin", "owner", "org:admin", "org_admin"):
         return "org:admin"
     return "org:member"
 
-def _current_user_ids() -> tuple[str, Optional[str]]:
+# ───────────────────────── helpers Clerk ─────────────────────────
+
+def _current_user_ids() -> Tuple[Optional[str], Optional[str]]:
+    """
+    user_id desde g.clerk y org_id de:
+      1) X-Org-Id header (prioridad)
+      2) query ?org_id=
+      3) claims del JWT en g.clerk
+    """
     c = getattr(g, "clerk", {}) or {}
     org_from_req = request.headers.get("X-Org-Id") or request.args.get("org_id")
     org_id = (org_from_req or c.get("org_id")) or None
     return c.get("user_id"), org_id
 
-def _is_enterprise_admin(user_id: str, org_id: str) -> bool:
+def _is_enterprise_admin(user_id: Optional[str], org_id: Optional[str]) -> bool:
+    """Comprueba en Clerk si el usuario es admin/owner en la org."""
     try:
+        if not user_id or not org_id:
+            return False
         url = f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={user_id}"
         res = requests.get(url, headers=_headers_json(), timeout=10)
         res.raise_for_status()
@@ -81,22 +101,52 @@ def _get_org(org_id: str) -> dict:
     return r.json()
 
 def _list_memberships(org_id: str) -> List[dict]:
-    r = requests.get(f"{_base()}/organizations/{org_id}/memberships?limit=200", headers=_headers_json(), timeout=10)
+    r = requests.get(
+        f"{_base()}/organizations/{org_id}/memberships?limit=200",
+        headers=_headers_json(),
+        timeout=10,
+    )
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, list) else data.get("data") or []
 
-def _list_invitations(org_id: str) -> List[dict]:
-    try:
-        r = requests.get(f"{_base()}/organizations/{org_id}/invitations?limit=200", headers=_headers_json(), timeout=10)
-        if r.status_code not in (200, 201):
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else data.get("data") or []
-    except Exception:
+def _list_invitations(org_id: str, only_pending: bool = True) -> List[dict]:
+    """
+    Devuelve invitaciones; si only_pending=True, solo las 'pending' (evita inflar el seat usage).
+    """
+    r = requests.get(
+        f"{_base()}/organizations/{org_id}/invitations?limit=200",
+        headers=_headers_json(),
+        timeout=10,
+    )
+    # Si Clerk devuelve 404/403, lo tratamos como "no hay invitaciones"
+    if r.status_code not in (200, 201):
         return []
+    data = r.json()
+    arr = data if isinstance(data, list) else data.get("data") or []
 
-# ───────── endpoints (resto igual salvo uso de _is_admin_slug) ─────────
+    if not only_pending:
+        return arr
+
+    def is_pending(x: dict) -> bool:
+        s = str(x.get("status") or "").lower()
+        # Clerk marca status: pending / accepted / revoked / expired / canceled
+        if s in ("accepted", "revoked", "expired", "canceled"):
+            return False
+        if x.get("revoked") or x.get("accepted"):
+            return False
+        return s == "pending"
+
+    return [x for x in arr if is_pending(x)]
+
+def _delete_invitation(org_id: str, invitation_id: str) -> None:
+    requests.delete(
+        f"{_base()}/organizations/{org_id}/invitations/{invitation_id}",
+        headers=_headers_json(),
+        timeout=10,
+    ).raise_for_status()
+
+# ───────────────────────── endpoints ─────────────────────────
 
 @bp.post("/org/create")
 @bp.post("/create-org")
@@ -125,7 +175,7 @@ def create_org():
         org = r.json()
         org_id = org.get("id")
 
-        public_md = {"plan": "enterprise_draft"}
+        public_md: Dict[str, Any] = {"plan": "enterprise_draft"}
         if seats > 0:
             public_md["seats"] = seats
         try:
@@ -134,7 +184,7 @@ def create_org():
                 headers=_headers_json(),
                 json={"public_metadata": public_md},
                 timeout=10,
-            )
+            ).raise_for_status()
         except Exception:
             pass
 
@@ -156,12 +206,19 @@ def create_org():
 def org_info():
     user_id, org_id = _current_user_ids()
     if not org_id:
-        return jsonify({"id": None, "name": None, "seats": 0, "used_seats": 0, "pending_invites": 0, "current_user_role": None})
+        return jsonify({
+            "id": None,
+            "name": None,
+            "seats": 0,
+            "used_seats": 0,
+            "pending_invites": 0,
+            "current_user_role": None
+        })
 
     try:
         org = _get_org(org_id)
         members = _list_memberships(org_id)
-        invites = _list_invitations(org_id)
+        invites = _list_invitations(org_id, only_pending=True)  # ← SOLO pendientes
     except Exception as e:
         current_app.logger.exception("[enterprise] fetch org/members failed: %s", e)
         return jsonify(error="clerk org fetch failed"), 502
@@ -185,7 +242,7 @@ def org_info():
         "name": org.get("name"),
         "seats": seats,
         "used_seats": len(members),
-        "pending_invites": len(invites),
+        "pending_invites": len(invites),  # ← solo pendientes
         "current_user_role": cur_role,
     }), 200
 
@@ -194,6 +251,10 @@ def org_info():
 @require_clerk_auth
 @_require_clerk_secret
 def list_users():
+    """
+    Devuelve **solo miembros** (NO invitaciones) para que el front
+    no intente cambiar rol/eliminar sobre invitaciones (lo que provoca 404).
+    """
     _, org_id = _current_user_ids()
     if not org_id:
         return jsonify({"data": []})
@@ -213,11 +274,12 @@ def list_users():
             first = pud.get("first_name") or ""
             last = pud.get("last_name") or ""
             name = (first + " " + last).strip() or None
+            # Si no hay nombre, devolvemos None y el front ya decide mostrar "—"
             email = pud.get("identifier") or ""
             out.append({
                 "id": membership_id,
                 "user_id": uid,
-                "name": name or "—",
+                "name": name,          # ← no forzamos "—" aquí, para que el front pueda decidir
                 "email": email,
                 "role": role,
                 "licensed": True,
@@ -239,7 +301,8 @@ def invite_user():
         return jsonify(error="forbidden: organization admin required"), 403
 
     payload = request.get_json(silent=True) or {}
-    emails_raw = payload.get("emails")
+    emails_raw = payload.get("emails") or payload.get("email")
+    emails: List[str]
     if isinstance(emails_raw, str):
         emails = [e.strip().lower() for e in emails_raw.replace(";", ",").replace("\n", ",").split(",") if e.strip()]
     else:
@@ -252,23 +315,25 @@ def invite_user():
     redirect_url = (payload.get("redirect_url") or "").strip() or None
     allow_overbook = bool(payload.get("allow_overbook"))
 
+    # Control de seats usando SOLO invitaciones pendientes
     try:
         org = _get_org(org_id)
         seats = int(((org.get("public_metadata") or {}).get("seats") or 0))
         members = _list_memberships(org_id)
-        invites = _list_invitations(org_id)
+        invites = _list_invitations(org_id, only_pending=True)  # ← SOLO pendientes
         used = len(members) + len(invites)
         if seats and not allow_overbook and (used + len(emails) > seats):
             return jsonify(
                 error="seat_limit_exceeded",
-                detail=f"Usados (miembros + invitaciones): {used}, intentas {len(emails)}, límite seats={seats}"
+                detail=f"Usados (miembros + invitaciones pendientes): {used}, intentas {len(emails)}, límite seats={seats}"
             ), 409
     except Exception:
+        # Si Clerk falla, no bloqueamos por seats
         pass
 
     results: List[Dict[str, Any]] = []
     for email in emails:
-        body = {"email_address": email, "role": role}
+        body: Dict[str, Any] = {"email_address": email, "role": role}
         if redirect_url:
             body["redirect_url"] = redirect_url
         try:
@@ -303,10 +368,17 @@ def remove_user():
         return jsonify(error="forbidden: organization admin required"), 403
 
     payload = request.get_json(silent=True) or {}
-    membership_id = payload.get("membership_id")
+    membership_id = payload.get("membership_id") or payload.get("id")
     target_user_id = payload.get("user_id")
+    invitation_id = payload.get("invitation_id")
 
     try:
+        # Soporte opcional: borrar invitación pendiente
+        if invitation_id:
+            _delete_invitation(org_id, invitation_id)
+            return jsonify({"ok": True, "type": "invitation"}), 200
+
+        # Si no llega membership_id pero sí user_id → resolvemos membership
         if not membership_id and target_user_id:
             q = requests.get(
                 f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={target_user_id}",
@@ -325,7 +397,7 @@ def remove_user():
             timeout=10,
         )
         res.raise_for_status()
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": True, "type": "membership"}), 200
     except requests.HTTPError as e:
         try:
             return jsonify(e.response.json()), e.response.status_code  # type: ignore[attr-defined]
@@ -347,7 +419,7 @@ def update_role():
         return jsonify(error="forbidden: organization admin required"), 403
 
     payload = request.get_json(silent=True) or {}
-    membership_id = payload.get("membership_id")
+    membership_id = payload.get("membership_id") or payload.get("id")
     target_user_id = payload.get("user_id")
     role_ui = (payload.get("role") or "").strip().lower()
     if role_ui not in ("member", "admin"):
@@ -355,6 +427,7 @@ def update_role():
     role_slug = _map_role_in(role_ui)
 
     try:
+        # Resolver membership por user_id si hace falta
         if not membership_id and target_user_id:
             q = requests.get(
                 f"{_base()}/organizations/{org_id}/memberships?limit=1&user_id={target_user_id}",
