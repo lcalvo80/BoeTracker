@@ -5,20 +5,16 @@ from typing import Optional, Dict, Any
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
-from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, ...
+from app.services import clerk_svc
 from app.services.entitlements import sync_entitlements_for_org
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
-# ────────────────────────────────────────────────────────────────
-# Preflight rápido (CORS) para este blueprint
-# ────────────────────────────────────────────────────────────────
 @bp.before_request
 def _billing_allow_options():
     if request.method == "OPTIONS":
         return ("", 204)
 
-# ─────────── helpers config ───────────
 def _cfg(k: str, default: str | None = None) -> str | None:
     try:
         v = current_app.config.get(k)
@@ -43,7 +39,6 @@ def _init_stripe():
     return sk, None
 
 def _get_price(kind: str) -> str | None:
-    """Lee price ids desde múltiples envs por compatibilidad."""
     def first(*keys):
         for kk in keys:
             v = _cfg(kk)
@@ -59,12 +54,10 @@ def _get_price(kind: str) -> str | None:
         return first("STRIPE_PRICE_ENTERPRISE_SEAT", "STRIPE_PRICE_ENTERPRISE_SEAT_ID", "PRICE_ENTERPRISE_SEAT_ID")
     return None
 
-# Solo valores válidos para Stripe: 'auto' | 'never'
 def _update_mode(v: str | None, default: str = "auto") -> str:
     s = (v or default).strip().lower()
     return "auto" if s in ("auto", "1", "true", "yes", "on") else "never"
 
-# Añade parámetros al success_url (p.ej. scope/org_id)
 def _with_success_params(url: str, **params) -> str:
     if not params:
         return url
@@ -77,7 +70,6 @@ def _with_success_params(url: str, **params) -> str:
     new_q = urlencode(q)
     return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
-# ─────────── auth guard ───────────
 def _load_auth_guard():
     if _truthy(_cfg("DISABLE_AUTH", "0") or "0"):
         def _noop(fn):
@@ -91,7 +83,6 @@ def _load_auth_guard():
 
 _require_auth = _load_auth_guard()
 
-# ─────────── identidad / roles ───────────
 def _role_is_admin(raw: str) -> bool:
     r = (raw or "").strip().lower()
     return r in {
@@ -105,10 +96,6 @@ def _derive_identity():
     return c.get("user_id"), c.get("email"), c.get("name"), c.get("org_id"), c.get("raw_claims") or {}
 
 def _is_org_admin(user_id: str, org_id: str) -> bool:
-    """
-    1) Autoridad: consulta a Clerk (secret key) la membership real.
-    2) Fallback: acepta claim 'org_role' admin del JWT si viene.
-    """
     try:
         m = clerk_svc.get_membership(user_id, org_id)
         if _role_is_admin(m.get("role")):
@@ -124,7 +111,6 @@ def _is_org_admin(user_id: str, org_id: str) -> bool:
     return False
 
 def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
-    """Prioriza body.org_id, header X-Org-Id, query org_id y por último la org del JWT."""
     try:
         body = request.get_json(silent=True) or {}
     except Exception:
@@ -136,7 +122,6 @@ def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
         or (default_org_id or "")
     ) or None
 
-# ─────────── Stripe customers: dedupe + metadata ───────────
 def _find_stripe_customer(entity_type: str, entity_id: str | None, email: str | None = None) -> str | None:
     _, err = _init_stripe()
     if err: return None
@@ -254,8 +239,6 @@ def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
         pass
     return None
 
-# ─────────── Endpoints ───────────
-
 @bp.route("/billing/portal", methods=["OPTIONS"])
 def portal_options():
     return ("", 204)
@@ -302,7 +285,6 @@ def portal_get():
         current_app.logger.exception("portal_get error: %s", e)
         return jsonify(error="portal creation failed", detail=str(e)), 502
 
-# ---------- SUMMARY (principal + aliases) ----------
 @bp.route("/billing/summary", methods=["OPTIONS"])
 def summary_options():
     return ("", 204)
@@ -310,7 +292,6 @@ def summary_options():
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
-    """Resumen por scope (user|org) vía query ?scope=... y/o header X-Org-Id."""
     return _summary_impl(scope=(request.args.get("scope") or "user").lower())
 
 @bp.route("/billing/org/summary", methods=["OPTIONS"])
@@ -320,7 +301,6 @@ def summary_org_options():
 @bp.get("/billing/org/summary")
 @_require_auth
 def summary_get_org_alias():
-    """Alias: /api/billing/org/summary (frontend legacy)"""
     return _summary_impl(scope="org")
 
 def _summary_impl(scope: str):
@@ -366,7 +346,6 @@ def _summary_impl(scope: str):
         current_app.logger.exception("summary_get failed: %s", e)
         return jsonify(error="summary failed", detail=str(e)), 502
 
-# ---------- INVOICES (principal + aliases) ----------
 @bp.route("/billing/invoices", methods=["OPTIONS"])
 def invoices_options():
     return ("", 204)
@@ -374,7 +353,6 @@ def invoices_options():
 @bp.get("/billing/invoices")
 @_require_auth
 def invoices_get():
-    """Facturas por scope (user|org) vía query ?scope=... y/o header X-Org-Id."""
     return _invoices_impl(scope=(request.args.get("scope") or "user").lower())
 
 @bp.route("/billing/org/invoices", methods=["OPTIONS"])
@@ -384,7 +362,6 @@ def invoices_org_options():
 @bp.get("/billing/org/invoices")
 @_require_auth
 def invoices_get_org_alias():
-    """Alias: /api/billing/org/invoices (frontend legacy)"""
     return _invoices_impl(scope="org")
 
 def _invoices_impl(scope: str):
@@ -420,9 +397,8 @@ def _invoices_impl(scope: str):
         return jsonify({"data": out}), 200
     except Exception as e:
         current_app.logger.exception("invoices_get failed: %s", e)
-        return jsonify({"data": []}), 200  # no rompemos UI
+        return jsonify({"data": []}), 200
 
-# ---------- SYNC ----------
 @bp.post("/billing/sync")
 @_require_auth
 def billing_sync():
@@ -493,7 +469,6 @@ def billing_sync():
         current_app.logger.exception("billing_sync failed: %s", e)
         return jsonify(error="sync failed", detail=str(e)), 502
 
-# ---------- CHECKOUTS ----------
 @bp.post("/billing/checkout/pro")
 @_require_auth
 def checkout_pro():
@@ -545,10 +520,6 @@ def checkout_pro():
 @bp.post("/billing/checkout/enterprise")
 @_require_auth
 def checkout_enterprise():
-    """
-    Body: { seats: number, org_id?: string } → { url }
-    Si no se pasa org_id, se crea una organización para el comprador (admin).
-    """
     _, err = _init_stripe()
     if err: return err
     body = request.get_json(silent=True) or {}
@@ -566,37 +537,20 @@ def checkout_enterprise():
     user_id, user_email, user_name, ctx_org_id, _ = _derive_identity()
     org_id = body.get("org_id") or ctx_org_id
 
-    # Crear organización si no existe (con fallback seguro)
     if not org_id:
-        wanted_name = (user_name or user_email or f"org-{user_id}").split("@")[0]
-        org_id = None
-
-        # Intento rico: helper que crea org y añade membership
         try:
+            wanted_name = (user_name or user_email or f"org-{user_id}").split("@")[0]
             org = clerk_svc.create_org_for_user(
                 user_id=user_id,
                 name=wanted_name,
                 public={"plan": "enterprise", "seats": seats, "subscription": "enterprise"},
                 private={},
-            ) or {}
-            org_id = org.get("id") or org.get("organization_id")
+            )
+            org_id = org.get("id")
         except Exception as e:
-            current_app.logger.warning("[checkout] create_org_for_user failed: %s", e)
+            current_app.logger.exception("[checkout] cannot create org: %s", e)
+            return jsonify(error="cannot create organization", detail=str(e)), 502
 
-        # Fallback mínimo: crear org y (si se puede) intentar añadir membership,
-        # pero si Clerk devuelve 404 en memberships NO abortamos el checkout.
-        if not org_id:
-            try:
-                org_id = clerk_svc.create_org_minimal(wanted_name)
-                try:
-                    clerk_svc.ensure_membership_admin(org_id, user_id)
-                except Exception as e2:
-                    current_app.logger.warning("[checkout] ensure_membership_admin failed (continuing): %s", e2)
-            except Exception as e3:
-                current_app.logger.exception("[checkout] cannot create organization (fallback failed): %s", e3)
-                return jsonify(error="cannot create organization", detail=str(e3)), 502
-
-    # Asegurar customer
     try:
         customer_id = _ensure_customer_for_org(org_id)
     except Exception as e:

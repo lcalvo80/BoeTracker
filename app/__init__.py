@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import os
 import sys
 import json
@@ -82,7 +81,6 @@ def create_app(config: dict | None = None):
     if request.method == "OPTIONS" and request.path.startswith("/api/"):
       return ("", 204)
 
-  # Registro blueprints (busca en app.blueprints, app.routes, y app)
   MODULE_ROOTS = ["app.blueprints", "app.routes", "app"]
 
   def register_bp(module_name: str, attr: str) -> bool:
@@ -98,11 +96,9 @@ def create_app(config: dict | None = None):
     app.logger.warning(f"[init] No se pudo registrar {module_name}.{attr}")
     return False
 
-  # Importante: registrar ambos
   register_bp("enterprise", "bp")
   register_bp("billing", "bp")
 
-  # Debug interno /api/_int
   from flask import Blueprint
   intdbg = Blueprint("int_debug", __name__, url_prefix="/api/_int")
 
@@ -170,12 +166,10 @@ def create_app(config: dict | None = None):
   app.register_blueprint(intdbg)
   app.logger.info("[init] Fallback interno montado en /api/_int")
 
-  # Health
   @app.get("/api/health")
   def health():
     return jsonify({"status": "ok"}), 200
 
-  # Error handler JSON
   @app.errorhandler(Exception)
   def handle_any_error(e):
     if isinstance(e, HTTPException):
@@ -183,7 +177,6 @@ def create_app(config: dict | None = None):
     app.logger.exception("Unhandled error")
     return {"message": "internal_error"}, 500
 
-  # WebSocket (opcional)
   sock = Sock(app)
 
   @sock.route("/ws")
@@ -206,5 +199,4 @@ def create_app(config: dict | None = None):
 
   return app
 
-# WSGI entrypoint
 app = create_app()

@@ -1,4 +1,3 @@
-# backend/enterprise.py
 from __future__ import annotations
 import os
 import re
@@ -11,13 +10,8 @@ bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 CLERK_API = "https://api.clerk.com/v1"
 CLERK_SECRET = os.environ.get("CLERK_SECRET_KEY", "")
 
-# Mapeo de roles BOE <-> Clerk
 ROLE_TO_CLERK = {"admin": "admin", "member": "basic_member"}
 ROLE_FROM_CLERK = {"admin": "admin", "basic_member": "member"}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers comunes
-# ─────────────────────────────────────────────────────────────────────────────
 
 _PLACEHOLDER_RE = re.compile(r"^\s*\{\{.*\}\}\s*$", re.I)
 
@@ -49,10 +43,6 @@ def _json_error(code: int, message: str, **extra):
     return jsonify({"message": message, **extra}), code
 
 def _org_id_from_context() -> str:
-    """
-    PRIORIDAD: header X-Org-Id > g.org_id.
-    Ignora placeholders. Lanza ValueError si no hay un org_id válido.
-    """
     hdr = request.headers.get("X-Org-Id")
     if _valid_org_id(hdr):
         return hdr
@@ -70,9 +60,6 @@ def _current_user_role() -> str:
     return "member"
 
 def _canonical_email(email: str) -> str:
-    """
-    Normaliza SOLO gmail/googlemail (quita puntos y +alias) para evitar duplicados.
-    """
     e = (email or "").strip().lower()
     if "@" not in e:
         return e
@@ -80,10 +67,6 @@ def _canonical_email(email: str) -> str:
     if domain in ("gmail.com", "googlemail.com"):
         local = local.split("+", 1)[0].replace(".", "")
     return f"{local}@{domain}"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Seat limit (almacen simple en memoria; sustituir por DB si procede)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_seat_limit(org_id: str) -> int:
     store = getattr(current_app, "_SEAT_LIMITS", {})
@@ -93,10 +76,6 @@ def _set_seat_limit(org_id: str, seats: int) -> None:
     store = getattr(current_app, "_SEAT_LIMITS", {})
     store[org_id] = int(max(0, seats))
     current_app._SEAT_LIMITS = store
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Wrappers seguros de Clerk (no levantan 500)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_memberships(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
     r = _clerk("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
@@ -138,10 +117,6 @@ def _is_last_admin(org_id: str, membership_id: str | None, user_id: str | None) 
             return True, (len(memberships), len(admins))
     return False, (len(memberships), len(admins))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Endpoints
-# ─────────────────────────────────────────────────────────────────────────────
-
 @bp.get("/org")
 def get_org():
     try:
@@ -149,7 +124,6 @@ def get_org():
     except ValueError as e:
         return _json_error(400, str(e))
 
-    # Nombre org (best-effort)
     org_resp = _clerk("GET", f"/organizations/{org_id}")
     org_name = None
     if org_resp.ok:
@@ -177,7 +151,6 @@ def get_org():
         "used_seats": used,
         "pending_invites": pending,
         "current_user_role": _current_user_role(),
-        # camelCase para compat
         "seatLimit": seats,
         "usedSeats": used,
     })
@@ -203,7 +176,7 @@ def list_users():
         email = pud.get("email_address") or pud.get("identifier") or None
         role = ROLE_FROM_CLERK.get(m.get("role",""), "member")
         rows.append({
-            "id": m.get("id"),         # membership_id
+            "id": m.get("id"),
             "user_id": user_id,
             "name": name,
             "email": email,
