@@ -480,9 +480,10 @@ def invoices_get():
 
 @bp.route("/billing/org/invoices", methods=["OPTIONS"])
 def invoices_org_options():
-    return ("", 204)
+    return ("", 204"
 
 
+)
 @bp.get("/billing/org/invoices")
 @_require_auth
 def invoices_get_org_alias():
@@ -537,21 +538,32 @@ def _promote_to_admin_if_needed(user_id: str, org_id: str):
         mm = clerk_svc.get_membership(user_id, org_id)
         if not mm:
             return
-        if (mm.get("role") or "").lower() == "admin":
+        if (mm.get("role") or "").lower() in ("admin", "owner"):
             return
+
         membership_id = mm.get("id")
-        if not membership_id:
-            return
         secret = _cfg("CLERK_SECRET_KEY")
         if not secret:
             current_app.logger.warning("No CLERK_SECRET_KEY; no se puede promover admin")
             return
-        r = requests.patch(
-            f"https://api.clerk.com/v1/organizations/{org_id}/memberships/{membership_id}",
-            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
-            json={"role": "admin"},
-            timeout=15,
-        )
+
+        hdrs = {"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}
+        body = {"role": "admin"}
+
+        if membership_id:
+            r = requests.patch(
+                f"https://api.clerk.com/v1/organization_memberships/{membership_id}",
+                headers=hdrs,
+                json=body,
+                timeout=15,
+            )
+        else:
+            r = requests.patch(
+                f"https://api.clerk.com/v1/organizations/{org_id}/memberships/{user_id}",
+                headers=hdrs,
+                json=body,
+                timeout=15,
+            )
         if not r.ok:
             current_app.logger.warning("No se pudo promover a admin: %s", r.text)
     except Exception:
@@ -575,6 +587,8 @@ def billing_sync():
             user_id, _, _, _, _ = _derive_identity()
             org_id = derived_org_id
             if not org_id or not _is_org_admin(user_id, org_id):
+                # Si el comprador aún es member, después lo promocionaremos (ver abajo)
+                # pero para leer Stripe necesitamos el customer de la org igualmente.
                 customer_id = _ensure_customer_for_org(org_id)
             else:
                 customer_id = _ensure_customer_for_org(org_id)

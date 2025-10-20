@@ -10,8 +10,9 @@ bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 CLERK_API = "https://api.clerk.com/v1"
 CLERK_SECRET = os.environ.get("CLERK_SECRET_KEY", "")
 
+# owner -> admin en lectura
 ROLE_TO_CLERK = {"admin": "admin", "member": "basic_member"}
-ROLE_FROM_CLERK = {"admin": "admin", "basic_member": "member"}
+ROLE_FROM_CLERK = {"admin": "admin", "owner": "admin", "basic_member": "member"}
 
 _PLACEHOLDER_RE = re.compile(r"^\s*\{\{.*\}\}\s*$", re.I)
 
@@ -70,40 +71,6 @@ def _current_user_id() -> str | None:
     return c.get("user_id")
 
 
-def _fetch_memberships(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
-    r = _clerk("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
-    if not r.ok:
-        detail = (
-            r.json()
-            if r.headers.get("content-type", "").startswith("application/json")
-            else r.text
-        )
-        return False, [], r.status_code, detail
-    data = r.json()
-    items = data["data"] if isinstance(data, dict) and "data" in data else data
-    return True, items, 200, None
-
-
-def _fetch_pending_invitations(
-    org_id: str,
-) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
-    r = _clerk(
-        "GET",
-        f"/organizations/{org_id}/invitations",
-        params={"status": "pending", "limit": 200},
-    )
-    if not r.ok:
-        detail = (
-            r.json()
-            if r.headers.get("content-type", "").startswith("application/json")
-            else r.text
-        )
-        return False, [], r.status_code, detail
-    data = r.json()
-    items = data["data"] if isinstance(data, dict) and "data" in data else data
-    return True, items, 200, None
-
-
 def _current_user_role_from_membership(org_id: str) -> str:
     """
     Rol real preguntando a Clerk, ignorando los claims del JWT (que pueden traer placeholders).
@@ -124,7 +91,7 @@ def _current_user_role_from_membership(org_id: str) -> str:
     )
     if not mm:
         return "member"
-    return "admin" if mm.get("role") == "admin" else "member"
+    return "admin" if mm.get("role") in ("admin", "owner") else "member"
 
 
 def _canonical_email(email: str) -> str:
@@ -179,9 +146,43 @@ def _set_seat_limit(org_id: str, seats: int) -> None:
             f"/organizations/{org_id}",
             json={"public_metadata": {"seats": seats}},
         )
-        # Si falla, al menos la cache está actualizada
+        # No necesitamos .ok duro; si falla, al menos la cache está actualizada
     except Exception:
         current_app.logger.warning("No se pudo persistir seats en Clerk")
+
+
+def _fetch_memberships(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
+    r = _clerk("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
+    if not r.ok:
+        detail = (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else r.text
+        )
+        return False, [], r.status_code, detail
+    data = r.json()
+    items = data["data"] if isinstance(data, dict) and "data" in data else data
+    return True, items, 200, None
+
+
+def _fetch_pending_invitations(
+    org_id: str,
+) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
+    r = _clerk(
+        "GET",
+        f"/organizations/{org_id}/invitations",
+        params={"status": "pending", "limit": 200},
+    )
+    if not r.ok:
+        detail = (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else r.text
+        )
+        return False, [], r.status_code, detail
+    data = r.json()
+    items = data["data"] if isinstance(data, dict) and "data" in data else data
+    return True, items, 200, None
 
 
 def _count_used_and_pending(org_id: str) -> Tuple[int, int] | Tuple[None, None]:
@@ -198,7 +199,7 @@ def _is_last_admin(
     ok, memberships, _, _ = _fetch_memberships(org_id)
     if not ok:
         return False, (0, 0)
-    admins = [m for m in memberships if m.get("role") == "admin"]
+    admins = [m for m in memberships if m.get("role") in ("admin", "owner")]
     if len(admins) <= 1:
         target = None
         if membership_id:
@@ -215,7 +216,7 @@ def _is_last_admin(
                 ),
                 None,
             )
-        if target and target.get("role") == "admin":
+        if target and target.get("role") in ("admin", "owner"):
             return True, (len(memberships), len(admins))
     return False, (len(memberships), len(admins))
 
@@ -405,6 +406,7 @@ def update_role():
     if not ok:
         return _json_error(code, "clerk_error_memberships", detail=detail)
 
+    # Resolver membership_id si solo llega user_id
     if not membership_id and user_id:
         mm = next(
             (
@@ -420,19 +422,24 @@ def update_role():
         if not mm:
             return _json_error(404, "membership no encontrada para ese user_id")
         membership_id = mm["id"]
-    if not membership_id:
+
+    if not membership_id and not user_id:
         return _json_error(400, "membership_id o user_id requerido")
 
+    # No permitir dejar a la organización sin admins
     if role == "member":
-        is_last, _ = _is_last_admin(org_id, membership_id, None)
+        is_last, _ = _is_last_admin(org_id, membership_id, user_id)
         if is_last:
             return _json_error(400, "no puedes degradar al último admin")
 
-    r = _clerk(
-        "PATCH",
-        f"/organizations/{org_id}/memberships/{membership_id}",
-        json={"role": ROLE_TO_CLERK.get(role, "basic_member")},
-    )
+    # Clerk: usar endpoint correcto
+    body = {"role": ROLE_TO_CLERK.get(role, "basic_member")}
+    if membership_id:
+        r = _clerk("PATCH", f"/organization_memberships/{membership_id}", json=body)
+    else:
+        # fallback por user_id
+        r = _clerk("PATCH", f"/organizations/{org_id}/memberships/{user_id}", json=body)
+
     if r.ok:
         return jsonify({"ok": True})
     detail = (
@@ -473,14 +480,21 @@ def remove_member():
         if not mm:
             return _json_error(404, "membership no encontrada para ese user_id")
         membership_id = mm["id"]
-    if not membership_id:
+
+    if not membership_id and not user_id:
         return _json_error(400, "membership_id o user_id requerido")
 
-    is_last, _ = _is_last_admin(org_id, membership_id, None)
+    # No permitir dejar la org sin admins
+    is_last, _ = _is_last_admin(org_id, membership_id, user_id)
     if is_last:
         return _json_error(400, "no puedes eliminar al último admin")
 
-    r = _clerk("DELETE", f"/organizations/{org_id}/memberships/{membership_id}")
+    # Clerk: usar endpoint correcto
+    if membership_id:
+        r = _clerk("DELETE", f"/organization_memberships/{membership_id}")
+    else:
+        r = _clerk("DELETE", f"/organizations/{org_id}/memberships/{user_id}")
+
     if r.status_code in (200, 204):
         return jsonify({"ok": True})
     detail = (
