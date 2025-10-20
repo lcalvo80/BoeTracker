@@ -93,7 +93,6 @@ _require_auth = _load_auth_guard()
 
 # ─────────── identidad / roles ───────────
 def _role_is_admin(raw: str) -> bool:
-    """Normaliza variaciones típicas que devuelve Clerk."""
     r = (raw or "").strip().lower()
     return r in {
         "admin", "owner",
@@ -106,18 +105,12 @@ def _derive_identity():
     return c.get("user_id"), c.get("email"), c.get("name"), c.get("org_id"), c.get("raw_claims") or {}
 
 def _is_org_admin(user_id: str, org_id: str) -> bool:
-    """
-    1) Autoridad: consulta a Clerk (secret key) la membership real.
-    2) Fallback: acepta claim 'org_role' admin del JWT si viene.
-    """
-    # 1) membership real en Clerk
     try:
         m = clerk_svc.get_membership(user_id, org_id)
         if _role_is_admin(m.get("role")):
             return True
     except Exception:
         pass
-    # 2) fallback a claims
     try:
         cl = getattr(g, "clerk", {}) or {}
         if _role_is_admin(cl.get("org_role")):
@@ -127,7 +120,6 @@ def _is_org_admin(user_id: str, org_id: str) -> bool:
     return False
 
 def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
-    """Prioriza body.org_id, header X-Org-Id, query org_id y por último la org del JWT."""
     try:
         body = request.get_json(silent=True) or {}
     except Exception:
@@ -139,7 +131,7 @@ def _org_from_req(default_org_id: Optional[str]) -> Optional[str]:
         or (default_org_id or "")
     ) or None
 
-# ─────────── Stripe customers: dedupe + metadata ───────────
+# ─────────── Stripe customers ───────────
 def _find_stripe_customer(entity_type: str, entity_id: str | None, email: str | None = None) -> str | None:
     _, err = _init_stripe()
     if err: return None
@@ -177,7 +169,6 @@ def _ensure_customer_metadata(customer_id: str, entity_type: str, entity_id: str
     except Exception:
         current_app.logger.warning("Cannot ensure stripe customer metadata")
 
-# ─────────── customers helpers ───────────
 def _ensure_customer_for_user(user_id: str) -> str:
     _, err = _init_stripe()
     if err: raise RuntimeError("stripe init failed")
@@ -244,7 +235,6 @@ def _ensure_customer_for_org(org_id: str) -> str:
     return c.id
 
 def _payment_method_summary(customer_id: str) -> Dict[str, Any] | None:
-    """{'brand': 'visa', 'last4': '4242'} del método por defecto si existe."""
     try:
         cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
         pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
@@ -315,7 +305,6 @@ def summary_options():
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
-    """Resumen por scope (user|org) vía query ?scope=... y/o header X-Org-Id."""
     return _summary_impl(scope=(request.args.get("scope") or "user").lower())
 
 @bp.route("/billing/org/summary", methods=["OPTIONS"])
@@ -325,7 +314,6 @@ def summary_org_options():
 @bp.get("/billing/org/summary")
 @_require_auth
 def summary_get_org_alias():
-    """Alias: /api/billing/org/summary (frontend legacy)"""
     return _summary_impl(scope="org")
 
 def _summary_impl(scope: str):
@@ -379,7 +367,6 @@ def invoices_options():
 @bp.get("/billing/invoices")
 @_require_auth
 def invoices_get():
-    """Facturas por scope (user|org) vía query ?scope=... y/o header X-Org-Id."""
     return _invoices_impl(scope=(request.args.get("scope") or "user").lower())
 
 @bp.route("/billing/org/invoices", methods=["OPTIONS"])
@@ -389,7 +376,6 @@ def invoices_org_options():
 @bp.get("/billing/org/invoices")
 @_require_auth
 def invoices_get_org_alias():
-    """Alias: /api/billing/org/invoices (frontend legacy)"""
     return _invoices_impl(scope="org")
 
 def _invoices_impl(scope: str):
@@ -425,7 +411,7 @@ def _invoices_impl(scope: str):
         return jsonify({"data": out}), 200
     except Exception as e:
         current_app.logger.exception("invoices_get failed: %s", e)
-        return jsonify({"data": []}), 200  # no rompemos UI
+        return jsonify({"data": []}), 200
 
 # ---------- SYNC ----------
 @bp.post("/billing/sync")

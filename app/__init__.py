@@ -1,4 +1,3 @@
-# app/__init__.py
 from __future__ import annotations
 
 import os
@@ -39,6 +38,8 @@ def create_app(config: dict | None = None):
     "app/__init__.py",
     "app/enterprise.py",
     "app/blueprints/enterprise.py",
+    "app/blueprints/billing.py",      # ← añadimos chequeo
+    "app/routes/billing.py",          # ← chequeo alternativo
   ]:
     p = Path(app.root_path).parent / rel
     app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
@@ -82,6 +83,7 @@ def create_app(config: dict | None = None):
 
   # Registro blueprints
   MODULE_ROOTS = ["app.blueprints", "app.routes", "app"]
+
   def register_bp(module_name: str, attr: str) -> bool:
     for root in MODULE_ROOTS:
       try:
@@ -90,13 +92,15 @@ def create_app(config: dict | None = None):
         app.register_blueprint(bp)
         app.logger.info(f"[init] Registrado BP '{bp.name}' de {root}.{module_name}")
         return True
-      except Exception:
+      except Exception as e:
         continue
     app.logger.warning(f"[init] No se pudo registrar {module_name}.{attr}")
     return False
 
-  # registra enterprise SIEMPRE (en tu repo está bajo app/enterprise.py)
+  # SIEMPRE registrar enterprise
   register_bp("enterprise", "bp")
+  # ⬇️ **NUEVO / IMPORTANTE**: registrar billing para exponer /api/billing/*
+  register_bp("billing", "bp")
 
   # Debug interno /api/_int
   from flask import Blueprint
@@ -171,7 +175,7 @@ def create_app(config: dict | None = None):
   def health():
     return jsonify({"status": "ok"}), 200
 
-  # Error handler JSON (evita HTML 500 de werkzeug)
+  # Error handler JSON (evita HTML 500 por defecto)
   @app.errorhandler(Exception)
   def handle_any_error(e):
     if isinstance(e, HTTPException):
