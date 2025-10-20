@@ -575,8 +575,6 @@ def billing_sync():
             user_id, _, _, _, _ = _derive_identity()
             org_id = derived_org_id
             if not org_id or not _is_org_admin(user_id, org_id):
-                # Si el comprador aún es member, después lo promocionaremos (ver abajo)
-                # pero para leer Stripe necesitamos el customer de la org igualmente.
                 customer_id = _ensure_customer_for_org(org_id)
             else:
                 customer_id = _ensure_customer_for_org(org_id)

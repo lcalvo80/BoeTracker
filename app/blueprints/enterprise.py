@@ -70,6 +70,40 @@ def _current_user_id() -> str | None:
     return c.get("user_id")
 
 
+def _fetch_memberships(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
+    r = _clerk("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
+    if not r.ok:
+        detail = (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else r.text
+        )
+        return False, [], r.status_code, detail
+    data = r.json()
+    items = data["data"] if isinstance(data, dict) and "data" in data else data
+    return True, items, 200, None
+
+
+def _fetch_pending_invitations(
+    org_id: str,
+) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
+    r = _clerk(
+        "GET",
+        f"/organizations/{org_id}/invitations",
+        params={"status": "pending", "limit": 200},
+    )
+    if not r.ok:
+        detail = (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else r.text
+        )
+        return False, [], r.status_code, detail
+    data = r.json()
+    items = data["data"] if isinstance(data, dict) and "data" in data else data
+    return True, items, 200, None
+
+
 def _current_user_role_from_membership(org_id: str) -> str:
     """
     Rol real preguntando a Clerk, ignorando los claims del JWT (que pueden traer placeholders).
@@ -145,43 +179,9 @@ def _set_seat_limit(org_id: str, seats: int) -> None:
             f"/organizations/{org_id}",
             json={"public_metadata": {"seats": seats}},
         )
-        # No necesitamos .ok duro; si falla, al menos la cache está actualizada
+        # Si falla, al menos la cache está actualizada
     except Exception:
         current_app.logger.warning("No se pudo persistir seats en Clerk")
-
-
-def _fetch_memberships(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
-    r = _clerk("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
-    if not r.ok:
-        detail = (
-            r.json()
-            if r.headers.get("content-type", "").startswith("application/json")
-            else r.text
-        )
-        return False, [], r.status_code, detail
-    data = r.json()
-    items = data["data"] if isinstance(data, dict) and "data" in data else data
-    return True, items, 200, None
-
-
-def _fetch_pending_invitations(
-    org_id: str,
-) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
-    r = _clerk(
-        "GET",
-        f"/organizations/{org_id}/invitations",
-        params={"status": "pending", "limit": 200},
-    )
-    if not r.ok:
-        detail = (
-            r.json()
-            if r.headers.get("content-type", "").startswith("application/json")
-            else r.text
-        )
-        return False, [], r.status_code, detail
-    data = r.json()
-    items = data["data"] if isinstance(data, dict) and "data" in data else data
-    return True, items, 200, None
 
 
 def _count_used_and_pending(org_id: str) -> Tuple[int, int] | Tuple[None, None]:
