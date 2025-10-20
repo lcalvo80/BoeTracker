@@ -37,9 +37,10 @@ def create_app(config: dict | None = None):
   for rel in [
     "app/__init__.py",
     "app/enterprise.py",
+    "app/billing.py",                # ← aseguramos log del billing real
     "app/blueprints/enterprise.py",
-    "app/blueprints/billing.py",      # ← añadimos chequeo
-    "app/routes/billing.py",          # ← chequeo alternativo
+    "app/blueprints/billing.py",     # ← chequeos alternativos
+    "app/routes/billing.py",
   ]:
     p = Path(app.root_path).parent / rel
     app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
@@ -81,7 +82,7 @@ def create_app(config: dict | None = None):
     if request.method == "OPTIONS" and request.path.startswith("/api/"):
       return ("", 204)
 
-  # Registro blueprints
+  # Registro blueprints (busca en app.blueprints, app.routes, y app)
   MODULE_ROOTS = ["app.blueprints", "app.routes", "app"]
 
   def register_bp(module_name: str, attr: str) -> bool:
@@ -92,14 +93,13 @@ def create_app(config: dict | None = None):
         app.register_blueprint(bp)
         app.logger.info(f"[init] Registrado BP '{bp.name}' de {root}.{module_name}")
         return True
-      except Exception as e:
+      except Exception:
         continue
     app.logger.warning(f"[init] No se pudo registrar {module_name}.{attr}")
     return False
 
-  # SIEMPRE registrar enterprise
+  # ← Importante: registrar ambos
   register_bp("enterprise", "bp")
-  # ⬇️ **NUEVO / IMPORTANTE**: registrar billing para exponer /api/billing/*
   register_bp("billing", "bp")
 
   # Debug interno /api/_int
@@ -115,6 +115,7 @@ def create_app(config: dict | None = None):
     rules.sort(key=lambda x: x["rule"])
     return jsonify(rules), 200
 
+  # Carga (o finge) decorator de auth para /_int/claims
   try:
     from .auth import require_clerk_auth as _auth_deco
     app.logger.info("[init] Auth decorator cargado")
@@ -175,7 +176,7 @@ def create_app(config: dict | None = None):
   def health():
     return jsonify({"status": "ok"}), 200
 
-  # Error handler JSON (evita HTML 500 por defecto)
+  # Error handler JSON
   @app.errorhandler(Exception)
   def handle_any_error(e):
     if isinstance(e, HTTPException):
