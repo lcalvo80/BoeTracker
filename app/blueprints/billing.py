@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from flask import Blueprint, request, jsonify, current_app, g
-from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, get_membership
+from app.services import clerk_svc  # get_user, get_org, update_*, create_org_for_user, ...
 from app.services.entitlements import sync_entitlements_for_org
 
 bp = Blueprint("billing", __name__, url_prefix="/api")
@@ -566,20 +566,35 @@ def checkout_enterprise():
     user_id, user_email, user_name, ctx_org_id, _ = _derive_identity()
     org_id = body.get("org_id") or ctx_org_id
 
-    # Crear organización si no existe
+    # Crear organización si no existe (con fallback seguro)
     if not org_id:
+        wanted_name = (user_name or user_email or f"org-{user_id}").split("@")[0]
+        org_id = None
+
+        # Intento rico: helper que crea org y añade membership
         try:
-            wanted_name = (user_name or user_email or f"org-{user_id}").split("@")[0]
             org = clerk_svc.create_org_for_user(
                 user_id=user_id,
                 name=wanted_name,
                 public={"plan": "enterprise", "seats": seats, "subscription": "enterprise"},
                 private={},
-            )
-            org_id = org.get("id")
+            ) or {}
+            org_id = org.get("id") or org.get("organization_id")
         except Exception as e:
-            current_app.logger.exception("[checkout] cannot create org: %s", e)
-            return jsonify(error="cannot create organization", detail=str(e)), 502
+            current_app.logger.warning("[checkout] create_org_for_user failed: %s", e)
+
+        # Fallback mínimo: crear org y (si se puede) intentar añadir membership,
+        # pero si Clerk devuelve 404 en memberships NO abortamos el checkout.
+        if not org_id:
+            try:
+                org_id = clerk_svc.create_org_minimal(wanted_name)
+                try:
+                    clerk_svc.ensure_membership_admin(org_id, user_id)
+                except Exception as e2:
+                    current_app.logger.warning("[checkout] ensure_membership_admin failed (continuing): %s", e2)
+            except Exception as e3:
+                current_app.logger.exception("[checkout] cannot create organization (fallback failed): %s", e3)
+                return jsonify(error="cannot create organization", detail=str(e3)), 502
 
     # Asegurar customer
     try:

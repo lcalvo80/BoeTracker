@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from flask import current_app
 
-API_BASE = "https://api.clerk.com/v1"
+API_BASE = os.getenv("CLERK_API_URL", "https://api.clerk.com/v1").rstrip("/")
 
 
 def _headers() -> Dict[str, str]:
@@ -22,13 +22,13 @@ def _headers() -> Dict[str, str]:
 # ─────────── Lectura ───────────
 
 def get_user(user_id: str) -> dict:
-    r = httpx.get(f"{API_BASE}/users/{user_id}", headers=_headers(), timeout=10)
+    r = httpx.get(f"{API_BASE}/users/{user_id}", headers=_headers(), timeout=20)
     r.raise_for_status()
     return r.json()
 
 
 def get_org(org_id: str) -> dict:
-    r = httpx.get(f"{API_BASE}/organizations/{org_id}", headers=_headers(), timeout=10)
+    r = httpx.get(f"{API_BASE}/organizations/{org_id}", headers=_headers(), timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -37,7 +37,7 @@ def get_user_memberships(user_id: str) -> List[Dict[str, Any]]:
     r = httpx.get(
         f"{API_BASE}/users/{user_id}/organization_memberships",
         headers=_headers(),
-        timeout=10,
+        timeout=20,
     )
     r.raise_for_status()
     data = r.json()
@@ -49,7 +49,7 @@ def list_org_memberships(org_id: str) -> List[Dict[str, Any]]:
     r = httpx.get(
         f"{API_BASE}/organizations/{org_id}/memberships",
         headers=_headers(),
-        timeout=10,
+        timeout=20,
     )
     r.raise_for_status()
     data = r.json()
@@ -67,7 +67,7 @@ def get_membership(user_id: str, org_id: str) -> Dict[str, Any]:
         f"{API_BASE}/organizations/{org_id}/memberships",
         params={"user_id": user_id, "limit": 1},
         headers=_headers(),
-        timeout=10,
+        timeout=20,
     )
     r.raise_for_status()
     data = r.json()
@@ -85,7 +85,7 @@ def update_user_metadata(user_id: str, public: dict | None = None, private: dict
         payload["private_metadata"] = private
     if not payload:
         return get_user(user_id)
-    r = httpx.patch(f"{API_BASE}/users/{user_id}", headers=_headers(), json=payload, timeout=10)
+    r = httpx.patch(f"{API_BASE}/users/{user_id}", headers=_headers(), json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -98,7 +98,7 @@ def update_org_metadata(org_id: str, public: dict | None = None, private: dict |
         payload["private_metadata"] = private
     if not payload:
         return get_org(org_id)
-    r = httpx.patch(f"{API_BASE}/organizations/{org_id}", headers=_headers(), json=payload, timeout=10)
+    r = httpx.patch(f"{API_BASE}/organizations/{org_id}", headers=_headers(), json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -109,24 +109,64 @@ def create_org_for_user(user_id: str | None, name: str, public: dict | None = No
     """
     Crea la organización y (si user_id) añade al usuario como admin.
     """
-    r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json={"name": name}, timeout=10)
+    r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json={"name": name}, timeout=20)
     r.raise_for_status()
     org = r.json()
     org_id = org.get("id")
 
     if user_id:
-        r2 = httpx.post(
-            f"{API_BASE}/organizations/{org_id}/memberships",
-            headers=_headers(),
-            json={"user_id": user_id, "role": "admin"},
-            timeout=10,
-        )
-        r2.raise_for_status()
+        # En algunas instancias el rol válido es "admin"; en otras "org:admin".
+        # Probamos ambos antes de rendirnos.
+        for role in ("admin", "org:admin"):
+            r2 = httpx.post(
+                f"{API_BASE}/organizations/{org_id}/memberships",
+                headers=_headers(),
+                json={"user_id": user_id, "role": role},
+                timeout=20,
+            )
+            if r2.status_code in (200, 201, 409):
+                break
+        else:
+            # Si ninguno funcionó, levantamos el último error
+            r2.raise_for_status()
 
     if public or private:
         update_org_metadata(org_id, public, private)
 
     return org
+
+
+def create_org_minimal(name: str) -> str:
+    """
+    Crea una organización sin tocar memberships; devuelve org_id.
+    """
+    r = httpx.post(f"{API_BASE}/organizations", headers=_headers(), json={"name": name}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("id") or data.get("organization_id")
+
+
+def ensure_membership_admin(org_id: str, user_id: str) -> None:
+    """
+    Intenta añadir al usuario como admin. Ignora:
+      - 404 (algunas instancias sin Organizations API extendida)
+      - 409 (ya existe invitación/membership)
+    Prueba "admin" y "org:admin".
+    """
+    for role in ("admin", "org:admin"):
+        r = httpx.post(
+            f"{API_BASE}/organizations/{org_id}/memberships",
+            headers=_headers(),
+            json={"user_id": user_id, "role": role},
+            timeout=20,
+        )
+        if r.status_code in (200, 201, 409):
+            return
+        if r.status_code == 404:
+            # Endpoint no disponible en esta instancia; no bloquear
+            return
+        # Si es 400/422, prueba el otro rol; si ninguno va, al final lanza
+    r.raise_for_status()
 
 
 # ─────────── Helpers de plan ───────────
@@ -191,7 +231,7 @@ def set_entitlement_for_org_members(org_id: str, entitlement: str | None):
 # ─────────── Invitado enterprise (opcional) ───────────
 
 def find_users_by_email(email: str) -> List[Dict[str, Any]]:
-    r = httpx.get(f"{API_BASE}/users", params={"email_address": email}, headers=_headers(), timeout=10)
+    r = httpx.get(f"{API_BASE}/users", params={"email_address": email}, headers=_headers(), timeout=20)
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, list) else (data.get("data") or [])
@@ -199,7 +239,7 @@ def find_users_by_email(email: str) -> List[Dict[str, Any]]:
 
 def create_user_skeleton(email: str) -> Dict[str, Any]:
     payload = {"email_address": [email], "skip_password_requirement": True}
-    r = httpx.post(f"{API_BASE}/users", headers=_headers(), json=payload, timeout=10)
+    r = httpx.post(f"{API_BASE}/users", headers=_headers(), json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
 

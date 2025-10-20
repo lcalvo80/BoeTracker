@@ -37,9 +37,9 @@ def create_app(config: dict | None = None):
   for rel in [
     "app/__init__.py",
     "app/enterprise.py",
-    "app/billing.py",                # ← aseguramos log del billing real
+    "app/billing.py",
     "app/blueprints/enterprise.py",
-    "app/blueprints/billing.py",     # ← chequeos alternativos
+    "app/blueprints/billing.py",
     "app/routes/billing.py",
   ]:
     p = Path(app.root_path).parent / rel
@@ -98,7 +98,7 @@ def create_app(config: dict | None = None):
     app.logger.warning(f"[init] No se pudo registrar {module_name}.{attr}")
     return False
 
-  # ← Importante: registrar ambos
+  # Importante: registrar ambos
   register_bp("enterprise", "bp")
   register_bp("billing", "bp")
 
@@ -115,7 +115,6 @@ def create_app(config: dict | None = None):
     rules.sort(key=lambda x: x["rule"])
     return jsonify(rules), 200
 
-  # Carga (o finge) decorator de auth para /_int/claims
   try:
     from .auth import require_clerk_auth as _auth_deco
     app.logger.info("[init] Auth decorator cargado")
