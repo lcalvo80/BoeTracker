@@ -1,13 +1,10 @@
 # backend/enterprise.py
 from __future__ import annotations
-import os, math, time
+import os
+import re
 from typing import Dict, Any, List, Tuple
 import requests
 from flask import Blueprint, request, jsonify, g, current_app
-
-# ───────── Dependencias de tu app (ajusta) ─────────
-# from yourapp.extensions import db
-# from yourapp.auth import require_auth
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 
@@ -18,33 +15,63 @@ CLERK_SECRET = os.environ.get("CLERK_SECRET_KEY", "")
 ROLE_TO_CLERK = {"admin": "admin", "member": "basic_member"}
 ROLE_FROM_CLERK = {"admin": "admin", "basic_member": "member"}
 
-# ============ Helpers comunes ==============================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers comunes
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _auth_headers():
+_PLACEHOLDER_RE = re.compile(r"^\s*\{\{.*\}\}\s*$", re.I)
+
+def _is_placeholder(v: str) -> bool:
+    if not isinstance(v, str):
+        return False
+    s = v.strip().lower()
+    return bool(_PLACEHOLDER_RE.match(s)) or s in {
+        "organization.id",
+        "organization_membership.role",
+        "organization.slug",
+        "user.id",
+        "user.email_address",
+    }
+
+def _valid_org_id(v: str) -> bool:
+    return isinstance(v, str) and v.startswith("org_") and not _is_placeholder(v)
+
+def _auth_headers() -> Dict[str, str]:
     if not CLERK_SECRET:
         raise RuntimeError("CLERK_SECRET_KEY no configurado")
     return {"Authorization": f"Bearer {CLERK_SECRET}"}
 
-def _clerk(method: str, path: str, *, params=None, json=None):
+def _clerk(method: str, path: str, *, params=None, json=None) -> requests.Response:
     url = f"{CLERK_API}{path}"
-    r = requests.request(method, url, headers=_auth_headers(), params=params, json=json, timeout=15)
-    # devolvemos el Response para poder inspeccionar status en algunos casos
-    return r
+    return requests.request(method, url, headers=_auth_headers(), params=params, json=json, timeout=20)
+
+def _json_error(code: int, message: str, **extra):
+    return jsonify({"message": message, **extra}), code
 
 def _org_id_from_context() -> str:
     """
-    Obtiene el org_id desde g (JWT backend template) o desde el header 'X-Org-Id' como fallback.
-    Debes tener un middleware que pueble g.user_id, g.org_id, g.org_role desde el JWT.
+    PRIORIDAD: header X-Org-Id > g.org_id.
+    Ignora placeholders. Lanza ValueError si no hay un org_id válido.
     """
-    org_id = getattr(g, "org_id", None) or request.headers.get("X-Org-Id")
-    if not org_id:
-        raise ValueError("No hay organización activa (org_id).")
-    return org_id
+    hdr = request.headers.get("X-Org-Id")
+    if _valid_org_id(hdr):
+        return hdr
+    claim = getattr(g, "org_id", None)
+    if _valid_org_id(claim):
+        return claim
+    raise ValueError("No hay un org_id válido. Incluye cabecera X-Org-Id o corrige el JWT template.")
+
+def _current_user_role() -> str:
+    raw = (getattr(g, "org_role", "") or "").strip().lower()
+    if _is_placeholder(raw) or raw in ("", "null", "undefined"):
+        return "member"
+    if raw in ("admin", "owner", "org:admin", "org_admin", "organization_admin", "org:owner", "org_owner", "organization_owner"):
+        return "admin"
+    return "member"
 
 def _canonical_email(email: str) -> str:
     """
-    Normaliza SOLO gmail/googlemail para evitar falsos duplicados por +alias y puntos.
-    Para otros dominios no tocamos nada.
+    Normaliza SOLO gmail/googlemail (quita puntos y +alias) para evitar duplicados.
     """
     e = (email or "").strip().lower()
     if "@" not in e:
@@ -54,93 +81,94 @@ def _canonical_email(email: str) -> str:
         local = local.split("+", 1)[0].replace(".", "")
     return f"{local}@{domain}"
 
-def _json_error(code: int, message: str, **extra):
-    payload = {"message": message, **extra}
-    return jsonify(payload), code
-
-def _current_user_role() -> str:
-    raw = (getattr(g, "org_role", "") or "").strip().lower()
-    return "admin" if raw in ("admin", "owner", "org:admin", "org_admin", "organization_admin", "org:owner", "org_owner") else "member"
-
-
-# ============ (opcional) Modelo de asientos =================================
-# Si ya lo guardas en DB, deja este stub adaptado a tu ORM.
-#
-# class EnterpriseOrg(db.Model):
-#     __tablename__ = "enterprise_orgs"
-#     org_id = db.Column(db.String, primary_key=True)
-#     seat_limit = db.Column(db.Integer, nullable=False, default=0)
+# ─────────────────────────────────────────────────────────────────────────────
+# Seat limit (almacen simple en memoria; sustituir por DB si procede)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_seat_limit(org_id: str) -> int:
-    """
-    Lee el límite de asientos desde DB o metadata. Aquí: ejemplo con config/dict.
-    Sustituye por tu query real (db.session.query(EnterpriseOrg.seat_limit)...).
-    """
-    # TODO: reemplazar por DB real
-    # row = db.session.get(EnterpriseOrg, org_id)
-    # return row.seat_limit if row else 0
     store = getattr(current_app, "_SEAT_LIMITS", {})
     return int(store.get(org_id, 0))
 
 def _set_seat_limit(org_id: str, seats: int) -> None:
-    # TODO: persistir en DB real
     store = getattr(current_app, "_SEAT_LIMITS", {})
     store[org_id] = int(max(0, seats))
     current_app._SEAT_LIMITS = store
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Wrappers seguros de Clerk (no levantan 500)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ============ Contadores (memberships + invites) ============================
-
-def _list_memberships(org_id: str) -> List[Dict[str, Any]]:
+def _fetch_memberships(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
     r = _clerk("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
-    r.raise_for_status()
+    if not r.ok:
+        detail = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
+        return False, [], r.status_code, detail
     data = r.json()
-    items = data["data"] if "data" in data else data  # safety
-    return items
+    items = data["data"] if isinstance(data, dict) and "data" in data else data
+    return True, items, 200, None
 
-def _list_pending_invitations(org_id: str) -> List[Dict[str, Any]]:
+def _fetch_pending_invitations(org_id: str) -> Tuple[bool, List[Dict[str, Any]], int, Any]:
     r = _clerk("GET", f"/organizations/{org_id}/invitations", params={"status": "pending", "limit": 200})
-    r.raise_for_status()
+    if not r.ok:
+        detail = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
+        return False, [], r.status_code, detail
     data = r.json()
-    items = data["data"] if "data" in data else data
-    return items
+    items = data["data"] if isinstance(data, dict) and "data" in data else data
+    return True, items, 200, None
 
-def _count_used_and_pending(org_id: str) -> Tuple[int, int]:
-    memberships = _list_memberships(org_id)
-    pending = _list_pending_invitations(org_id)
-    return len(memberships), len(pending)
+def _count_used_and_pending(org_id: str) -> Tuple[int, int] | Tuple[None, None]:
+    ok_u, memberships, _, _ = _fetch_memberships(org_id)
+    ok_i, invites, _, _ = _fetch_pending_invitations(org_id)
+    if not ok_u or not ok_i:
+        return None, None
+    return len(memberships), len(invites)
 
-def _is_last_admin(org_id: str, membership_id: str | None, user_id: str | None) -> bool:
-    memberships = _list_memberships(org_id)
-    admins = [m for m in memberships if (m.get("role") == "admin")]
+def _is_last_admin(org_id: str, membership_id: str | None, user_id: str | None) -> Tuple[bool, Tuple[int,int]]:
+    ok, memberships, _, _ = _fetch_memberships(org_id)
+    if not ok:
+        return False, (0,0)
+    admins = [m for m in memberships if m.get("role") == "admin"]
     if len(admins) <= 1:
-        # ¿el target es ese único admin?
         target = None
         if membership_id:
             target = next((m for m in memberships if m.get("id") == membership_id), None)
         elif user_id:
-            target = next((m for m in memberships if (m.get("public_user_data", {}).get("user_id") == user_id or m.get("user_id") == user_id)), None)
+            target = next((m for m in memberships if (m.get("user_id") == user_id or m.get("public_user_data", {}).get("user_id") == user_id)), None)
         if target and target.get("role") == "admin":
-            return True
-    return False
+            return True, (len(memberships), len(admins))
+    return False, (len(memberships), len(admins))
 
-
-# ============ GET /org ======================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 
 @bp.get("/org")
-# @require_auth(org=True)  # Asegúrate de proteger con tu decorador
 def get_org():
     try:
         org_id = _org_id_from_context()
     except ValueError as e:
         return _json_error(400, str(e))
 
-    used, pending = _count_used_and_pending(org_id)
-    seats = _get_seat_limit(org_id)
+    # Nombre org (best-effort)
+    org_resp = _clerk("GET", f"/organizations/{org_id}")
+    org_name = None
+    if org_resp.ok:
+        try:
+            org_name = org_resp.json().get("name")
+        except Exception:
+            org_name = None
 
-    # Puedes ampliar: name desde Clerk
-    org = _clerk("GET", f"/organizations/{org_id}")
-    org_name = org.json().get("name") if org.ok else None
+    ok_u, memberships, code_u, detail_u = _fetch_memberships(org_id)
+    if not ok_u:
+        return _json_error(code_u, "clerk_error_memberships", detail=detail_u)
+
+    ok_i, invites, code_i, detail_i = _fetch_pending_invitations(org_id)
+    if not ok_i:
+        return _json_error(code_i, "clerk_error_invitations", detail=detail_i)
+
+    used = len(memberships)
+    pending = len(invites)
+    seats = _get_seat_limit(org_id)
 
     return jsonify({
         "id": org_id,
@@ -149,46 +177,41 @@ def get_org():
         "used_seats": used,
         "pending_invites": pending,
         "current_user_role": _current_user_role(),
-        # opcionales para compatibilidad camelCase
+        # camelCase para compat
         "seatLimit": seats,
         "usedSeats": used,
     })
 
-
-# ============ GET /users ====================================================
-
 @bp.get("/users")
-# @require_auth(org=True)
 def list_users():
     try:
         org_id = _org_id_from_context()
     except ValueError as e:
         return _json_error(400, str(e))
 
-    items = _list_memberships(org_id)
+    ok, items, code, detail = _fetch_memberships(org_id)
+    if not ok:
+        return _json_error(code, "clerk_error_memberships", detail=detail)
+
     rows = []
     for m in items:
-        # Clerk puede devolver user_id directamente o dentro de public_user_data
         pud = m.get("public_user_data") or {}
         user_id = m.get("user_id") or pud.get("user_id")
-        name = pud.get("first_name", "") + (" " if pud.get("last_name") else "") + (pud.get("last_name", "") or "")
-        email = pud.get("email_address") or pud.get("identifier") or ""
-        role = ROLE_FROM_CLERK.get(m.get("role", ""), "member")
+        first = (pud.get("first_name") or "").strip()
+        last  = (pud.get("last_name") or "").strip()
+        name = " ".join(filter(None, [first, last])) or None
+        email = pud.get("email_address") or pud.get("identifier") or None
+        role = ROLE_FROM_CLERK.get(m.get("role",""), "member")
         rows.append({
-            "id": m.get("id"),               # membership_id
+            "id": m.get("id"),         # membership_id
             "user_id": user_id,
-            "name": name.strip() or None,
-            "email": email or None,
+            "name": name,
+            "email": email,
             "role": role,
         })
-
     return jsonify({"data": rows})
 
-
-# ============ POST /invite ==================================================
-
 @bp.post("/invite")
-# @require_auth(org_admin=True)
 def invite_users():
     try:
         org_id = _org_id_from_context()
@@ -208,15 +231,20 @@ def invite_users():
     if not emails:
         return _json_error(400, "emails requerido")
 
-    # Capacidad
     seats = _get_seat_limit(org_id)
-    used, pending = _count_used_and_pending(org_id)
-    if not allow_overbook and (used + pending + len(emails) > seats):
-        return _json_error(409, "seat_limit_exceeded", results=[{"email": e, "ok": False, "error": "seat_limit_exceeded"} for e in emails])
+    ok_u, memberships, code_u, detail_u = _fetch_memberships(org_id)
+    if not ok_u:
+        return _json_error(code_u, "clerk_error_memberships", detail=detail_u)
+    ok_i, invites, code_i, detail_i = _fetch_pending_invitations(org_id)
+    if not ok_i:
+        return _json_error(code_i, "clerk_error_invitations", detail=detail_i)
 
-    # Detección previa de duplicados por email canónico
-    existing = _list_pending_invitations(org_id)
-    existing_map = { _canonical_email(i.get("email_address","")): i for i in existing }
+    used = len(memberships); pending = len(invites)
+    if not allow_overbook and (used + pending + len(emails) > seats):
+        return _json_error(409, "seat_limit_exceeded",
+                           results=[{"email": e, "ok": False, "error": "seat_limit_exceeded"} for e in emails])
+
+    existing_map = { _canonical_email(i.get("email_address","")): i for i in invites }
 
     results = []
     any_error = False
@@ -233,34 +261,24 @@ def invite_users():
         }
         if redirect_url:
             body["redirect_url"] = redirect_url
-        # Clerk soporta expires_in_days para org invitations
         if expires_in_days:
             body["expires_in_days"] = max(1, int(expires_in_days))
 
         r = _clerk("POST", f"/organizations/{org_id}/invitations", json=body)
-        if r.status_code in (200, 201):
+        if r.status_code in (200,201):
             inv = r.json()
             results.append({"email": raw, "ok": True, "invitation_id": inv.get("id"), "status": inv.get("status")})
         elif r.status_code == 409:
-            # Clerk ya detectó duplicada
             results.append({"email": raw, "ok": False, "error": "invitation_exists_pending"})
             any_error = True
         else:
             any_error = True
-            try:
-                msg = r.json()
-            except Exception:
-                msg = {"error": r.text}
-            results.append({"email": raw, "ok": False, "error": "clerk_error", "detail": msg})
+            detail = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
+            results.append({"email": raw, "ok": False, "error": "clerk_error", "detail": detail})
 
-    status = 409 if any_error else 200
-    return jsonify({"results": results}), status
-
-
-# ============ POST /update-role ============================================
+    return jsonify({"results": results}), (409 if any_error else 200)
 
 @bp.post("/update-role")
-# @require_auth(org_admin=True)
 def update_role():
     try:
         org_id = _org_id_from_context()
@@ -271,36 +289,35 @@ def update_role():
     membership_id = payload.get("membership_id")
     user_id = payload.get("user_id")
     role = (payload.get("role") or "member").strip().lower()
-
-    if not membership_id and not user_id:
-        return _json_error(400, "membership_id o user_id requerido")
-
-    if role not in ("admin", "member"):
+    if role not in ("admin","member"):
         return _json_error(400, "role inválido (usa 'admin'|'member')")
 
-    # Resolver membership_id por user_id si hace falta
-    if not membership_id:
-        memberships = _list_memberships(org_id)
-        mm = next((m for m in memberships if (m.get("user_id") == user_id or m.get("public_user_data", {}).get("user_id") == user_id)), None)
+    ok, memberships, code, detail = _fetch_memberships(org_id)
+    if not ok:
+        return _json_error(code, "clerk_error_memberships", detail=detail)
+
+    if not membership_id and user_id:
+        mm = next((m for m in memberships if (m.get("user_id")==user_id or m.get("public_user_data",{}).get("user_id")==user_id)), None)
         if not mm:
             return _json_error(404, "membership no encontrada para ese user_id")
         membership_id = mm["id"]
+    if not membership_id:
+        return _json_error(400, "membership_id o user_id requerido")
 
-    # Evitar dejar la org sin admin
-    if role == "member" and _is_last_admin(org_id, membership_id, None):
-        return _json_error(400, "no puedes degradar al último admin")
+    if role == "member":
+        is_last, _ = _is_last_admin(org_id, membership_id, None)
+        if is_last:
+            return _json_error(400, "no puedes degradar al último admin")
 
-    body = {"role": ROLE_TO_CLERK.get(role, "basic_member")}
-    r = _clerk("PATCH", f"/organizations/{org_id}/memberships/{membership_id}", json=body)
+    r = _clerk("PATCH", f"/organizations/{org_id}/memberships/{membership_id}", json={
+        "role": ROLE_TO_CLERK.get(role, "basic_member")
+    })
     if r.ok:
         return jsonify({"ok": True})
-    return _json_error(r.status_code, "clerk_error", detail=r.json() if r.headers.get("content-type","").startswith("application/json") else r.text)
-
-
-# ============ POST /remove ==================================================
+    detail = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
+    return _json_error(r.status_code, "clerk_error", detail=detail)
 
 @bp.post("/remove")
-# @require_auth(org_admin=True)
 def remove_member():
     try:
         org_id = _org_id_from_context()
@@ -311,34 +328,29 @@ def remove_member():
     membership_id = payload.get("membership_id")
     user_id = payload.get("user_id")
 
-    if not membership_id and not user_id:
-        return _json_error(400, "membership_id o user_id requerido")
+    ok, memberships, code, detail = _fetch_memberships(org_id)
+    if not ok:
+        return _json_error(code, "clerk_error_memberships", detail=detail)
 
-    # Resolver membership_id si llega user_id
-    if not membership_id:
-        memberships = _list_memberships(org_id)
-        mm = next((m for m in memberships if (m.get("user_id") == user_id or m.get("public_user_data", {}).get("user_id") == user_id)), None)
+    if not membership_id and user_id:
+        mm = next((m for m in memberships if (m.get("user_id")==user_id or m.get("public_user_data",{}).get("user_id")==user_id)), None)
         if not mm:
             return _json_error(404, "membership no encontrada para ese user_id")
         membership_id = mm["id"]
+    if not membership_id:
+        return _json_error(400, "membership_id o user_id requerido")
 
-    if _is_last_admin(org_id, membership_id, None):
+    is_last, _ = _is_last_admin(org_id, membership_id, None)
+    if is_last:
         return _json_error(400, "no puedes eliminar al último admin")
 
     r = _clerk("DELETE", f"/organizations/{org_id}/memberships/{membership_id}")
-    if r.status_code in (200, 204):
+    if r.status_code in (200,204):
         return jsonify({"ok": True})
-    try:
-        detail = r.json()
-    except Exception:
-        detail = r.text
+    detail = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
     return _json_error(r.status_code, "clerk_error", detail=detail)
 
-
-# ============ POST /set-seat-limit =========================================
-
 @bp.post("/set-seat-limit")
-# @require_auth(org_admin=True)
 def set_seat_limit():
     try:
         org_id = _org_id_from_context()
@@ -350,24 +362,29 @@ def set_seat_limit():
     if seats < 0:
         return _json_error(400, "seats debe ser >= 0")
 
-    used, pending = _count_used_and_pending(org_id)
+    ok_u, memberships, code_u, detail_u = _fetch_memberships(org_id)
+    if not ok_u:
+        return _json_error(code_u, "clerk_error_memberships", detail=detail_u)
+    ok_i, invites, code_i, detail_i = _fetch_pending_invitations(org_id)
+    if not ok_i:
+        return _json_error(code_i, "clerk_error_invitations", detail=detail_i)
+
+    used = len(memberships); pending = len(invites)
     if seats < (used + pending):
         return _json_error(400, f"seats no puede ser < used+pending ({used}+{pending})")
 
     _set_seat_limit(org_id, seats)
     return jsonify({"ok": True, "seats": seats})
 
-
-# ============ (Opcional) Invites: listar / revocar ==========================
-
 @bp.get("/invitations")
-# @require_auth(org_admin=True)
 def list_invitations():
     try:
         org_id = _org_id_from_context()
     except ValueError as e:
         return _json_error(400, str(e))
-    items = _list_pending_invitations(org_id)
+    ok, items, code, detail = _fetch_pending_invitations(org_id)
+    if not ok:
+        return _json_error(code, "clerk_error_invitations", detail=detail)
     out = [{
         "id": i.get("id"),
         "email": i.get("email_address"),
@@ -377,7 +394,6 @@ def list_invitations():
     return jsonify({"items": out})
 
 @bp.post("/revoke-invite")
-# @require_auth(org_admin=True)
 def revoke_invite():
     try:
         org_id = _org_id_from_context()
@@ -392,11 +408,12 @@ def revoke_invite():
         return _json_error(400, "email o invitation_id requerido")
 
     if not invitation_id:
-        items = _list_pending_invitations(org_id)
+        ok, items, code, detail = _fetch_pending_invitations(org_id)
+        if not ok:
+            return _json_error(code, "clerk_error_invitations", detail=detail)
         for inv in items:
             if (inv.get("email_address") or "").strip().lower() == email:
-                invitation_id = inv.get("id")
-                break
+                invitation_id = inv.get("id"); break
 
     if not invitation_id:
         return _json_error(404, "invitation no encontrada")
@@ -404,8 +421,5 @@ def revoke_invite():
     r = _clerk("POST", f"/organizations/{org_id}/invitations/{invitation_id}/revoke")
     if r.ok:
         return jsonify({"ok": True})
-    try:
-        detail = r.json()
-    except Exception:
-        detail = r.text
+    detail = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text
     return _json_error(r.status_code, "clerk_error", detail=detail)

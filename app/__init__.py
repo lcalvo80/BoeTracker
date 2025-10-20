@@ -13,84 +13,54 @@ from flask_cors import CORS
 from flask_sock import Sock
 from dotenv import load_dotenv
 from werkzeug.middleware.proxy_fix import ProxyFix
-
+from werkzeug.exceptions import HTTPException
 
 def _normalize_origin(o: str) -> str:
   o = (o or "").strip()
   return o[:-1] if o.endswith("/") else o
 
-
 def _parse_origins():
-  """
-  Prioriza ALLOWED_ORIGINS (coma-separado). Si no, cae a FRONTEND_ORIGIN o FRONTEND_URL.
-  Devuelve una lista de orígenes válidos (sin slash final).
-  """
   raw = os.getenv("ALLOWED_ORIGINS", "").strip()
   if raw:
     return [_normalize_origin(o) for o in raw.split(",") if o.strip()]
-
   cand = [os.getenv("FRONTEND_ORIGIN", "").strip(), os.getenv("FRONTEND_URL", "").strip()]
   out = [_normalize_origin(o) for o in cand if o]
   return out or ["http://localhost:3000", "http://localhost:5173"]
-
 
 def create_app(config: dict | None = None):
   load_dotenv()
   app = Flask(__name__)
   app.url_map.strict_slashes = False
 
-  # Confiar en cabeceras de proxy (Railway/Fly/NGINX)
   app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
-  # Diagnóstico de archivos
   app.logger.info(f"[init] cwd={os.getcwd()} root_path={app.root_path} sys.path[0]={sys.path[0]}")
   for rel in [
     "app/__init__.py",
-    "app/enterprise.py",               # ← añadida (por si no está en app/blueprints)
+    "app/enterprise.py",
     "app/blueprints/enterprise.py",
-    "app/blueprints/debug.py",
-    "app/blueprints/billing.py",
-    "app/blueprints/webhooks.py",
-    "app/blueprints/items.py",
-    "app/blueprints/comments.py",
-    "app/blueprints/compat.py",
-    "app/blueprints/api_alias.py",
-    "app/blueprints/account.py",
-    "app/routes/debug.py",
-    "app/routes/billing.py",
-    "app/routes/webhooks.py",
-    "app/routes/items.py",
-    "app/routes/comments.py",
-    "app/routes/compat.py",
-    "app/auth.py",
   ]:
     p = Path(app.root_path).parent / rel
     app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
 
-  # ── Config ──
   app.config.update(
     FRONTEND_URL=os.getenv("FRONTEND_URL", "http://localhost:5173"),
-    # Clerk
     CLERK_PUBLISHABLE_KEY=os.getenv("CLERK_PUBLISHABLE_KEY", ""),
     CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
     CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),
     CLERK_WEBHOOK_SECRET=os.getenv("CLERK_WEBHOOK_SECRET", ""),
     CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),
-    # Default para validar el JWT de plantilla "backend"
     CLERK_AUDIENCE=os.getenv("CLERK_AUDIENCE", "backend"),
     CLERK_LEEWAY=os.getenv("CLERK_LEEWAY", "30"),
     CLERK_JWKS_TTL=os.getenv("CLERK_JWKS_TTL", "3600"),
     CLERK_JWKS_TIMEOUT=os.getenv("CLERK_JWKS_TIMEOUT", "5"),
-    # Flags
     DISABLE_AUTH=os.getenv("DISABLE_AUTH", "0"),
     EXPOSE_CLAIMS_DEBUG=os.getenv("EXPOSE_CLAIMS_DEBUG", "0"),
-    # Flask
     JSON_SORT_KEYS=False,
   )
   if config:
     app.config.update(config)
 
-  # ── CORS (solo /api/*) ──
   origins = _parse_origins()
   app.logger.info(f"[init] CORS origins = {origins}")
   app.logger.info("[init] FRONTEND_URL=%s", app.config.get("FRONTEND_URL"))
@@ -105,59 +75,30 @@ def create_app(config: dict | None = None):
     max_age=86400,
   )
 
-  # --- Preflight global
   @app.before_request
   def _allow_cors_preflight():
     if request.method == "OPTIONS" and request.path.startswith("/api/"):
       return ("", 204)
 
-  # ── Registro de blueprints (robusto) ──
-  # Añadimos "app" para capturar app/enterprise.py
+  # Registro blueprints
   MODULE_ROOTS = ["app.blueprints", "app.routes", "app"]
-
   def register_bp(module_name: str, attr: str) -> bool:
-    errors = []
     for root in MODULE_ROOTS:
-      module_path = f"{root}.{module_name}"
       try:
-        mod = importlib.import_module(module_path)
-      except ModuleNotFoundError:
-        continue
-      except Exception as e:
-        errors.append((module_path, f"import_error: {e}"))
-        continue
-
-      try:
+        mod = importlib.import_module(f"{root}.{module_name}")
         bp = getattr(mod, attr)
-      except Exception as e:
-        errors.append((module_path, f"missing_attr_{attr}: {e}"))
-        continue
-
-      try:
         app.register_blueprint(bp)
-        app.logger.info(f"[init] Registrado BP '{bp.name}' de {module_path}")
+        app.logger.info(f"[init] Registrado BP '{bp.name}' de {root}.{module_name}")
         return True
-      except Exception as e:
-        errors.append((module_path, f"register_error: {e}"))
-
-    if errors:
-      for where, msg in errors:
-        app.logger.error(f"[init] Fallo registrando {where}.{attr}: {msg}")
-    else:
-      app.logger.info(f"[init] No se encontró módulo '{module_name}' en {MODULE_ROOTS}")
+      except Exception:
+        continue
+    app.logger.warning(f"[init] No se pudo registrar {module_name}.{attr}")
     return False
 
-  register_bp("debug", "bp")
-  register_bp("billing", "bp")
-  register_bp("webhooks", "bp")
-  register_bp("items", "bp")
-  register_bp("comments", "bp")
-  register_bp("compat", "bp")
-  register_bp("enterprise", "bp")  # ← asegurado
-  register_bp("api_alias", "bp")
-  register_bp("account", "bp")
+  # registra enterprise SIEMPRE (en tu repo está bajo app/enterprise.py)
+  register_bp("enterprise", "bp")
 
-  # ── Fallback de debug en /api/_int ──
+  # Debug interno /api/_int
   from flask import Blueprint
   intdbg = Blueprint("int_debug", __name__, url_prefix="/api/_int")
 
@@ -165,16 +106,16 @@ def create_app(config: dict | None = None):
   def _int_routes():
     rules = []
     for r in app.url_map.iter_rules():
-      methods = sorted(m for m in r.methods if m in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+      methods = sorted(m for m in r.methods if m in {"GET","POST","PUT","PATCH","DELETE","OPTIONS"})
       rules.append({"endpoint": r.endpoint, "methods": methods, "rule": str(r.rule)})
     rules.sort(key=lambda x: x["rule"])
     return jsonify(rules), 200
 
   try:
     from .auth import require_clerk_auth as _auth_deco
-    app.logger.info("[init] Auth decorator cargado: app.auth.require_clerk_auth")
+    app.logger.info("[init] Auth decorator cargado")
   except Exception as e:
-    app.logger.warning(f"[init] Auth no disponible ({e}); /api/_int/claims devolverá 501")
+    app.logger.warning(f"[init] Auth no disponible ({e}); claims será 501")
     def _auth_deco(fn):
       @wraps(fn)
       def wrapper(*args, **kwargs):
@@ -188,8 +129,6 @@ def create_app(config: dict | None = None):
       "CLERK_JWKS_URL": app.config.get("CLERK_JWKS_URL", ""),
       "CLERK_AUDIENCE": app.config.get("CLERK_AUDIENCE", ""),
       "CLERK_LEEWAY": app.config.get("CLERK_LEEWAY", ""),
-      "CLERK_JWKS_TTL": app.config.get("CLERK_JWKS_TTL", ""),
-      "CLERK_JWKS_TIMEOUT": app.config.get("CLERK_JWKS_TIMEOUT", ""),
       "DISABLE_AUTH": app.config.get("DISABLE_AUTH", ""),
     }
     return jsonify(cfg), 200
@@ -214,7 +153,7 @@ def create_app(config: dict | None = None):
     }
     return jsonify(payload), 200
 
-  @intdbg.route("/echo", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+  @intdbg.route("/echo", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
   def _int_echo():
     return jsonify({
       "method": request.method,
@@ -227,12 +166,20 @@ def create_app(config: dict | None = None):
   app.register_blueprint(intdbg)
   app.logger.info("[init] Fallback interno montado en /api/_int")
 
-  # ── Health ──
+  # Health
   @app.get("/api/health")
   def health():
     return jsonify({"status": "ok"}), 200
 
-  # ── WebSocket (opcional) ──
+  # Error handler JSON (evita HTML 500 de werkzeug)
+  @app.errorhandler(Exception)
+  def handle_any_error(e):
+    if isinstance(e, HTTPException):
+      return {"message": e.description}, e.code
+    app.logger.exception("Unhandled error")
+    return {"message": "internal_error"}, 500
+
+  # WebSocket (opcional)
   sock = Sock(app)
 
   @sock.route("/ws")
@@ -254,7 +201,6 @@ def create_app(config: dict | None = None):
         ws.send(json.dumps({"type": "echo", "data": payload}))
 
   return app
-
 
 # WSGI entrypoint
 app = create_app()
