@@ -13,3 +13,4 @@ python-jose[cryptography]==3.3.0
 requests>=2.32.0
 svix==1.24.0
 hypercorn[trio]
+PyJWT[crypto]==2.9.0
