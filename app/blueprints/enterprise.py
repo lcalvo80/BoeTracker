@@ -390,15 +390,29 @@ def invite_users():
 
 @bp.post("/update-role")
 def update_role():
+    """
+    Body:
+      { "membership_id": "orgmem_...", "role": "admin"|"member" }
+      o bien
+      { "user_id": "user_...", "role": "admin"|"member" }
+    Requiere:
+      - Authorization: Bearer <JWT Clerk>
+      - X-Org-Id: org_...
+    """
     try:
         org_id = _org_id_from_context()
     except ValueError as e:
         return _json_error(400, str(e))
 
+    # 🔐 Solo admins pueden modificar roles
+    if _current_user_role_from_membership(org_id) != "admin":
+        return _json_error(403, "forbidden: admin requerido")
+
     payload = request.get_json(silent=True) or {}
-    membership_id = payload.get("membership_id")
-    user_id = payload.get("user_id")
+    membership_id = (payload.get("membership_id") or "").strip()
+    user_id = (payload.get("user_id") or "").strip()
     role = (payload.get("role") or "member").strip().lower()
+
     if role not in ("admin", "member"):
         return _json_error(400, "role inválido (usa 'admin'|'member')")
 
@@ -406,39 +420,40 @@ def update_role():
     if not ok:
         return _json_error(code, "clerk_error_memberships", detail=detail)
 
-    # Resolver membership_id si solo llega user_id
+    # Resolver membership_id con user_id si hace falta
     if not membership_id and user_id:
         mm = next(
-            (
-                m
-                for m in memberships
-                if (
-                    m.get("user_id") == user_id
-                    or m.get("public_user_data", {}).get("user_id") == user_id
-                )
-            ),
+            (m for m in memberships
+             if (m.get("user_id") == user_id
+                 or m.get("public_user_data", {}).get("user_id") == user_id)),
             None,
         )
         if not mm:
             return _json_error(404, "membership no encontrada para ese user_id")
-        membership_id = mm["id"]
+        membership_id = (mm.get("id") or "").strip()
 
-    if not membership_id and not user_id:
+    if not membership_id:
         return _json_error(400, "membership_id o user_id requerido")
 
-    # No permitir dejar a la organización sin admins
+    # Verificar que el membership_id pertenece a esta org
+    mm_by_id = next((m for m in memberships if (m.get("id") or "").strip() == membership_id), None)
+    if not mm_by_id:
+        return _json_error(404, "membership no encontrada para ese membership_id")
+
+    # Evitar dejar la org sin admins al degradar
     if role == "member":
-        is_last, _ = _is_last_admin(org_id, membership_id, user_id)
+        is_last, _ = _is_last_admin(org_id, membership_id, None)
         if is_last:
             return _json_error(400, "no puedes degradar al último admin")
 
-    # Clerk: usar endpoint correcto
+    # Idempotencia: ya tiene ese rol
+    current_role = ROLE_FROM_CLERK.get(mm_by_id.get("role", ""), "member")
+    if current_role == role:
+        return jsonify({"ok": True, "unchanged": True})
+
+    # ✅ Endpoint correcto en Clerk
     body = {"role": ROLE_TO_CLERK.get(role, "basic_member")}
-    if membership_id:
-        r = _clerk("PATCH", f"/organization_memberships/{membership_id}", json=body)
-    else:
-        # fallback por user_id
-        r = _clerk("PATCH", f"/organizations/{org_id}/memberships/{user_id}", json=body)
+    r = _clerk("PATCH", f"/organization_memberships/{membership_id}", json=body)
 
     if r.ok:
         return jsonify({"ok": True})
@@ -457,9 +472,13 @@ def remove_member():
     except ValueError as e:
         return _json_error(400, str(e))
 
+    # 🔐 Solo admins pueden eliminar miembros
+    if _current_user_role_from_membership(org_id) != "admin":
+        return _json_error(403, "forbidden: admin requerido")
+
     payload = request.get_json(silent=True) or {}
-    membership_id = payload.get("membership_id")
-    user_id = payload.get("user_id")
+    membership_id = (payload.get("membership_id") or "").strip()
+    user_id = (payload.get("user_id") or "").strip()
 
     ok, memberships, code, detail = _fetch_memberships(org_id)
     if not ok:
@@ -479,17 +498,17 @@ def remove_member():
         )
         if not mm:
             return _json_error(404, "membership no encontrada para ese user_id")
-        membership_id = mm["id"]
+        membership_id = (mm.get("id") or "").strip()
 
     if not membership_id and not user_id:
         return _json_error(400, "membership_id o user_id requerido")
 
     # No permitir dejar la org sin admins
-    is_last, _ = _is_last_admin(org_id, membership_id, user_id)
+    is_last, _ = _is_last_admin(org_id, membership_id, user_id or None)
     if is_last:
         return _json_error(400, "no puedes eliminar al último admin")
 
-    # Clerk: usar endpoint correcto
+    # ✅ Endpoint correcto
     if membership_id:
         r = _clerk("DELETE", f"/organization_memberships/{membership_id}")
     else:
