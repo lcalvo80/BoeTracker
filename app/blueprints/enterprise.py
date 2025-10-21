@@ -9,9 +9,16 @@ from app.auth import require_auth, require_org_admin
 
 bp = Blueprint("enterprise", __name__)
 
-# Mapeos robustos de roles
-CLERK_ROLE_TO_API = {"admin": "admin", "member": "basic_member", "basic_member": "basic_member"}
-CLERK_ROLE_FROM_API = {"admin": "admin", "basic_member": "member"}
+# ───────────────── Mapeos de roles ─────────────────
+CLERK_ROLE_TO_API = {
+    "admin": "admin",
+    "member": "basic_member",
+    "basic_member": "basic_member",
+}
+CLERK_ROLE_FROM_API = {
+    "admin": "admin",
+    "basic_member": "member",
+}
 
 
 @bp.before_request
@@ -58,7 +65,7 @@ def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
     return None
 
 def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
-    # Clerk puede devolver: user_id, public_user_data y/o user expandido
+    """Normaliza un membership de Clerk con varias formas de respuesta (public_user_data / expand=user)."""
     pud = (m.get("public_user_data") or {})
     user = (m.get("user") or {})
     uid = m.get("user_id") or pud.get("user_id") or user.get("id")
@@ -80,16 +87,50 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
+    """Búsqueda rápida de membership_id en la org (usando include_public_user_data)."""
     res = _req("GET", f"/organizations/{org_id}/memberships?limit=100&include_public_user_data=true")
     for m in res.get("data", []):
         if (m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")) == user_id:
             return m.get("id")
     return None
 
+def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Devuelve el membership del usuario en la org.
+    Estrategia:
+      1) Lista de memberships de la org (incluyendo public_user_data) → match por user_id
+      2) Fallback: /users/{id}?expand=organization_memberships → hidrata membership con expand=user
+    """
+    # Intento 1: por la org
+    try:
+        res = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
+        for m in res.get("data", []):
+            uid = m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")
+            if uid == user_id:
+                return m
+    except Exception:
+        pass
+
+    # Intento 2: por el usuario
+    try:
+        u = _req("GET", f"/users/{user_id}?expand=organization_memberships")
+        for mem in (u.get("organization_memberships") or []):
+            if mem.get("organization_id") == org_id or mem.get("organization") == org_id:
+                mid = mem.get("id")
+                if mid:
+                    try:
+                        return _req("GET", f"/organizations/{org_id}/memberships/{mid}?expand=user&include_public_user_data=true")
+                    except Exception:
+                        return mem
+                return mem
+    except Exception:
+        pass
+
+    return None
+
 def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None:
     """
-    Para los items sin email o user_id, intentamos hidratar con expand=user.
-    En caso extremo, leemos /users/{id}.
+    Para los items sin email o user_id, intenta hidratar con expand=user y, último recurso, /users/{id}.
     """
     for it in items:
         if it.get("email") and it.get("user_id"):
@@ -107,7 +148,7 @@ def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None
                 u = _req("GET", f"/users/{it['user_id']}?expand=email_addresses")
                 it["email"] = _extract_email_from_user(u or {}) or it.get("email")
         except Exception:
-            # no rompemos la lista si Clerk falla puntualmente
+            # no romper si Clerk falla puntualmente
             pass
 
 def _json_ok(payload: Any, code: int = 200):
@@ -127,11 +168,14 @@ def get_org_info():
 
     try:
         org = _req("GET", f"/organizations/{g.org_id}")
+
+        # Rol por defecto desde el token (puede ser None si hay placeholders)
         current_role = g.org_role
+
+        # Intento robusto de determinar el rol real del usuario en la org
         try:
-            mid = _find_membership_id(g.org_id, g.user_id)
-            if mid:
-                mem = _req("GET", f"/organizations/{g.org_id}/memberships/{mid}")
+            mem = _find_membership(g.org_id, g.user_id)
+            if mem and mem.get("role"):
                 current_role = CLERK_ROLE_FROM_API.get(mem.get("role"), current_role or "member")
         except Exception:
             pass
@@ -142,7 +186,7 @@ def get_org_info():
             "name": org.get("name"),
             "slug": org.get("slug"),
             "seats": seats,
-            "current_user_role": current_role,
+            "current_user_role": current_role,  # ← ya no debería quedar en None si existes en la org
         }
         return _json_ok(out)
     except Exception as e:
