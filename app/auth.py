@@ -1,295 +1,152 @@
-# app/auth.py
 from __future__ import annotations
 
-import os
 import time
-import threading
 from functools import wraps
-from typing import Any, Dict, Optional
+from typing import Callable, Dict, Any, Optional
 
+import jwt
+from jwt import PyJWKClient
 import requests
-from flask import request, g, abort, current_app, has_app_context
-from jose import jwt
-from jose.exceptions import ExpiredSignatureError, JWTClaimsError
+from flask import Blueprint, current_app, request, jsonify, g
+
+# ───────────────── Utilidades JWT Clerk ─────────────────
+
+_jwk_client_cache: Dict[str, PyJWKClient] = {}
 
 
-# ───────────────── helpers de config ─────────────────
-def _cfg(key: str, default: Optional[str] = None) -> str:
-    if has_app_context():
-        try:
-            val = current_app.config.get(key)
-            if val is not None:
-                return str(val)
-        except Exception:
-            pass
-    return str(os.getenv(key, default if default is not None else ""))
-
-
-def _truthy(v: Any) -> bool:
-    return str(v).lower() in ("1", "true", "yes", "on")
-
-
-# ───────────────── caché JWKS ─────────────────
-class _JWKSCache:
-    def __init__(self) -> None:
-        self._store: Dict[str, Dict[str, Any]] = {}
-        self._at: Dict[str, int] = {}
-        self._lock = threading.Lock()
-
-    def get(self, url: str, ttl: int = 3600) -> Dict[str, Any]:
-        now = int(time.time())
-        with self._lock:
-            jwks = self._store.get(url)
-            at = self._at.get(url, 0)
-            if jwks and (now - at) < ttl:
-                return jwks
-        data = self._fetch(url)
-        with self._lock:
-            self._store[url] = data
-            self._at[url] = now
-        return data
-
-    def refresh(self, url: str) -> Dict[str, Any]:
-        data = self._fetch(url)
-        with self._lock:
-            self._store[url] = data
-            self._at[url] = int(time.time())
-        return data
-
-    @staticmethod
-    def _fetch(url: str) -> Dict[str, Any]:
-        timeout = float(_cfg("CLERK_JWKS_TIMEOUT", "5") or "5")
-        res = requests.get(url, timeout=timeout)
-        res.raise_for_status()
-        data = res.json()
-        if not isinstance(data, dict) or "keys" not in data:
-            raise ValueError("JWKS payload missing 'keys'")
-        return data
-
-
-_JWKS = _JWKSCache()
-
-
-# ───────────────── utilidades JWT ─────────────────
 def _get_bearer_token() -> Optional[str]:
     auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        t = auth.split(" ", 1)[1].strip()
-        return t or None
-    return None
+    if not auth.lower().startswith("bearer "):
+        return None
+    return auth.split(" ", 1)[1].strip() or None
 
 
-def _pick_key_for_kid(jwks: Dict[str, Any], kid: str) -> Optional[Dict[str, Any]]:
-    for k in jwks.get("keys", []):
-        if k.get("kid") == kid:
-            return k
-    return None
+def _get_jwk_client(jwks_url: str) -> PyJWKClient:
+    client = _jwk_client_cache.get(jwks_url)
+    if client is None:
+        client = PyJWKClient(jwks_url)
+        _jwk_client_cache[jwks_url] = client
+    return client
 
 
-def _decode_token(
-    token: str,
-    key: Dict[str, Any],
-    leeway: int,
-    audience: Optional[str],
-    issuer: Optional[str],
-    alg: Optional[str],
-) -> Dict[str, Any]:
-    options = {
-        "verify_aud": bool(audience),
-        "verify_iat": True,
-        "verify_exp": True,
-        "verify_nbf": True,
-        "verify_iss": bool(issuer),
-    }
-    kwargs: Dict[str, Any] = {
-        "key": key,
-        "algorithms": [alg] if alg else ["RS256", "RS512", "ES256", "ES512"],
-        "options": options,
-    }
-    if audience:
-        kwargs["audience"] = audience
-    if issuer:
-        kwargs["issuer"] = issuer
+def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
+    jwks_url = current_app.config.get("CLERK_JWKS_URL", "")
+    issuer = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
+    options = {"verify_aud": False}  # normalmente no necesitamos 'aud' si usamos template backend
+    if not jwks_url:
+        # Modo permisivo si no hay JWKS (solo DEBUG). No recomendado en prod.
+        if current_app.config.get("DEBUG"):
+            return jwt.decode(token, options={"verify_signature": False})
+        raise RuntimeError("CLERK_JWKS_URL no configurado")
 
-    try:
-        return jwt.decode(token, leeway=leeway, **kwargs)
-    except TypeError:
-        return jwt.decode(token, **kwargs)
-
-
-def _bypass_enabled() -> bool:
-    return _truthy(_cfg("DISABLE_AUTH", "0"))
-
-
-# ───────────────── helpers de claims ─────────────────
-def _merge_inner_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
-    if isinstance(claims, dict) and isinstance(claims.get("claims"), dict):
-        merged = dict(claims)
-        inner = dict(claims["claims"])
-        for k, v in inner.items():
-            if k not in merged:
-                merged[k] = v
-        return merged
+    signing_key = _get_jwk_client(jwks_url).get_signing_key_from_jwt(token).key
+    claims = jwt.decode(
+        token,
+        key=signing_key,
+        algorithms=["RS256"],
+        options=options,
+        issuer=issuer if issuer else None,
+    )
     return claims
 
 
-def _extract_org_id(claims: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(claims, dict):
-        return None
-    for k in ("org_id", "organization_id"):
-        v = claims.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    for k in ("o", "org", "organization"):
-        o = claims.get(k)
-        if isinstance(o, dict):
-            vid = o.get("id")
-            if isinstance(vid, str) and vid.strip():
-                return vid.strip()
-    for k in ("orgs", "organizations"):
-        arr = claims.get(k)
-        if isinstance(arr, list):
-            for it in arr:
-                if isinstance(it, dict):
-                    vid = it.get("id")
-                    if isinstance(vid, str) and vid.strip():
-                        return vid.strip()
-    return None
+def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
+    """Rellena g.<...> con info útil para el backend."""
+    g.clerk_claims = claims or {}
+
+    # Campos típicos (depende del template de JWT)
+    g.user_id = claims.get("sub") or claims.get("user_id")
+    g.email = claims.get("email") or claims.get("user", {}).get("email_address")
+    g.name = (
+        claims.get("name")
+        or (claims.get("user", {}) or {}).get("full_name")
+        or ""
+    )
+
+    # Organización: priorizamos header X-Org-Id (frontend decide el scope)
+    org_from_hdr = request.headers.get("X-Org-Id") or request.headers.get("x-org-id")
+    claim_org_id = (
+        claims.get("org_id")
+        or claims.get("organization", {}).get("id")
+        or claims.get("organization_id")
+    )
+    claim_org_role = (
+        claims.get("org_role")
+        or claims.get("organization_membership", {}).get("role")
+        or claims.get("organization_role")
+    )
+
+    g.org_id = org_from_hdr or claim_org_id
+    # Normalizamos role → 'admin' | 'member'
+    raw_role = (claim_org_role or "").strip().lower()
+    if raw_role in {"admin"}:
+        g.org_role = "admin"
+    elif raw_role in {"basic_member", "member"}:
+        g.org_role = "member"
+    else:
+        g.org_role = None
 
 
-def _extract_org_role(claims: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(claims, dict):
-        return None
-    for k in ("org_role", "organization_role"):
-        v = claims.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    om = claims.get("organization_membership")
-    if isinstance(om, dict):
-        r = om.get("role")
-        if isinstance(r, str) and r.strip():
-            return r.strip()
-    for k in ("organization", "org"):
-        obj = claims.get(k)
-        if isinstance(obj, dict):
-            mem = obj.get("membership") or {}
-            r = mem.get("role")
-            if isinstance(r, str) and r.strip():
-                return r.strip()
-    return None
-
-
-def _normalize_org_role(v: Optional[str]) -> Optional[str]:
-    if v is None:
-        return None
-    r = str(v).strip().lower()
-    if not r:
-        return None
-    if r in ("org:admin", "owner", "organization_admin"):
-        return "admin"
-    if r in ("basic_member", "member", "org:member"):
-        return "member"
-    return "admin" if r == "admin" else "member"
-
-
-# ───────────────── decorador ─────────────────
-def require_clerk_auth(fn):
+def require_auth(fn: Callable) -> Callable:
     @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if _bypass_enabled():
-            g.clerk = {
-                "user_id": "dev_user",
-                "org_id": None,
-                "org_role": None,
-                "email": "dev@example.com",
-                "name": "Dev User",
-                "raw_claims": None,
-            }
-            return fn(*args, **kwargs)
-
+    def _wrap(*args, **kwargs):
         token = _get_bearer_token()
         if not token:
-            abort(401, "Missing bearer token")
-
-        jwks_url = _cfg("CLERK_JWKS_URL", "")
-        if not jwks_url:
-            abort(500, "CLERK_JWKS_URL not configured")
-
+            return jsonify({"ok": False, "error": "Missing Bearer token"}), 401
         try:
-            leeway = int(_cfg("CLERK_LEEWAY", "30") or "30")
-        except Exception:
-            leeway = 30
-        audience = _cfg("CLERK_AUDIENCE", "") or None
-        issuer = _cfg("CLERK_ISSUER", "") or None
-        try:
-            ttl = int(_cfg("CLERK_JWKS_TTL", "3600") or "3600")
-        except Exception:
-            ttl = 3600
-
-        try:
-            headers = jwt.get_unverified_header(token)
+            claims = decode_and_verify_clerk_jwt(token)
         except Exception as e:
-            abort(401, f"Invalid token header: {e}")
+            if current_app.config.get("DEBUG"):
+                # En DEBUG devolvemos info de error explícita
+                return jsonify({"ok": False, "error": f"Invalid token: {e}"}), 401
+            return jsonify({"ok": False, "error": "Invalid token"}), 401
 
-        kid = headers.get("kid")
-        alg = headers.get("alg", "RS256")
-        if not kid:
-            abort(401, "Missing kid header")
-
-        try:
-            jwks = _JWKS.get(jwks_url, ttl=ttl)
-            key = _pick_key_for_kid(jwks, kid) or _pick_key_for_kid(_JWKS.refresh(jwks_url), kid)
-            if key is None:
-                abort(401, "Unknown token kid")
-        except Exception as e:
-            abort(503, f"JWKS fetch error: {e}")
-
-        try:
-            claims = _decode_token(token, key, leeway, audience, issuer, alg)
-        except ExpiredSignatureError:
-            abort(401, "Token expired")
-        except JWTClaimsError as e:
-            abort(401, f"Invalid claims: {e}")
-        except Exception as e:
-            abort(401, f"Invalid token: {e}")
-
-        claims = _merge_inner_claims(claims)
-
-        user_id = claims.get("sub") or claims.get("user_id")
-        org_id = _extract_org_id(claims)
-        org_role = _normalize_org_role(_extract_org_role(claims))
-
-        email = (
-            claims.get("email")
-            or claims.get("primary_email_address")
-            or (claims.get("email_addresses") or [{}])[0].get("email_address")
-        )
-        name = (
-            claims.get("name")
-            or claims.get("full_name")
-            or " ".join([claims.get("first_name") or "", claims.get("last_name") or ""]).strip()
-        )
-
-        if not user_id:
-            abort(401, "Missing user id in token")
-
-        if isinstance(org_id, str):
-            s = org_id.strip()
-            if not s or s.startswith("{{") or not s.startswith("org_"):
-                org_id = None
-
-        if not org_id:
-            xhdr = (request.headers.get("X-Org-Id") or "").strip()
-            if xhdr.startswith("org_"):
-                org_id = xhdr
-
-        g.clerk = {
-            "user_id": user_id,
-            "org_id": org_id,
-            "org_role": org_role,  # admin | member
-            "email": email,
-            "name": name,
-            "raw_claims": claims if _truthy(_cfg("EXPOSE_CLAIMS_DEBUG", "0")) else None,
-        }
+        _normalize_g_from_claims(claims)
+        if not g.user_id:
+            return jsonify({"ok": False, "error": "Invalid claims"}), 401
         return fn(*args, **kwargs)
-    return wrapper
+
+    return _wrap
+
+
+def require_org_admin(fn: Callable) -> Callable:
+    @wraps(fn)
+    def _wrap(*args, **kwargs):
+        if not getattr(g, "org_id", None):
+            return jsonify({"ok": False, "error": "Missing X-Org-Id or org in token"}), 400
+        if getattr(g, "org_role", None) != "admin":
+            return jsonify({"ok": False, "error": "Admin role required"}), 403
+        return fn(*args, **kwargs)
+
+    return _wrap
+
+
+# ───────────────── Blueprint de INT/DEBUG ─────────────────
+
+int_bp = Blueprint("int", __name__)
+
+
+@int_bp.before_request
+def _allow_options():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+
+@int_bp.route("/claims", methods=["GET", "OPTIONS"])
+@require_auth
+def debug_claims():
+    """Centralizado en /api/_int/claims; sólo registrado en DEBUG desde create_app()."""
+    return jsonify(
+        {
+            "ok": True,
+            "auth_header_present": bool(_get_bearer_token()),
+            "g": {
+                "user_id": getattr(g, "user_id", None),
+                "email": getattr(g, "email", None),
+                "name": getattr(g, "name", None),
+                "org_id": getattr(g, "org_id", None),
+                "org_role": getattr(g, "org_role", None),
+            },
+            "claims": getattr(g, "clerk_claims", {}),
+        }
+    )
