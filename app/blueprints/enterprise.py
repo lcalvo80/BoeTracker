@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
 import requests
-from flask import Blueprint, current_app, request, jsonify, g
+from flask import Blueprint, current_app, request, g
 
 from app.auth import require_auth, require_org_admin
 
@@ -20,15 +20,12 @@ CLERK_ROLE_FROM_API = {
     "basic_member": "member",
 }
 
-
 @bp.before_request
 def _allow_options():
     if request.method == "OPTIONS":
         return ("", 204)
 
-
 # ───────────────── Clerk helpers ─────────────────
-
 def _clerk_headers() -> Dict[str, str]:
     key = current_app.config.get("CLERK_SECRET_KEY", "")
     if not key:
@@ -48,17 +45,14 @@ def _req(method: str, path: str, **kwargs) -> Any:
 def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
     if not user:
         return None
-    # 1) campo directo
     if user.get("email_address"):
         return user.get("email_address")
-    # 2) por primary_email_address_id
     primary_id = user.get("primary_email_address_id")
     emails = user.get("email_addresses") or []
     if primary_id:
         for ea in emails:
             if ea.get("id") == primary_id and ea.get("email_address"):
                 return ea["email_address"]
-    # 3) primer email disponible
     for ea in emails:
         if ea.get("email_address"):
             return ea["email_address"]
@@ -97,11 +91,9 @@ def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
 def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     """
     Devuelve el membership del usuario en la org.
-    Estrategia:
-      1) Lista de memberships de la org (incluyendo public_user_data) → match por user_id
-      2) Fallback: /users/{id}?expand=organization_memberships → hidrata membership con expand=user
+    1) Lista de memberships de la org (include_public_user_data) → match por user_id
+    2) Fallback: /users/{id}?expand=organization_memberships → hidrata membership con expand=user
     """
-    # Intento 1: por la org
     try:
         res = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
         for m in res.get("data", []):
@@ -111,7 +103,6 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # Intento 2: por el usuario
     try:
         u = _req("GET", f"/users/{user_id}?expand=organization_memberships")
         for mem in (u.get("organization_memberships") or []):
@@ -129,9 +120,7 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None:
-    """
-    Para los items sin email o user_id, intenta hidratar con expand=user y, último recurso, /users/{id}.
-    """
+    """Para los items sin email o user_id, intenta hidratar con expand=user y, último recurso, /users/{id}."""
     for it in items:
         if it.get("email") and it.get("user_id"):
             continue
@@ -139,16 +128,13 @@ def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None
         try:
             mem = _req("GET", f"/organizations/{org_id}/memberships/{mid}?expand=user&include_public_user_data=true")
             n = _normalize_member(mem or {})
-            # Sólo rellenar huecos
             for k in ("user_id", "email", "name"):
                 if not it.get(k) and n.get(k):
                     it[k] = n[k]
-            # Último intento: si hay user_id y sigue sin email, consulta /users/{id}
             if it.get("user_id") and not it.get("email"):
                 u = _req("GET", f"/users/{it['user_id']}?expand=email_addresses")
                 it["email"] = _extract_email_from_user(u or {}) or it.get("email")
         except Exception:
-            # no romper si Clerk falla puntualmente
             pass
 
 def _json_ok(payload: Any, code: int = 200):
@@ -157,9 +143,7 @@ def _json_ok(payload: Any, code: int = 200):
 def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
 
-
 # ───────────────── Endpoints ─────────────────
-
 @bp.route("/org", methods=["GET", "OPTIONS"])
 @require_auth
 def get_org_info():
@@ -172,7 +156,7 @@ def get_org_info():
         # Rol por defecto desde el token (puede ser None si hay placeholders)
         current_role = g.org_role
 
-        # Intento robusto de determinar el rol real del usuario en la org
+        # Rol real (robusto)
         try:
             mem = _find_membership(g.org_id, g.user_id)
             if mem and mem.get("role"):
@@ -180,18 +164,36 @@ def get_org_info():
         except Exception:
             pass
 
+        # Seats configurados en metadata
         seats = int((org.get("public_metadata") or {}).get("seats") or 0)
+
+        # Métricas de uso e invitaciones
+        used_seats = 0
+        pending_invites = 0
+        try:
+            mems = _req("GET", f"/organizations/{g.org_id}/memberships?limit=200&include_public_user_data=true")
+            used_seats = len(mems.get("data", []))
+        except Exception:
+            pass
+        try:
+            invs = _req("GET", f"/organizations/{g.org_id}/invitations?status=pending&limit=200")
+            arr = invs if isinstance(invs, list) else (invs.get("data") or [])
+            pending_invites = len(arr)
+        except Exception:
+            pass
+
         out = {
             "id": org.get("id"),
             "name": org.get("name"),
             "slug": org.get("slug"),
             "seats": seats,
-            "current_user_role": current_role,  # ← ya no debería quedar en None si existes en la org
+            "used_seats": used_seats,
+            "pending_invites": pending_invites,
+            "current_user_role": current_role,
         }
         return _json_ok(out)
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
-
 
 @bp.route("/users", methods=["GET", "OPTIONS"])
 @require_auth
@@ -199,18 +201,13 @@ def list_users():
     if not g.org_id:
         return _json_err("Missing org (X-Org-Id).", 400)
     try:
-        # Pedimos los datos públicos del usuario en la lista
         res = _req("GET", f"/organizations/{g.org_id}/memberships?limit=200&include_public_user_data=true")
         raw = res.get("data", [])
         items = [_normalize_member(m) for m in raw]
-
-        # Hidrata miembros "cojos" (sin email/user_id)
         _hydrate_members_if_needed(g.org_id, items)
-
         return _json_ok({"items": items, "total": len(items)})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
-
 
 @bp.route("/invite", methods=["POST", "OPTIONS"])
 @require_auth
@@ -247,7 +244,6 @@ def invite_user():
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
 
-
 @bp.route("/update-role", methods=["POST", "OPTIONS"])
 @require_auth
 @require_org_admin
@@ -271,7 +267,6 @@ def update_role():
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
 
-
 @bp.route("/remove", methods=["POST", "OPTIONS"])
 @require_auth
 @require_org_admin
@@ -290,7 +285,6 @@ def remove_user():
         return _json_ok({"removed": True, "membership_id": membership_id})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
-
 
 @bp.route("/set-seat-limit", methods=["POST", "OPTIONS"])
 @require_auth
