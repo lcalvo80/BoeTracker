@@ -1,25 +1,38 @@
 from __future__ import annotations
 
-import time
 from functools import wraps
 from typing import Callable, Dict, Any, Optional
 
 import jwt
 from jwt import PyJWKClient
-import requests
 from flask import Blueprint, current_app, request, jsonify, g
 
-# ───────────────── Utilidades JWT Clerk ─────────────────
+# ───────────────── Placeholders Clerk ─────────────────
+_PLACEHOLDER_STRINGS = {
+    "organization.id",
+    "organization_membership.role",
+    "organization.slug",
+    "user.id",
+    "user.email_address",
+    "user.primary_email_address",
+}
 
+def _is_placeholder(v: str) -> bool:
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    s_low = s.lower()
+    return (s_low.startswith("{{") and s_low.endswith("}}")) or (s_low in _PLACEHOLDER_STRINGS)
+
+
+# ───────────────── JWT / Clerk ─────────────────
 _jwk_client_cache: Dict[str, PyJWKClient] = {}
-
 
 def _get_bearer_token() -> Optional[str]:
     auth = request.headers.get("Authorization", "")
     if not auth.lower().startswith("bearer "):
         return None
     return auth.split(" ", 1)[1].strip() or None
-
 
 def _get_jwk_client(jwks_url: str) -> PyJWKClient:
     client = _jwk_client_cache.get(jwks_url)
@@ -28,14 +41,13 @@ def _get_jwk_client(jwks_url: str) -> PyJWKClient:
         _jwk_client_cache[jwks_url] = client
     return client
 
-
 def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     jwks_url = current_app.config.get("CLERK_JWKS_URL", "")
     issuer = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
-    options = {"verify_aud": False}  # normalmente no necesitamos 'aud' si usamos template backend
+    options = {"verify_aud": False}
     if not jwks_url:
-        # Modo permisivo si no hay JWKS (solo DEBUG). No recomendado en prod.
         if current_app.config.get("DEBUG"):
+            # Modo permisivo SOLO en debug
             return jwt.decode(token, options={"verify_signature": False})
         raise RuntimeError("CLERK_JWKS_URL no configurado")
 
@@ -49,36 +61,34 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     )
     return claims
 
-
 def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
-    """Rellena g.<...> con info útil para el backend."""
+    """Rellena g con info normalizada y segura."""
     g.clerk_claims = claims or {}
-
-    # Campos típicos (depende del template de JWT)
     g.user_id = claims.get("sub") or claims.get("user_id")
-    g.email = claims.get("email") or claims.get("user", {}).get("email_address")
+    g.email = claims.get("email") or (claims.get("user") or {}).get("email_address")
     g.name = (
         claims.get("name")
-        or (claims.get("user", {}) or {}).get("full_name")
+        or (claims.get("user") or {}).get("full_name")
         or ""
     )
 
-    # Organización: priorizamos header X-Org-Id (frontend decide el scope)
+    # Header tiene prioridad y evita placeholders
     org_from_hdr = request.headers.get("X-Org-Id") or request.headers.get("x-org-id")
+
     claim_org_id = (
         claims.get("org_id")
-        or claims.get("organization", {}).get("id")
+        or (claims.get("organization") or {}).get("id")
         or claims.get("organization_id")
     )
     claim_org_role = (
         claims.get("org_role")
-        or claims.get("organization_membership", {}).get("role")
+        or (claims.get("organization_membership") or {}).get("role")
         or claims.get("organization_role")
     )
 
-    g.org_id = org_from_hdr or claim_org_id
-    # Normalizamos role → 'admin' | 'member'
-    raw_role = (claim_org_role or "").strip().lower()
+    g.org_id = org_from_hdr or (None if _is_placeholder(str(claim_org_id)) else claim_org_id)
+
+    raw_role = ("" if _is_placeholder(str(claim_org_role)) else str(claim_org_role)).strip().lower()
     if raw_role in {"admin"}:
         g.org_role = "admin"
     elif raw_role in {"basic_member", "member"}:
@@ -97,7 +107,6 @@ def require_auth(fn: Callable) -> Callable:
             claims = decode_and_verify_clerk_jwt(token)
         except Exception as e:
             if current_app.config.get("DEBUG"):
-                # En DEBUG devolvemos info de error explícita
                 return jsonify({"ok": False, "error": f"Invalid token: {e}"}), 401
             return jsonify({"ok": False, "error": "Invalid token"}), 401
 
@@ -121,21 +130,17 @@ def require_org_admin(fn: Callable) -> Callable:
     return _wrap
 
 
-# ───────────────── Blueprint de INT/DEBUG ─────────────────
-
+# ───────────────── Blueprint INT (DEBUG) ─────────────────
 int_bp = Blueprint("int", __name__)
-
 
 @int_bp.before_request
 def _allow_options():
     if request.method == "OPTIONS":
         return ("", 204)
 
-
 @int_bp.route("/claims", methods=["GET", "OPTIONS"])
 @require_auth
 def debug_claims():
-    """Centralizado en /api/_int/claims; sólo registrado en DEBUG desde create_app()."""
     return jsonify(
         {
             "ok": True,

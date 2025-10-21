@@ -13,17 +13,21 @@ def create_app() -> Flask:
     app.config.update(
         DEBUG=os.getenv("FLASK_DEBUG", "0") == "1",
         JSON_SORT_KEYS=False,
+
+        # Frontend
         FRONTEND_ORIGIN=os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"),
         FRONTEND_BASE_URL=os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")),
+
         # Stripe
         STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
         STRIPE_PRICE_PRO=os.getenv("STRIPE_PRICE_PRO", ""),
         STRIPE_PRICE_ENTERPRISE=os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
         STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
+
         # Clerk
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
-        CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),   # ej: https://clerk.accounts.dev/.well-known/jwks.json
-        CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),       # opcional (validación iss)
+        CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),   # ej: https://<subdominio>.clerk.accounts.dev/.well-known/jwks.json
+        CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),       # ej: https://<subdominio>.clerk.accounts.dev
         CLERK_API_BASE=os.getenv("CLERK_API_BASE", "https://api.clerk.com/v1"),
     )
 
@@ -39,14 +43,14 @@ def create_app() -> Flask:
     # ───────────────── Blueprints ─────────────────
     from app.blueprints.billing import bp as billing_bp
     from app.blueprints.enterprise import bp as enterprise_bp
-    from app.auth import int_bp  # solo se registra en DEBUG
+    from app.auth import int_bp  # solo en DEBUG
 
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
     app.register_blueprint(enterprise_bp, url_prefix="/api/enterprise")
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")
 
-    # ───────────────── Health & Errores ─────────────────
+    # ───────────────── Salud y errores ─────────────────
     @app.route("/healthz")
     def healthz():
         return {"ok": True, "status": "healthy"}
@@ -64,7 +68,6 @@ def create_app() -> Flask:
         app.logger.exception("Unhandled error", exc_info=e)
         return jsonify({"ok": False, "error": "Internal server error"}), 500
 
-    # Log básico
     if not app.debug:
         logging.basicConfig(level=logging.INFO)
 
