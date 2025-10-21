@@ -40,6 +40,7 @@ def create_app(config: dict | None = None):
     "app/blueprints/enterprise.py",
     "app/blueprints/billing.py",
     "app/routes/billing.py",
+    "app/routes/enterprise.py",
   ]:
     p = Path(app.root_path).parent / rel
     app.logger.info(f"[init] exists {rel}? {'YES' if p.exists() else 'NO'} -> {p}")
@@ -91,7 +92,8 @@ def create_app(config: dict | None = None):
         app.register_blueprint(bp)
         app.logger.info(f"[init] Registrado BP '{bp.name}' de {root}.{module_name}")
         return True
-      except Exception:
+      except Exception as e:
+        app.logger.warning(f"[init] {root}.{module_name} falló: {e}")
         continue
     app.logger.warning(f"[init] No se pudo registrar {module_name}.{attr}")
     return False

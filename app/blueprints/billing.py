@@ -9,6 +9,8 @@ from flask import Blueprint, request, jsonify, current_app, g
 from app.services import clerk_svc
 from app.services.entitlements import sync_entitlements_for_org
 
+# Nota: dejamos el prefix en /api y ponemos /billing/... en cada ruta,
+# así el resultado final es /api/billing/... (coincide con el frontend)
 bp = Blueprint("billing", __name__, url_prefix="/api")
 
 
@@ -400,6 +402,7 @@ def summary_options():
 @bp.get("/billing/summary")
 @_require_auth
 def summary_get():
+    # Mantiene compatibilidad si alguien aún manda ?scope=
     return _summary_impl(scope=(request.args.get("scope") or "user").lower())
 
 
@@ -480,10 +483,10 @@ def invoices_get():
 
 @bp.route("/billing/org/invoices", methods=["OPTIONS"])
 def invoices_org_options():
-    return ("", 204"
+    # 🔧 FIX de sintaxis que te rompía el módulo
+    return ("", 204)
 
 
-)
 @bp.get("/billing/org/invoices")
 @_require_auth
 def invoices_get_org_alias():
@@ -588,7 +591,6 @@ def billing_sync():
             org_id = derived_org_id
             if not org_id or not _is_org_admin(user_id, org_id):
                 # Si el comprador aún es member, después lo promocionaremos (ver abajo)
-                # pero para leer Stripe necesitamos el customer de la org igualmente.
                 customer_id = _ensure_customer_for_org(org_id)
             else:
                 customer_id = _ensure_customer_for_org(org_id)
@@ -696,6 +698,7 @@ def checkout_pro():
 
 
 @bp.post("/billing/checkout/enterprise")
+@bp.post("/billing/org/checkout")  # ✅ alias opcional para compatibilidad
 @_require_auth
 def checkout_enterprise():
     _, err = _init_stripe()
