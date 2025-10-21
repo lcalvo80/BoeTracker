@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import stripe
 from flask import Blueprint, current_app, request, jsonify, g
@@ -44,14 +44,12 @@ def _get_or_create_customer(email: Optional[str], metadata: Dict[str, Any]) -> s
     return stripe.Customer.create(email=email or None, metadata=metadata or None)
 
 def _pm_from_customer(customer_id: str) -> Dict[str, Optional[str]]:
-    """Intenta obtener brand/last4 desde el default payment method o última factura."""
     try:
         cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
         pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
         if pm and pm.get("card"):
             card = pm["card"]
             return {"brand": card.get("brand"), "last4": card.get("last4")}
-        # fallback: última invoice
         invs = stripe.Invoice.list(customer=customer_id, limit=1).data
         if invs:
             inv = invs[0]
@@ -69,10 +67,20 @@ def _sub_summary(sub: Dict[str, Any]) -> Dict[str, Any]:
     cpe = sub.get("current_period_end")
     cust_id = sub.get("customer")
     pm = _pm_from_customer(cust_id) if cust_id else {"brand": None, "last4": None}
+    return {"status": status, "current_period_end": cpe, "payment_method": pm}
+
+def _invoice_dto(inv: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "status": status,
-        "current_period_end": cpe,
-        "payment_method": pm,
+        "id": inv.get("id"),
+        "number": inv.get("number"),
+        "status": inv.get("status"),
+        "total": inv.get("total"),
+        "currency": inv.get("currency"),
+        "created": inv.get("created"),
+        "hosted_invoice_url": inv.get("hosted_invoice_url"),
+        "invoice_pdf": inv.get("invoice_pdf"),
+        "subscription": inv.get("subscription"),
+        "customer": inv.get("customer"),
     }
 
 def _json_ok(payload: Any, code: int = 200):
@@ -87,12 +95,6 @@ def _json_err(msg: str, code: int = 400):
 @bp.route("/summary", methods=["GET", "OPTIONS"])
 @require_auth
 def billing_summary():
-    """
-    Resumen de estado:
-    - Si hay g.org_id → busca subs con metadata.org_id == g.org_id
-    - Si no hay g.org_id → subs activas del customer del usuario (Pro)
-    Retorna: { scope, plan, status, current_period_end, payment_method{brand,last4}, seats? }
-    """
     _stripe()
     try:
         if g.org_id:
@@ -151,16 +153,16 @@ def checkout_pro():
 @bp.route("/checkout/enterprise", methods=["POST", "OPTIONS"])
 @require_auth
 def checkout_enterprise():
-    """
-    Checkout Enterprise con seats como quantity; requiere g.org_id o X-Org-Id.
-    Permite override 'price' en el body si no hay STRIPE_PRICE_ENTERPRISE en env.
-    """
     if not g.org_id:
         return _json_err("Debes indicar organización (X-Org-Id o en el token).", 400)
 
     _stripe()
     body = request.get_json(silent=True) or {}
-    seats = max(1, int(body.get("seats") or 1))
+    try:
+        seats = max(1, int(body.get("seats") or 1))
+    except Exception:
+        return _json_err("'seats' debe ser número entero.", 400)
+
     price = body.get("price") or _cfg("STRIPE_PRICE_ENTERPRISE")
     if not price:
         return _json_err("Falta STRIPE_PRICE_ENTERPRISE", 500)
@@ -191,10 +193,6 @@ def checkout_enterprise():
 @bp.route("/portal", methods=["POST", "OPTIONS"])
 @require_auth
 def billing_portal():
-    """
-    Requiere tener configurado el Customer Portal en Stripe (modo test o live) con una
-    configuración por defecto.
-    """
     _stripe()
     try:
         customer = _get_or_create_customer(
@@ -209,11 +207,44 @@ def billing_portal():
         return _json_err(str(e), 500)
 
 
+@bp.route("/invoices", methods=["GET", "OPTIONS"])
+@require_auth
+def billing_invoices():
+    """
+    Lista facturas:
+      - Scope org (si hay X-Org-Id/g.org_id): busca subs por metadata.org_id y lista sus invoices.
+      - Scope user: lista por customer del usuario.
+    Query: ?limit=20 (opcional)
+    """
+    _stripe()
+    try:
+        limit = max(1, min(100, int(request.args.get("limit", "20"))))
+    except Exception:
+        limit = 20
+
+    try:
+        if g.org_id:
+            # Preferimos todas las subs (cualquier status) para mostrar histórico
+            subs = stripe.Subscription.search(query=f'metadata["org_id"]:"{g.org_id}"').data
+            if not subs:
+                return _json_ok({"scope": "org", "org_id": g.org_id, "items": []})
+            sub = subs[0]
+            invs = stripe.Invoice.list(subscription=sub.id, limit=limit).data
+            items = [_invoice_dto(i) for i in invs]
+            return _json_ok({"scope": "org", "org_id": g.org_id, "items": items})
+
+        # user scope
+        cust = _get_or_create_customer(g.email, {"clerk_user_id": g.user_id})
+        invs = stripe.Invoice.list(customer=cust.id, limit=limit).data
+        items = [_invoice_dto(i) for i in invs]
+        return _json_ok({"scope": "user", "items": items})
+
+    except Exception as e:
+        return _json_err(str(e), 500)
+
+
 @bp.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Webhook único de Stripe.
-    """
     _stripe()
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
@@ -229,7 +260,6 @@ def webhook():
     try:
         if etype == "checkout.session.completed":
             _sync_entitlements_from_checkout(data)
-
         elif etype in {
             "customer.subscription.created",
             "customer.subscription.updated",
@@ -238,7 +268,6 @@ def webhook():
             "invoice.payment_failed",
         }:
             _sync_entitlements_from_subscription(data)
-
     except Exception as e:
         current_app.logger.exception("Error processing webhook: %s", etype)
         return _json_ok({"handled": False, "error": str(e)})
