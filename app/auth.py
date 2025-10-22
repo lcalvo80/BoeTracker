@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from functools import wraps
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, List
 
 import jwt
 from jwt import PyJWKClient
 from flask import Blueprint, current_app, request, jsonify, g
 
-# ───────────────── Placeholders Clerk ─────────────────
+# ───────────────── Placeholders de Clerk (evitar falsos positivos) ─────────────────
 _PLACEHOLDER_STRINGS = {
     "organization.id",
     "organization_membership.role",
@@ -41,21 +41,32 @@ def _get_jwk_client(jwks_url: str) -> PyJWKClient:
         _jwk_client_cache[jwks_url] = client
     return client
 
+
+def _aud_list_from_env(v: Optional[str]) -> List[str]:
+    """
+    Convierte CLERK_AUDIENCE (p. ej. 'boe-backend' o 'a,b,c') en lista depurada.
+    """
+    if not v:
+        return []
+    return [x.strip() for x in str(v).split(",") if x and x.strip()]
+
+
 def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     """
     Verifica el JWT emitido por Clerk:
-      - Si CLERK_JWKS_URL no está, en DEBUG aceptamos token sin firma (para dev local).
-      - Si CLERK_AUDIENCE está configurado, se verifica aud; si no, se omite.
-      - Si CLERK_ISSUER está configurado, se verifica issuer.
-    """
-    jwks_url = current_app.config.get("CLERK_JWKS_URL", "")
-    issuer = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
-    audience = current_app.config.get("CLERK_AUDIENCE")  # opcional: str o coma-sep
 
-    verify_aud = bool(audience)
-    options = {
-        "verify_aud": verify_aud,
-    }
+    - Si CLERK_JWKS_URL NO está definido:
+        * En DEBUG: acepta token sin firma (solo para desarrollo local).
+        * En no-DEBUG: lanza error de configuración.
+    - Si CLERK_AUDIENCE está configurado (uno o varios, coma-sep), se verifica 'aud'.
+      Si NO está configurado, la verificación de audience se desactiva.
+    - Si CLERK_ISSUER está configurado, se verifica 'iss'.
+    - Se usa RS256 y un pequeño 'leeway' para tolerar leves desincronizaciones de reloj.
+    """
+    jwks_url = (current_app.config.get("CLERK_JWKS_URL") or "").strip()
+    issuer   = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
+    audience_env = current_app.config.get("CLERK_AUDIENCE")
+    audiences = _aud_list_from_env(audience_env)
 
     if not jwks_url:
         if current_app.config.get("DEBUG"):
@@ -63,26 +74,41 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
             return jwt.decode(token, options={"verify_signature": False})
         raise RuntimeError("CLERK_JWKS_URL no configurado")
 
+    # Clave de firma (cacheada por PyJWKClient)
     signing_key = _get_jwk_client(jwks_url).get_signing_key_from_jwt(token).key
+
+    # Verificaciones
+    options = {
+        # Solo verificamos 'aud' si hay uno o más audiences definidos:
+        "verify_aud": bool(audiences),
+    }
 
     kwargs: Dict[str, Any] = {
         "key": signing_key,
         "algorithms": ["RS256"],
         "options": options,
+        # tolerancia leve por posibles desajustes de reloj (segundos)
+        "leeway": 10,
     }
     if issuer:
         kwargs["issuer"] = issuer
-    if verify_aud:
-        # soporta múltiples audiences separadas por coma
-        aud_list = [a.strip() for a in str(audience).split(",") if a.strip()]
-        kwargs["audience"] = aud_list if len(aud_list) > 1 else aud_list[0]
+    if audiences:
+        kwargs["audience"] = audiences if len(audiences) > 1 else audiences[0]
 
+    # PyJWT valida por defecto exp/nbf/iat
     claims = jwt.decode(token, **kwargs)
     return claims
 
+
 def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
-    """Rellena g con info normalizada y segura."""
+    """
+    Rellena flask.g con info normalizada y segura a partir de los claims.
+    - Soporta plantillas de Clerk con claims planos o anidados.
+    - X-Org-Id en cabecera prevalece sobre el token.
+    - Filtra placeholders de Clerk ({{ ... }}).
+    """
     g.clerk_claims = claims or {}
+
     g.user_id = claims.get("sub") or claims.get("user_id")
     g.email = claims.get("email") or (claims.get("user") or {}).get("email_address")
     g.name = (
@@ -91,12 +117,11 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
         or ""
     )
 
-    # Header tiene prioridad y evita placeholders
+    # Header tiene prioridad (útil cuando el token no incluye org)
     org_from_hdr = request.headers.get("X-Org-Id") or request.headers.get("x-org-id")
 
     claim_org_id = (
         claims.get("org_id")
-        # algunos templates lo ponen anidado:
         or (claims.get("organization") or {}).get("id")
         or claims.get("organization_id")
     )
@@ -109,7 +134,7 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
     g.org_id = org_from_hdr or (None if _is_placeholder(str(claim_org_id)) else claim_org_id)
 
     raw_role = ("" if _is_placeholder(str(claim_org_role)) else str(claim_org_role)).strip().lower()
-    # Aceptamos equivalentes comunes
+    # equivalencias comunes de Clerk
     if raw_role in {"admin", "org:admin", "owner"}:
         g.org_role = "admin"
     elif raw_role in {"basic_member", "member", "org:member"}:
@@ -136,14 +161,13 @@ def require_auth(fn: Callable) -> Callable:
         if not g.user_id:
             return jsonify({"ok": False, "error": "Invalid claims"}), 401
         return fn(*args, **kwargs)
-
     return _wrap
 
 
 def require_org(fn: Callable) -> Callable:
     """
     Exige contexto de organización (pero no rol admin).
-    Útil para endpoints tipo GET /enterprise/org o /enterprise/users.
+    Útil para endpoints como GET /enterprise/org o /enterprise/users.
     """
     @wraps(fn)
     def _wrap(*args, **kwargs):
@@ -161,11 +185,11 @@ def require_org_admin(fn: Callable) -> Callable:
         if getattr(g, "org_role", None) != "admin":
             return jsonify({"ok": False, "error": "Admin role required"}), 403
         return fn(*args, **kwargs)
-
     return _wrap
 
 
-# ───────────────── Blueprint INT (DEBUG) ─────────────────
+# ───────────────── Blueprint INT (solo DEBUG) ─────────────────
+# Se registra desde app/__init__.py en /api/_int si app.config["DEBUG"] es True.
 int_bp = Blueprint("int", __name__)
 
 @int_bp.before_request
@@ -176,6 +200,9 @@ def _allow_options():
 @int_bp.route("/claims", methods=["GET", "OPTIONS"])
 @require_auth
 def debug_claims():
+    """
+    Endpoint de diagnóstico (solo DEBUG). Devuelve los claims y la vista normalizada en g.
+    """
     return jsonify(
         {
             "ok": True,
