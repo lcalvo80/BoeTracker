@@ -340,7 +340,7 @@ def revoke_invitation():
 
     try:
         # Si llegan emails, mapear a ids desde pendientes
-        if emails && not ids:
+        if emails and not ids:
             res = _req("GET", f"/organizations/{g.org_id}/invitations?status=pending&limit=200")
             arr = res if isinstance(res, list) else (res.get("data") or [])
             email_to_id = {it.get("email_address"): it.get("id") for it in arr}
