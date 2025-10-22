@@ -11,16 +11,16 @@ from app.auth import require_auth, require_org_admin
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 
 # ───────────────── Roles (Clerk ↔ API) ─────────────────
-# → Cuando escribimos a Clerk
+# → Cuando escribimos a Clerk (invites / memberships)
 CLERK_ROLE_TO_API = {
-    "admin": "admin",
-    "owner": "admin",
-    "org:admin": "admin",
-    "member": "basic_member",
-    "org:member": "basic_member",
-    "basic_member": "basic_member",
+    "admin": "org:admin",
+    "owner": "org:admin",
+    "org:admin": "org:admin",
+    "member": "org:member",
+    "org:member": "org:member",
+    "basic_member": "org:member",  # compat hacia delante
 }
-# ← Cuando leemos de Clerk
+# ← Cuando leemos desde Clerk
 CLERK_ROLE_FROM_API = {
     "admin": "admin",
     "owner": "admin",
@@ -313,7 +313,10 @@ def list_invitations():
 @require_auth
 @require_org_admin
 def revoke_invitation():
-    """Revoca invitaciones por id (preferido) o por email(s)."""
+    """
+    Revoca invitaciones por id (preferido) o por email(s).
+    Usa Clerk: POST /organizations/{org}/invitations/{id}/revoke con requesting_user_id.
+    """
     data = request.get_json(silent=True) or {}
     ids = data.get("ids") or []
     emails = data.get("emails") or []
@@ -326,7 +329,7 @@ def revoke_invitation():
     errors: List[Dict[str, Any]] = []
 
     try:
-        # Si llegan emails, mapear a ids
+        # Si llegan emails, mapear a ids desde pendientes
         if emails and not ids:
             res = _req("GET", f"/organizations/{g.org_id}/invitations?status=pending&limit=200")
             arr = res if isinstance(res, list) else (res.get("data") or [])
@@ -338,7 +341,8 @@ def revoke_invitation():
 
         for inv_id in ids:
             try:
-                _req("DELETE", f"/organizations/{g.org_id}/invitations/{inv_id}")
+                _req("POST", f"/organizations/{g.org_id}/invitations/{inv_id}/revoke",
+                     json={"requesting_user_id": g.user_id})
                 revoked.append({"id": inv_id, "revoked": True})
             except Exception as ex:
                 errors.append({"id": inv_id, "error": str(ex)})
@@ -354,7 +358,13 @@ def revoke_invitation():
 @require_auth
 @require_org_admin
 def invite_user():
+    """
+    Invita N emails haciendo 1 llamada por email al endpoint simple:
+    POST /organizations/{org_id}/invitations
+    Body: { inviter_user_id, email_address, role (org:*), redirect_url, [expires_in_days] }
+    """
     data = request.get_json(silent=True) or {}
+
     emails = data.get("emails")
     if isinstance(emails, str):
         emails = [emails]
@@ -363,24 +373,26 @@ def invite_user():
         return _json_err("Debes indicar 'emails'.", 400)
 
     role_in = (data.get("role") or "member").strip().lower()
-    role_api = CLERK_ROLE_TO_API.get(role_in, "basic_member")
+    role_api = CLERK_ROLE_TO_API.get(role_in)
+    if role_api not in ("org:member", "org:admin"):
+        return _json_err("role debe ser 'admin' o 'member'.", 400)
 
     allow_overbook = bool(data.get("allow_overbook", False))
-
     redirect_url = data.get("redirect_url") or (
         current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
         + "/auth/callback"
     )
 
     expires_in_days = data.get("expires_in_days")
-    try:
-        expires_in_days = int(expires_in_days) if expires_in_days is not None else None
-        if expires_in_days is not None and not (1 <= expires_in_days <= 30):
-            return _json_err("'expires_in_days' debe estar entre 1 y 30.", 400)
-    except Exception:
-        return _json_err("'expires_in_days' debe ser entero.", 400)
+    if expires_in_days is not None:
+        try:
+            expires_in_days = int(expires_in_days)
+            if not (1 <= expires_in_days <= 30):
+                return _json_err("'expires_in_days' debe estar entre 1 y 30.", 400)
+        except Exception:
+            return _json_err("'expires_in_days' debe ser entero.", 400)
 
-    # Asientos disponibles
+    # Guard-rail de asientos (members + pending)
     try:
         org = _req("GET", f"/organizations/{g.org_id}")
         seats = int((org.get("public_metadata") or {}).get("seats") or 0)
@@ -394,24 +406,31 @@ def invite_user():
         return ({"ok": False, "error": "not_enough_seats",
                  "details": {"seats": seats, "used": used, "free": free, "needed": needed}}, 409)
 
-    payload = {
-        "email_addresses": emails,
-        "role": role_api,
-        "redirect_url": redirect_url,
-        "allow_duplicates": False,
-        "send_email": True,
-    }
-    if expires_in_days is not None:
-        payload["expires_in_days"] = expires_in_days
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
 
-    try:
-        res = _req("POST", f"/organizations/{g.org_id}/invitations", json=payload)
-        # Clerk devuelve array de resultados
-        arr = res if isinstance(res, list) else (res.get("data") or [])
-        out = [{"email": r.get("email_address"), "status": r.get("status"), "id": r.get("id")} for r in arr]
-        return _json_ok({"results": out})
-    except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+    for email in emails:
+        payload = {
+            "inviter_user_id": g.user_id,
+            "email_address": email,
+            "role": role_api,
+            "redirect_url": redirect_url,
+        }
+        if expires_in_days is not None:
+            payload["expires_in_days"] = expires_in_days
+
+        try:
+            r = _req("POST", f"/organizations/{g.org_id}/invitations", json=payload)
+            results.append({
+                "id": r.get("id"),
+                "email": r.get("email_address"),
+                "status": r.get("status"),
+            })
+        except Exception as e:
+            errors.append({"email": email, "error": str(e)})
+
+    code = 207 if errors and results else 200 if results else 502
+    return _json_ok({"results": results, "errors": errors}, code)
 
 
 @bp.route("/update-role", methods=["POST", "OPTIONS"])
@@ -422,8 +441,8 @@ def update_role():
     membership_id = data.get("membership_id")
     user_id = data.get("user_id")
     role = (data.get("role") or "").lower().strip()
-    role_api = CLERK_ROLE_TO_API.get(role)
-    if not role_api:
+    role_api = CLERK_ROLE_TO_API.get(role)  # -> org:admin/org:member
+    if role_api not in ("org:admin", "org:member"):
         return _json_err("role debe ser 'admin' o 'member'.", 400)
 
     if not membership_id and user_id:
@@ -432,11 +451,12 @@ def update_role():
         return _json_err("membership_id o user_id requeridos.", 400)
 
     # Guard-rail: no degradar al último admin
-    if role_api != "admin" and _is_last_admin(g.org_id, membership_id):
+    if role_api != "org:admin" and _is_last_admin(g.org_id, membership_id):
         return ({"ok": False, "error": "cannot_demote_last_admin"}, 409)
 
     try:
-        res = _req("PATCH", f"/organizations/{g.org_id}/memberships/{membership_id}", json={"role": role_api})
+        res = _req("PATCH", f"/organizations/{g.org_id}/memberships/{membership_id}",
+                   json={"role": role_api})
         return _json_ok(_normalize_member(res))
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
