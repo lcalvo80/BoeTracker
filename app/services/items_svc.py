@@ -2,6 +2,7 @@
 from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import base64, gzip, json
 
 from psycopg2 import sql
 from app.services.postgres import get_db
@@ -86,6 +87,59 @@ def _fts_available(conn) -> bool:
 def _ts_lang(conn) -> str:
     return "spanish"
 
+# ---------- inflate helpers (b64+gzip -> str/obj) ----------
+
+def _is_b64(s: str) -> bool:
+    try:
+        if not isinstance(s, str) or len(s) < 8:
+            return False
+        # fast base64 check
+        return all(c.isalnum() or c in "+/=" for c in s)
+    except Exception:
+        return False
+
+def _inflate_b64_gzip(s: str) -> Optional[str]:
+    try:
+        raw = base64.b64decode(s)
+        out = gzip.decompress(raw)
+        return out.decode("utf-8", "ignore")
+    except Exception:
+        return None
+
+def _inflate_any(value: Any) -> Any:
+    """
+    - Si es b64+gzip -> descomprime
+    - Si es JSON string -> parsea
+    - Si no, lo devuelve tal cual (texto plano o None)
+    """
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", "ignore")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        txt = value
+        if _is_b64(txt):
+            inflated = _inflate_b64_gzip(txt)
+            if inflated is not None:
+                txt = inflated
+
+        s = (txt or "").strip()
+        if not s:
+            return None
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return json.loads(s)
+            except Exception:
+                return s
+        return s
+    # cualquier otro tipo no lo consideramos “mostrable”
+    return None
+
 # ====================== Búsqueda / listado ======================
 
 def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,9 +187,6 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         has_titulo_resumen = _col_exists(conn, "items", "titulo_resumen")
         has_titulo_corto = _col_exists(conn, "items", "titulo_corto")
         has_titulo_completo = _col_exists(conn, "items", "titulo_completo")
-        has_created_at_date = _col_exists(conn, "items", "created_at_date")
-        has_created_at = _col_exists(conn, "items", "created_at")
-        has_control = _col_exists(conn, "items", "control")
         has_contenido = _col_exists(conn, "items", "contenido")
         has_resumen = _col_exists(conn, "items", "resumen")
         has_titulo = _col_exists(conn, "items", "titulo")
@@ -148,7 +199,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        date_expr = sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)")
+        date_expr = sql.SQL("DATE(i.created_at)") if _col_exists(conn, "items", "created_at") else sql.SQL("DATE(i.created_at_date)")
         if fecha_eq:
             where_sql_parts.append(sql.SQL("{} = %s").format(date_expr)); args.append(fecha_eq)
         else:
@@ -206,7 +257,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             where_sql_parts.append(sql.SQL("i.identificador ILIKE %s"))
             args.append(f"%{identificador}%")
 
-        if control_val and has_control:
+        if control_val and _col_exists(conn, "items", "control"):
             where_sql_parts.append(sql.SQL("i.control ILIKE %s"))
             args.append(f"%{control_val}%")
 
@@ -220,7 +271,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.titulo_resumen") if has_titulo_resumen else sql.SQL("NULL AS titulo_resumen"),
             sql.SQL("i.titulo_corto") if has_titulo_corto else sql.SQL("NULL AS titulo_corto"),
             sql.SQL("i.titulo_completo") if has_titulo_completo else sql.SQL("NULL AS titulo_completo"),
-            sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
+            sql.SQL("i.resumen") if _col_exists(conn, "items", "resumen") else sql.SQL("NULL AS resumen"),
             sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
                 else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
             sql.SQL("i.departamento_codigo"),
@@ -231,7 +282,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             ),
             sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
             sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
-            sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
+            sql.SQL("i.control") if _col_exists(conn, "items", "control") else sql.SQL("NULL AS control"),
         ]
         joins: List[sql.SQL] = []
 
@@ -291,6 +342,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
 
+    # En listado NO inflamos para ahorrar CPU/ancho de banda
     return {
         "items": data,
         "page": page,
@@ -367,11 +419,16 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         names = [desc.name for desc in cur.description]
         data = dict(zip(names, row))
 
+    # Campos esperados
     for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
               "contenido", "resumen", "impacto", "likes", "dislikes", "control",
               "departamento_codigo", "seccion_codigo", "epigrafe", "created_at",
               "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"):
         data.setdefault(k, None)
+
+    # Inflar resumen/impacto si vienen comprimidos o como JSON string
+    data["resumen"] = _inflate_any(data.get("resumen"))
+    data["impacto"] = _inflate_any(data.get("impacto"))
 
     return data
 
@@ -381,7 +438,7 @@ def get_item_resumen(identificador: str) -> Dict[str, Any]:
             return {"identificador": identificador, "resumen": None}
         cur.execute("SELECT resumen FROM items WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
-    return {"identificador": identificador, "resumen": row[0] if row else None}
+    return {"identificador": identificador, "resumen": _inflate_any(row[0]) if row else None}
 
 def get_item_impacto(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
@@ -389,11 +446,11 @@ def get_item_impacto(identificador: str) -> Dict[str, Any]:
             if _col_exists(conn, "items", "impacto"):
                 cur.execute("SELECT impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
                 row = cur.fetchone()
-                return {"identificador": identificador, "impacto": row[0] if row else None}
+                return {"identificador": identificador, "impacto": _inflate_any(row[0]) if row else None}
             return {"identificador": identificador, "impacto": None}
         cur.execute("SELECT informe_impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
-    return {"identificador": identificador, "impacto": row[0] if row else None}
+    return {"identificador": identificador, "impacto": _inflate_any(row[0]) if row else None}
 
 def like_item(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
