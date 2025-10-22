@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, List
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 from flask import Blueprint, current_app, request, g
@@ -186,6 +187,12 @@ def _json_err(msg: str, code: int = 400):
 def _frontend_base() -> str:
     return (current_app.config.get("FRONTEND_BASE_URL") or "http://localhost:3000").rstrip("/")
 
+def _append_query(url: str, extra: Dict[str, str]) -> str:
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query))
+    q.update({k: v for k, v in extra.items() if v is not None})
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
+
 
 # ─────────────── Utilidades de asientos / admins ───────────────
 def _org_usage(org_id: str) -> Dict[str, int]:
@@ -333,7 +340,7 @@ def revoke_invitation():
 
     try:
         # Si llegan emails, mapear a ids desde pendientes
-        if emails and not ids:
+        if emails && not ids:
             res = _req("GET", f"/organizations/{g.org_id}/invitations?status=pending&limit=200")
             arr = res if isinstance(res, list) else (res.get("data") or [])
             email_to_id = {it.get("email_address"): it.get("id") for it in arr}
@@ -382,12 +389,12 @@ def invite_user():
 
     allow_overbook = bool(data.get("allow_overbook", False))
 
-    # Redirect seguro según guía de Clerk (custom flow con ticket)
+    # Redirect seguro a /accept-invitation con org_id como query param
     frontend = _frontend_base()
-    redirect_url = data.get("redirect_url") or f"{frontend}/accept-invitation"
+    base_redirect = f"{frontend}/accept-invitation"
+    redirect_url = data.get("redirect_url") or _append_query(base_redirect, {"org_id": g.org_id})
     if not str(redirect_url).startswith(frontend):
-        # endurecemos para evitar /404 o redirecciones inválidas
-        redirect_url = f"{frontend}/accept-invitation"
+        redirect_url = _append_query(base_redirect, {"org_id": g.org_id})
 
     expires_in_days = data.get("expires_in_days")
     if expires_in_days is not None:
