@@ -31,6 +31,7 @@ CLERK_ROLE_FROM_API = {
     "org:member": "member",
 }
 
+
 def _normalize_role(v: Optional[str]) -> Optional[str]:
     if not v:
         return None
@@ -50,8 +51,10 @@ def _clerk_headers() -> Dict[str, str]:
         raise RuntimeError("Falta CLERK_SECRET_KEY")
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
+
 def _clerk_base() -> str:
     return (current_app.config.get("CLERK_API_BASE") or "https://api.clerk.com/v1").rstrip("/")
+
 
 def _req(method: str, path: str, **kwargs) -> Any:
     url = f"{_clerk_base()}{path}"
@@ -64,6 +67,7 @@ def _req(method: str, path: str, **kwargs) -> Any:
         return r.json()
     except Exception:
         return r.text
+
 
 def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
     if not user:
@@ -80,6 +84,7 @@ def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
         if ea.get("email_address"):
             return ea["email_address"]
     return None
+
 
 def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -107,6 +112,7 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
         "role": role,
     }
 
+
 def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
     """Devuelve membership_id a partir de org_id + user_id."""
     res = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
@@ -114,6 +120,7 @@ def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
         if (m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")) == user_id:
             return m.get("id")
     return None
+
 
 def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     """
@@ -144,6 +151,7 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
     return None
+
 
 def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None:
     """
@@ -181,11 +189,14 @@ def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None
 def _json_ok(payload: Any, code: int = 200):
     return ({"ok": True, "data": payload}, code)
 
+
 def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
 
+
 def _frontend_base() -> str:
     return (current_app.config.get("FRONTEND_BASE_URL") or "http://localhost:3000").rstrip("/")
+
 
 def _append_query(url: str, extra: Dict[str, str]) -> str:
     u = urlparse(url)
@@ -212,12 +223,14 @@ def _org_usage(org_id: str) -> Dict[str, int]:
         pass
     return {"members": members, "pending": pending, "used": members + pending}
 
+
 def _count_admins(org_id: str) -> int:
     try:
         res = _req("GET", f"/organizations/{org_id}/memberships?limit=200")
         return sum(1 for m in res.get("data", []) if _normalize_role(m.get("role")) == "admin")
     except Exception:
         return 0
+
 
 def _is_last_admin(org_id: str, membership_id: str) -> bool:
     try:
@@ -303,7 +316,10 @@ def list_invitations():
     status = (request.args.get("status") or "pending").strip().lower()
     q = "" if status in ("all", "*") else f"?status={status}"
     try:
-        res = _req("GET", f"/organizations/{g.org_id}/invitations{q}&limit=200" if q else f"/organizations/{g.org_id}/invitations?limit=200")
+        res = _req(
+            "GET",
+            f"/organizations/{g.org_id}/invitations{q}&limit=200" if q else f"/organizations/{g.org_id}/invitations?limit=200",
+        )
         arr = res if isinstance(res, list) else (res.get("data") or [])
         items = [{
             "id": it.get("id"),
@@ -351,8 +367,11 @@ def revoke_invitation():
 
         for inv_id in ids:
             try:
-                _req("POST", f"/organizations/{g.org_id}/invitations/{inv_id}/revoke",
-                     json={"requesting_user_id": g.user_id})
+                _req(
+                    "POST",
+                    f"/organizations/{g.org_id}/invitations/{inv_id}/revoke",
+                    json={"requesting_user_id": g.user_id},
+                )
                 revoked.append({"id": inv_id, "revoked": True})
             except Exception as ex:
                 errors.append({"id": inv_id, "error": str(ex)})
@@ -416,8 +435,11 @@ def invite_user():
     free = max(0, seats - used)
     needed = len(emails)
     if not allow_overbook and needed > free:
-        return ({"ok": False, "error": "not_enough_seats",
-                 "details": {"seats": seats, "used": used, "free": free, "needed": needed}}, 409)
+        return (
+            {"ok": False, "error": "not_enough_seats",
+             "details": {"seats": seats, "used": used, "free": free, "needed": needed}},
+            409,
+        )
 
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
@@ -468,8 +490,7 @@ def update_role():
         return ({"ok": False, "error": "cannot_demote_last_admin"}, 409)
 
     try:
-        res = _req("PATCH", f"/organizations/{g.org_id}/memberships/{membership_id}",
-                   json={"role": role_api})
+        res = _req("PATCH", f"/organizations/{g.org_id}/memberships/{membership_id}", json={"role": role_api})
         return _json_ok(_normalize_member(res))
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
