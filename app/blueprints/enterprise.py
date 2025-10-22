@@ -183,6 +183,9 @@ def _json_ok(payload: Any, code: int = 200):
 def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
 
+def _frontend_base() -> str:
+    return (current_app.config.get("FRONTEND_BASE_URL") or "http://localhost:3000").rstrip("/")
+
 
 # ─────────────── Utilidades de asientos / admins ───────────────
 def _org_usage(org_id: str) -> Dict[str, int]:
@@ -378,10 +381,13 @@ def invite_user():
         return _json_err("role debe ser 'admin' o 'member'.", 400)
 
     allow_overbook = bool(data.get("allow_overbook", False))
-    redirect_url = data.get("redirect_url") or (
-        current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
-        + "/auth/callback"
-    )
+
+    # Redirect seguro según guía de Clerk (custom flow con ticket)
+    frontend = _frontend_base()
+    redirect_url = data.get("redirect_url") or f"{frontend}/accept-invitation"
+    if not str(redirect_url).startswith(frontend):
+        # endurecemos para evitar /404 o redirecciones inválidas
+        redirect_url = f"{frontend}/accept-invitation"
 
     expires_in_days = data.get("expires_in_days")
     if expires_in_days is not None:
