@@ -81,7 +81,6 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
-    """Búsqueda rápida de membership_id en la org (usando include_public_user_data)."""
     res = _req("GET", f"/organizations/{org_id}/memberships?limit=100&include_public_user_data=true")
     for m in res.get("data", []):
         if (m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")) == user_id:
@@ -89,11 +88,7 @@ def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
     return None
 
 def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Devuelve el membership del usuario en la org.
-    1) Lista de memberships de la org (include_public_user_data) → match por user_id
-    2) Fallback: /users/{id}?expand=organization_memberships → hidrata membership con expand=user
-    """
+    """Devuelve el membership del usuario en la org."""
     try:
         res = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
         for m in res.get("data", []):
@@ -116,11 +111,9 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
                 return mem
     except Exception:
         pass
-
     return None
 
 def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None:
-    """Para los items sin email o user_id, intenta hidratar con expand=user y, último recurso, /users/{id}."""
     for it in items:
         if it.get("email") and it.get("user_id"):
             continue
@@ -142,6 +135,40 @@ def _json_ok(payload: Any, code: int = 200):
 
 def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
+
+# ─────────────── Utilidades de asientos / admins ───────────────
+def _org_usage(org_id: str) -> Dict[str, int]:
+    """Devuelve counts: members, pending_invites."""
+    members = 0
+    pending = 0
+    try:
+        mems = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
+        members = len(mems.get("data", []))
+    except Exception:
+        pass
+    try:
+        invs = _req("GET", f"/organizations/{org_id}/invitations?status=pending&limit=200")
+        arr = invs if isinstance(invs, list) else (invs.get("data") or [])
+        pending = len(arr)
+    except Exception:
+        pass
+    return {"members": members, "pending": pending, "used": members + pending}
+
+def _count_admins(org_id: str) -> int:
+    try:
+        res = _req("GET", f"/organizations/{org_id}/memberships?limit=200")
+        return sum(1 for m in res.get("data", []) if (m.get("role") == "admin"))
+    except Exception:
+        return 0
+
+def _is_last_admin(org_id: str, membership_id: str) -> bool:
+    try:
+        mem = _req("GET", f"/organizations/{org_id}/memberships/{membership_id}")
+        if mem.get("role") != "admin":
+            return False
+    except Exception:
+        return False
+    return _count_admins(org_id) <= 1
 
 # ───────────────── Endpoints ─────────────────
 @bp.route("/org", methods=["GET", "OPTIONS"])
@@ -167,29 +194,23 @@ def get_org_info():
         # Seats configurados en metadata
         seats = int((org.get("public_metadata") or {}).get("seats") or 0)
 
-        # Métricas de uso e invitaciones
-        used_seats = 0
-        pending_invites = 0
-        try:
-            mems = _req("GET", f"/organizations/{g.org_id}/memberships?limit=200&include_public_user_data=true")
-            used_seats = len(mems.get("data", []))
-        except Exception:
-            pass
-        try:
-            invs = _req("GET", f"/organizations/{g.org_id}/invitations?status=pending&limit=200")
-            arr = invs if isinstance(invs, list) else (invs.get("data") or [])
-            pending_invites = len(arr)
-        except Exception:
-            pass
+        # Métricas
+        usage = _org_usage(g.org_id)
+        used = usage["used"]
+        free = max(0, seats - used)
 
         out = {
             "id": org.get("id"),
             "name": org.get("name"),
             "slug": org.get("slug"),
             "seats": seats,
-            "used_seats": used_seats,
-            "pending_invites": pending_invites,
+            "used_seats": used,      # compat
+            "pending_invites": usage["pending"],
             "current_user_role": current_role,
+            # Nuevos (más claros)
+            "used": used,
+            "free_seats": free,
+            "free": free,
         }
         return _json_ok(out)
     except Exception as e:
@@ -217,17 +238,32 @@ def invite_user():
     emails = data.get("emails")
     if isinstance(emails, str):
         emails = [emails]
-    emails = [e for e in (emails or []) if e]
+    emails = [e.strip() for e in (emails or []) if e and isinstance(e, str)]
     if not emails:
         return _json_err("Debes indicar 'emails'.", 400)
 
     role_in = (data.get("role") or "member").strip().lower()
     role_api = CLERK_ROLE_TO_API.get(role_in, "basic_member")
 
+    allow_overbook = bool(data.get("allow_overbook", False))
+
     redirect_url = data.get("redirect_url") or (
         current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
         + "/auth/callback"
     )
+
+    # Asientos disponibles
+    try:
+        org = _req("GET", f"/organizations/{g.org_id}")
+        seats = int((org.get("public_metadata") or {}).get("seats") or 0)
+    except Exception:
+        seats = 0
+    usage = _org_usage(g.org_id)
+    used = usage["used"]
+    free = max(0, seats - used)
+    needed = len(emails)
+    if not allow_overbook and needed > free:
+        return ({"ok": False, "error": "not_enough_seats", "details": {"seats": seats, "used": used, "free": free, "needed": needed}}, 409)
 
     payload = {
         "email_addresses": emails,
@@ -261,6 +297,10 @@ def update_role():
     if not membership_id:
         return _json_err("membership_id o user_id requeridos.", 400)
 
+    # Guard rail: no degradar al último admin
+    if role_api != "admin" and _is_last_admin(g.org_id, membership_id):
+        return ({"ok": False, "error": "cannot_demote_last_admin"}, 409)
+
     try:
         res = _req("PATCH", f"/organizations/{g.org_id}/memberships/{membership_id}", json={"role": role_api})
         return _json_ok(_normalize_member(res))
@@ -279,6 +319,10 @@ def remove_user():
         membership_id = _find_membership_id(g.org_id, user_id)
     if not membership_id:
         return _json_err("membership_id o user_id requeridos.", 400)
+
+    # Guard rail: no eliminar al último admin
+    if _is_last_admin(g.org_id, membership_id):
+        return ({"ok": False, "error": "cannot_remove_last_admin"}, 409)
 
     try:
         _req("DELETE", f"/organizations/{g.org_id}/memberships/{membership_id}")

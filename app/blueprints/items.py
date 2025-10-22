@@ -1,24 +1,13 @@
-# app/routes/items.py
+# app/blueprints/items.py
+from __future__ import annotations
 from flask import Blueprint, jsonify, request, current_app, make_response
 from datetime import datetime
 
-from app.controllers.items_controller import (
-    get_filtered_items,
-    get_item_by_id,
-    get_item_resumen,
-    get_item_impacto,
-    like_item,
-    dislike_item,
-    list_departamentos,
-    list_secciones,
-    list_epigrafes,
-)
+from app.services import items_svc
 
-# Prefijo unificado: /api/items
-bp = Blueprint("items", __name__, url_prefix="/api/items")
+bp = Blueprint("items", __name__)
 
 # ===== Helpers =====
-
 def _safe_int(v, d, mi=1, ma=100):
     try:
         n = int(v)
@@ -58,38 +47,28 @@ def _dedupe_preserve_order(seq):
             out.append(x)
     return out
 
-# claves multi-valor
 MULTI_KEYS_PLURALS = {"departamentos", "secciones", "epigrafes", "tags", "ids"}
-
-# normalización de nombres
 NORMALIZE_KEYS = {
-    # multi
     "departamento": "departamentos", "departamentos": "departamentos",
     "seccion": "secciones", "secciones": "secciones",
     "epigrafe": "epigrafes", "epigrafes": "epigrafes",
     "tag": "tags", "tags": "tags",
     "id": "ids", "ids": "ids",
-    # FE alternativo (mapeos del front/service)
     "seccion_codigo": "secciones",
     "departamento_codigo": "departamentos",
-    # texto
     "q": "q", "query": "q", "search": "q", "q_adv": "q",
-    # fechas
     "fecha": "fecha",
     "fecha_desde": "fecha_desde", "desde": "fecha_desde", "from": "fecha_desde", "date_from": "fecha_desde",
     "fecha_hasta": "fecha_hasta", "hasta": "fecha_hasta", "to": "fecha_hasta", "date_to": "fecha_hasta",
     "useRange": "useRange",
-    # flags
     "has_resumen": "has_resumen",
     "has_impacto": "has_impacto",
     "has_comments": "has_comments",
     "favoritos": "favoritos",
     "destacado": "destacado",
-    # paginación/orden
     "page": "page", "limit": "limit",
     "sort_by": "sort_by", "sort_dir": "sort_dir",
 }
-
 ALLOWED_SORT_BY = {
     "created_at": "created_at",
     "fecha": "fecha",
@@ -100,79 +79,54 @@ ALLOWED_SORT_BY = {
 }
 ALLOWED_SORT_DIR = {"asc", "desc"}
 
-
 def _parse_query_args(args):
-    """
-    Parser robusto:
-    - Recorre args en orden con items(multi=True): k=a&k=b preserva el orden.
-    - Soporta k[]=a&k[]=b, k=a&k=b y k=a,b
-    - Para claves multi, agrega y deduplica preservando orden.
-    - Normaliza fechas, booleanos, paginación y ordenación.
-    - Acepta 'fecha' (exacta) y 'useRange' para convertir a [fecha_desde, fecha_hasta].
-    """
     data = {}
-
-    # 1) recolecta y agrega
     for raw_key, raw_val in args.items(multi=True):
         key = raw_key[:-2] if raw_key.endswith("[]") else raw_key
         norm = NORMALIZE_KEYS.get(key, key)
 
         if norm in MULTI_KEYS_PLURALS:
-            # split por comas para soportar k=a,b
             parts = [p.strip() for p in str(raw_val).split(",") if p.strip() != ""]
             prev = data.get(norm, [])
             data[norm] = prev + parts
         else:
             data[norm] = raw_val
 
-    # 2) dedupe para multi
     for m in list(MULTI_KEYS_PLURALS):
         if m in data:
             data[m] = _dedupe_preserve_order(data[m])
 
-    # 3) q string
     if "q" in data and data["q"] is not None:
         data["q"] = (str(data["q"]).strip() or None)
 
-    # 4) flags bool (incluye useRange)
     for flag in ("has_resumen", "has_impacto", "has_comments", "favoritos", "destacado", "useRange"):
         if flag in data:
             data[flag] = _safe_bool(data[flag])
 
-    # 5) fechas (ISO)
     fecha_exacta = _safe_date(data.get("fecha"))
     fecha_desde = _safe_date(data.get("fecha_desde"))
     fecha_hasta = _safe_date(data.get("fecha_hasta"))
 
-    use_range = _safe_bool(data.get("useRange"), False)  # default=False
+    use_range = _safe_bool(data.get("useRange"), False)
     if use_range is False and fecha_exacta:
-        # modo fecha exacta: fuerza desde=hasta=fecha y limpia claves
         data["fecha_desde"] = fecha_exacta
         data["fecha_hasta"] = fecha_exacta
         data.pop("fecha", None)
     else:
-        if fecha_desde:
-            data["fecha_desde"] = fecha_desde
-        else:
-            data.pop("fecha_desde", None)
-        if fecha_hasta:
-            data["fecha_hasta"] = fecha_hasta
-        else:
-            data.pop("fecha_hasta", None)
+        if fecha_desde: data["fecha_desde"] = fecha_desde
+        else:           data.pop("fecha_desde", None)
+        if fecha_hasta: data["fecha_hasta"] = fecha_hasta
+        else:           data.pop("fecha_hasta", None)
         data.pop("fecha", None)
 
-    # 6) paginación
     data["page"]  = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
     data["limit"] = _safe_int(data.get("limit", 12), 12, 1, 100)
 
-    # 7) ordenación
     raw_sort_by  = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
     raw_sort_dir = str(data.get("sort_dir", "desc") or "desc").strip().lower()
     data["sort_by"]  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
     data["sort_dir"] = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
-
     return data
-
 
 def _json_with_cache(payload, status=200, max_age=3600):
     resp = make_response(jsonify(payload), status)
@@ -180,18 +134,21 @@ def _json_with_cache(payload, status=200, max_age=3600):
         resp.headers["Cache-Control"] = f"public, max-age={max_age}"
     return resp
 
+@bp.before_request
+def _allow_options():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
 # ===== Rutas =====
 
 # Listado
 @bp.get("")
-def api_items():
+def list_items():
     try:
         parsed = _parse_query_args(request.args)
+        result = items_svc.search_items(parsed)
 
-        # Llamamos SIEMPRE al controller (para que los tests puedan monkeypatchear)
-        result = get_filtered_items(parsed)
-
-        # Asegura 'pages' si el controller no lo aporta
+        # Asegura 'pages' si el service no lo aportara (lo aporta)
         if isinstance(result, dict):
             total = result.get("total", 0) or 0
             limit = result.get("limit", parsed.get("limit", 12)) or 12
@@ -200,7 +157,6 @@ def api_items():
                 pages = (total + limit - 1) // limit
                 result["pages"] = pages
 
-        # Debug opcional
         if request.headers.get("X-Debug-Filters") == "1" and current_app.config.get("DEBUG_FILTERS_ENABLED", False):
             debug = {
                 "_debug": True,
@@ -208,7 +164,7 @@ def api_items():
                 "parsed_filters": parsed,
             }
             if isinstance(result, dict):
-                result = {**result, **debug}
+                result = {**result, **(debug)}
             else:
                 result = {"data": result, **debug}
 
@@ -233,71 +189,64 @@ def api_items():
             "sort_dir": sort_dir,
         }), 200
 
-
-# Detalle
+# Detalle y derivados
 @bp.get("/<identificador>")
-def api_item_by_id(identificador):
-    data = get_item_by_id(identificador)
+def get_item(identificador):
+    data = items_svc.get_item_by_id(identificador)
     if not data:
         return jsonify({"detail": "Not found"}), 404
     return jsonify(data), 200
 
 @bp.get("/<identificador>/resumen")
-def api_resumen(identificador):
-    return jsonify(get_item_resumen(identificador)), 200
+def get_resumen(identificador):
+    return jsonify(items_svc.get_item_resumen(identificador)), 200
 
 @bp.get("/<identificador>/impacto")
-def api_impacto(identificador):
-    return jsonify(get_item_impacto(identificador)), 200
+def get_impacto(identificador):
+    return jsonify(items_svc.get_item_impacto(identificador)), 200
 
 # Reacciones
 @bp.post("/<identificador>/like")
-def api_like(identificador):
-    return jsonify(like_item(identificador)), 200
+def like(identificador):
+    return jsonify(items_svc.like_item(identificador)), 200
 
 @bp.post("/<identificador>/dislike")
-def api_dislike(identificador):
-    return jsonify(dislike_item(identificador)), 200
+def dislike(identificador):
+    return jsonify(items_svc.dislike_item(identificador)), 200
 
 # Catálogos (cache)
 @bp.get("/departamentos")
-def api_departamentos():
+def departamentos():
     try:
-        data = list_departamentos()
+        data = items_svc.list_departamentos()
         return _json_with_cache(data, 200, max_age=3600)
     except Exception:
         current_app.logger.exception("departamentos failed")
         return _json_with_cache([], 200, max_age=60)
 
 @bp.get("/secciones")
-def api_secciones():
+def secciones():
     try:
-        data = list_secciones()
+        data = items_svc.list_secciones()
         return _json_with_cache(data, 200, max_age=3600)
     except Exception:
         current_app.logger.exception("secciones failed")
         return _json_with_cache([], 200, max_age=60)
 
 @bp.get("/epigrafes")
-def api_epigrafes():
+def epigrafes():
     try:
-        data = list_epigrafes()
+        data = items_svc.list_epigrafes()
         return _json_with_cache(data, 200, max_age=3600)
     except Exception:
         current_app.logger.exception("epigrafes failed")
         return _json_with_cache([], 200, max_age=60)
 
-# ===== Endpoint de eco/diagnóstico explícito (solo DEV) =====
+# Debug (solo si está habilitado)
 @bp.get("/_debug/echo")
-def api_items_echo():
-    """
-    /api/items/_debug/echo?departamentos=a&departamentos=b&secciones=I,II...
-    Devuelve cómo interpreta el backend los filtros.
-    Requiere DEBUG_FILTERS_ENABLED=True.
-    """
+def echo():
     if not current_app.config.get("DEBUG_FILTERS_ENABLED", False):
         return jsonify({"detail": "Debug endpoint disabled"}), 404
-
     parsed = _parse_query_args(request.args)
     return jsonify({
         "_debug": True,

@@ -1,6 +1,5 @@
-# app/controllers/items_controller.py
+# app/services/items_svc.py
 from __future__ import annotations
-
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -14,10 +13,9 @@ from app.services.lookup import (
     list_secciones_lookup,
 )
 
-# ============================ Helpers ============================
+# ============================ Helpers internos ============================
 
 def _norm(s: Optional[str]) -> Optional[str]:
-    """Normaliza strings de entrada, convirtiendo vacíos/placeholder a None."""
     if s is None:
         return None
     s = s.strip()
@@ -26,7 +24,6 @@ def _norm(s: Optional[str]) -> Optional[str]:
     return s
 
 def _to_date(s: Optional[str]):
-    """Convierte a date si cuadra con formatos soportados."""
     if not s:
         return None
     for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
@@ -41,14 +38,12 @@ def _rows(cur) -> List[Dict[str, Any]]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 def _split_csv(s: Optional[str]) -> List[str]:
-    """Divide una CSV simple en lista depurada."""
     if not s:
         return []
     parts = [p.strip() for p in s.split(",")]
     return [p for p in parts if p]
 
 def _as_list(val: Any) -> List[str]:
-    """Normaliza a lista de strings depurados (acepta CSV, lista o string)."""
     if val is None:
         return []
     if isinstance(val, str):
@@ -65,17 +60,12 @@ def _as_list(val: Any) -> List[str]:
     return []
 
 def _list_param(params: Dict[str, Any], *names: str) -> List[str]:
-    """
-    Obtiene un parámetro que puede venir como CSV o lista, probando varios alias.
-    Devuelve lista deduplicada preservando el orden de llegada.
-    """
     for n in names:
         if n in params and params[n] is not None:
             return _as_list(params[n])
     return []
 
 def _col_exists(conn, table: str, col: str) -> bool:
-    """Comprueba si existe una columna en una tabla del esquema public."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -91,29 +81,17 @@ def _col_exists(conn, table: str, col: str) -> bool:
         return cur.fetchone() is not None
 
 def _fts_available(conn) -> bool:
-    """True si la tabla items tiene columna tsvector 'fts'."""
     return _col_exists(conn, "items", "fts")
 
 def _ts_lang(conn) -> str:
-    """Lenguaje FTS a usar (ajústalo si lo haces configurable)."""
     return "spanish"
 
-# ====================== Listado con filtros ======================
+# ====================== Búsqueda / listado ======================
 
-def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
+def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Filtros soportados (con alias):
-      - page, limit
-      - sort_by in {created_at, titulo, id, likes, dislikes, relevancia}, sort_dir in {asc, desc}
-      - fecha, fecha_desde, fecha_hasta (aplican sobre created_at o created_at_date si existe)
-      - departamento | departamentos | departamento_codigo (CSV o array)
-      - seccion      | secciones     | seccion_codigo      (CSV o array)
-      - epigrafe     | epigrafes                            (CSV o array)
-      - q | q_adv (FTS si existe o ILIKE sobre titulo(_resumen/_corto/_completo)/resumen/contenido/CAST(informe_impacto AS TEXT))
-      - identificador (ILIKE)
-      - control (ILIKE si existe columna)
+    Igual que el antiguo get_filtered_items(params).
     """
-
     # paginación segura
     try:
         page = max(int(params.get("page", 1)), 1)
@@ -122,10 +100,8 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         limit = int(params.get("limit", 12))
-        if limit < 1:
-            limit = 1
-        if limit > 100:
-            limit = 100
+        if limit < 1:  limit = 1
+        if limit > 100: limit = 100
     except Exception:
         limit = 12
 
@@ -168,38 +144,19 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         has_informe_imp = _col_exists(conn, "items", "informe_impacto")
         has_impacto = _col_exists(conn, "items", "impacto")
 
-        # catálogos disponibles
-        dep_table = None
-        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
-            if _lookup_table_exists(conn, t):
-                dep_table = t
-                break
-
-        sec_table = None
-        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
-            if _lookup_table_exists(conn, t):
-                sec_table = t
-                break
-
         # WHERE dinámico
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        # fechas (usa created_at si existe; si no, created_at_date)
         date_expr = sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)")
-
         if fecha_eq:
-            where_sql_parts.append(sql.SQL("{} = %s").format(date_expr))
-            args.append(fecha_eq)
+            where_sql_parts.append(sql.SQL("{} = %s").format(date_expr)); args.append(fecha_eq)
         else:
             if fecha_desde:
-                where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr))
-                args.append(fecha_desde)
+                where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr)); args.append(fecha_desde)
             if fecha_hasta:
-                where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr))
-                args.append(fecha_hasta)
+                where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr)); args.append(fecha_hasta)
 
-        # IN filters
         def _in_clause(col_name: str, values: Sequence[str]) -> Optional[Tuple[sql.SQL, List[str]]]:
             if not values:
                 return None
@@ -218,7 +175,7 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         if in_epi:
             where_sql_parts.append(in_epi[0]); args.extend(in_epi[1])
 
-        # texto: FTS (si existe y q>=2), si no ILIKE; 'informe_impacto' incluido
+        # texto: FTS si hay columna, si no ILIKE
         _use_fts_rank = False
         if q_adv and len(q_adv) >= 2:
             if _fts_available(conn):
@@ -240,7 +197,7 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
                     text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
                 if has_contenido:
                     text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
-                if has_informe_imp:
+                if _col_exists(conn, "items", "informe_impacto"):
                     text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s")); args.append(like_val)
                 if text_clauses:
                     where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
@@ -264,7 +221,6 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.titulo_corto") if has_titulo_corto else sql.SQL("NULL AS titulo_corto"),
             sql.SQL("i.titulo_completo") if has_titulo_completo else sql.SQL("NULL AS titulo_completo"),
             sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
-            # impacto normalizado: prioriza informe_impacto
             sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
                 else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
             sql.SQL("i.departamento_codigo"),
@@ -279,17 +235,14 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         ]
         joins: List[sql.SQL] = []
 
-        # catálogos disponibles
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
             if _lookup_table_exists(conn, t):
-                dep_table = t
-                break
+                dep_table = t; break
         sec_table = None
         for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
             if _lookup_table_exists(conn, t):
-                sec_table = t
-                break
+                sec_table = t; break
 
         if dep_table:
             select_cols.append(sql.SQL("d.nombre AS departamento_nombre"))
@@ -303,7 +256,7 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             select_cols.append(sql.SQL("NULL AS seccion_nombre"))
 
-        # ORDER BY (soporta relevancia con FTS)
+        # ORDER BY
         if sort_by == "relevancia" and _use_fts_rank:
             order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s)) ")
             order_params: List[Any] = [_ts_lang(conn), q_adv]
@@ -330,7 +283,6 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         count_sql = sql.SQL("SELECT COUNT(*) FROM items i ") + where_sql
-
         offset = (page - 1) * limit
 
         with conn.cursor() as cur:
@@ -349,17 +301,14 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
         "sort_dir": sort_dir,
     }
 
+# Compat: mismo nombre que usabas en el controller
+def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
+    return search_items(params)
+
 # ====================== Detalle & derivados ======================
 
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
-    """
-    Devuelve el detalle del item con:
-      - nombres de catálogo (departamento_nombre, seccion_nombre)
-      - impacto normalizado como 'impacto'
-      - URLs normalizadas como 'url_pdf' y 'sourceUrl'
-    """
     with get_db() as conn, conn.cursor() as cur:
-        # columnas existentes
         base_cols = [
             "id", "identificador",
             "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
@@ -367,40 +316,33 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
             "departamento_codigo", "seccion_codigo", "epigrafe",
             "created_at", "likes", "dislikes", "control"
         ]
-        existing_cols = [c for c in base_cols if _col_exists(conn, "items", c)]
+        def _col_exists_inner(c): return _col_exists(conn, "items", c)
+        existing_cols = [c for c in base_cols if _col_exists_inner(c)]
 
-        # Impacto normalizado
         impacto_expr = None
-        if _col_exists(conn, "items", "informe_impacto"):
+        if _col_exists_inner("informe_impacto"):
             impacto_expr = "i.informe_impacto AS impacto"
-        elif _col_exists(conn, "items", "impacto"):
+        elif _col_exists_inner("impacto"):
             impacto_expr = "i.impacto AS impacto"
 
-        # URL PDF priorizando el primer campo existente
         url_pdf_expr = None
         for cand in ("url_pdf", "pdf_url", "pdf", "urlPdf"):
-            if _col_exists(conn, "items", cand):
-                url_pdf_expr = f"i.{cand} AS url_pdf"
-                break
+            if _col_exists_inner(cand):
+                url_pdf_expr = f"i.{cand} AS url_pdf"; break
 
-        # URL fuente (BOE) priorizando el primer campo existente
         source_url_expr = None
         for cand in ("sourceUrl", "url_boe"):
-            if _col_exists(conn, "items", cand):
-                source_url_expr = f"i.{cand} AS sourceUrl"
-                break
+            if _col_exists_inner(cand):
+                source_url_expr = f"i.{cand} AS sourceUrl"; break
 
-        # catálogos disponibles
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
             if _lookup_table_exists(conn, t):
-                dep_table = t
-                break
+                dep_table = t; break
         sec_table = None
         for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
             if _lookup_table_exists(conn, t):
-                sec_table = t
-                break
+                sec_table = t; break
 
         sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
         if impacto_expr:    sel_parts.append(impacto_expr)
@@ -425,7 +367,6 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         names = [desc.name for desc in cur.description]
         data = dict(zip(names, row))
 
-    # Defaults y consistencia
     for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
               "contenido", "resumen", "impacto", "likes", "dislikes", "control",
               "departamento_codigo", "seccion_codigo", "epigrafe", "created_at",

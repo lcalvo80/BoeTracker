@@ -243,66 +243,10 @@ def billing_invoices():
         return _json_err(str(e), 500)
 
 
-@bp.route("/webhook", methods=["POST"])
-def webhook():
-    _stripe()
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature", "")
-    secret = current_app.config.get("STRIPE_WEBHOOK_SECRET", "")
-    try:
-        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=secret)
-    except Exception as e:
-        return _json_err(f"Invalid signature: {e}", 400)
-
-    etype = event["type"]
-    data = event["data"]["object"]
-
-    try:
-        if etype == "checkout.session.completed":
-            _sync_entitlements_from_checkout(data)
-        elif etype in {
-            "customer.subscription.created",
-            "customer.subscription.updated",
-            "customer.subscription.deleted",
-            "invoice.paid",
-            "invoice.payment_failed",
-        }:
-            _sync_entitlements_from_subscription(data)
-    except Exception as e:
-        current_app.logger.exception("Error processing webhook: %s", etype)
-        return _json_ok({"handled": False, "error": str(e)})
-
-    return _json_ok({"handled": True, "type": etype})
-
-
-# ───────────────── Sync stubs ─────────────────
-
-def _sync_entitlements_from_checkout(sess: Dict[str, Any]) -> None:
-    md = sess.get("metadata") or {}
-    scope = (md.get("scope") or "").lower()
-    if scope == "org" and md.get("org_id"):
-        _sync_entitlements_for_org(md["org_id"])
-    elif scope == "user" and md.get("clerk_user_id"):
-        _sync_entitlements_for_user(md["clerk_user_id"])
-
-def _sync_entitlements_from_subscription(sub: Dict[str, Any]) -> None:
-    md = sub.get("metadata") or {}
-    scope = (md.get("scope") or "").lower()
-    if scope == "org" and md.get("org_id"):
-        _sync_entitlements_for_org(md["org_id"])
-    elif scope == "user" and md.get("clerk_user_id"):
-        _sync_entitlements_for_user(md["clerk_user_id"])
-
-def _sync_entitlements_for_org(org_id: str) -> None:
-    try:
-        from app.services.entitlements import sync_entitlements_for_org as _real
-        _real(org_id)
-    except Exception:
-        current_app.logger.info("sync_entitlements_for_org stub for %s", org_id)
-
-def _sync_entitlements_for_user(user_id: str) -> None:
-    try:
-        from app.services.entitlements import sync_entitlements_for_user as _real
-        _real(user_id)
-    except Exception:
-        current_app.logger.info("sync_entitlements_for_user stub for %s", user_id)
+# ───────────────── (Nota) ─────────────────
+# Se ha eliminado la ruta:
+#   @bp.route("/webhook", methods=["POST"])
+# El webhook de Stripe debe manejarse en el blueprint canónico:
+#   POST /api/stripe  (en webhooks.py)
+# Si quieres, puedo pasarte también el parche para webhooks.py para
+# consolidar la lógica de _apply_subscription_set_semantics allí.

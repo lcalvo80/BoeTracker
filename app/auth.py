@@ -42,9 +42,21 @@ def _get_jwk_client(jwks_url: str) -> PyJWKClient:
     return client
 
 def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
+    """
+    Verifica el JWT emitido por Clerk:
+      - Si CLERK_JWKS_URL no está, en DEBUG aceptamos token sin firma (para dev local).
+      - Si CLERK_AUDIENCE está configurado, se verifica aud; si no, se omite.
+      - Si CLERK_ISSUER está configurado, se verifica issuer.
+    """
     jwks_url = current_app.config.get("CLERK_JWKS_URL", "")
     issuer = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
-    options = {"verify_aud": False}
+    audience = current_app.config.get("CLERK_AUDIENCE")  # opcional: str o coma-sep
+
+    verify_aud = bool(audience)
+    options = {
+        "verify_aud": verify_aud,
+    }
+
     if not jwks_url:
         if current_app.config.get("DEBUG"):
             # Modo permisivo SOLO en debug
@@ -52,13 +64,20 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
         raise RuntimeError("CLERK_JWKS_URL no configurado")
 
     signing_key = _get_jwk_client(jwks_url).get_signing_key_from_jwt(token).key
-    claims = jwt.decode(
-        token,
-        key=signing_key,
-        algorithms=["RS256"],
-        options=options,
-        issuer=issuer if issuer else None,
-    )
+
+    kwargs: Dict[str, Any] = {
+        "key": signing_key,
+        "algorithms": ["RS256"],
+        "options": options,
+    }
+    if issuer:
+        kwargs["issuer"] = issuer
+    if verify_aud:
+        # soporta múltiples audiences separadas por coma
+        aud_list = [a.strip() for a in str(audience).split(",") if a.strip()]
+        kwargs["audience"] = aud_list if len(aud_list) > 1 else aud_list[0]
+
+    claims = jwt.decode(token, **kwargs)
     return claims
 
 def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
@@ -77,6 +96,7 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
 
     claim_org_id = (
         claims.get("org_id")
+        # algunos templates lo ponen anidado:
         or (claims.get("organization") or {}).get("id")
         or claims.get("organization_id")
     )
@@ -89,14 +109,16 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
     g.org_id = org_from_hdr or (None if _is_placeholder(str(claim_org_id)) else claim_org_id)
 
     raw_role = ("" if _is_placeholder(str(claim_org_role)) else str(claim_org_role)).strip().lower()
-    if raw_role in {"admin"}:
+    # Aceptamos equivalentes comunes
+    if raw_role in {"admin", "org:admin", "owner"}:
         g.org_role = "admin"
-    elif raw_role in {"basic_member", "member"}:
+    elif raw_role in {"basic_member", "member", "org:member"}:
         g.org_role = "member"
     else:
         g.org_role = None
 
 
+# ───────────────── Decoradores ─────────────────
 def require_auth(fn: Callable) -> Callable:
     @wraps(fn)
     def _wrap(*args, **kwargs):
@@ -115,6 +137,19 @@ def require_auth(fn: Callable) -> Callable:
             return jsonify({"ok": False, "error": "Invalid claims"}), 401
         return fn(*args, **kwargs)
 
+    return _wrap
+
+
+def require_org(fn: Callable) -> Callable:
+    """
+    Exige contexto de organización (pero no rol admin).
+    Útil para endpoints tipo GET /enterprise/org o /enterprise/users.
+    """
+    @wraps(fn)
+    def _wrap(*args, **kwargs):
+        if not getattr(g, "org_id", None):
+            return jsonify({"ok": False, "error": "Missing X-Org-Id or org in token"}), 400
+        return fn(*args, **kwargs)
     return _wrap
 
 
