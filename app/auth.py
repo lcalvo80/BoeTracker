@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import wraps
 from typing import Callable, Dict, Any, Optional, List
 
+import requests
 import jwt
 from jwt import PyJWKClient
 from flask import Blueprint, current_app, request, jsonify, g
@@ -41,7 +42,6 @@ def _get_jwk_client(jwks_url: str) -> PyJWKClient:
         _jwk_client_cache[jwks_url] = client
     return client
 
-
 def _aud_list_from_env(v: Optional[str]) -> List[str]:
     """
     Convierte CLERK_AUDIENCE (p. ej. 'boe-backend' o 'a,b,c') en lista depurada.
@@ -49,7 +49,6 @@ def _aud_list_from_env(v: Optional[str]) -> List[str]:
     if not v:
         return []
     return [x.strip() for x in str(v).split(",") if x and x.strip()]
-
 
 def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     """
@@ -143,6 +142,37 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
         g.org_role = None
 
 
+# ───────────────── Fallback server-to-server con Clerk ─────────────────
+def _clerk_is_org_admin(org_id: str, user_id: str) -> bool:
+    """
+    Comprueba en Clerk si user_id es admin de org_id (server-to-server).
+    Requiere CLERK_SECRET_KEY (y opcionalmente CLERK_API_BASE).
+    """
+    base = (current_app.config.get("CLERK_API_BASE") or "https://api.clerk.com/v1").rstrip("/")
+    sk = current_app.config.get("CLERK_SECRET_KEY", "")
+    if not sk:
+        return False
+    try:
+        r = requests.get(
+            f"{base}/organizations/{org_id}/memberships",
+            headers={"Authorization": f"Bearer {sk}"},
+            params={"limit": 200},
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            current_app.logger.warning("Clerk memberships %s -> %s %s", org_id, r.status_code, r.text)
+            return False
+        data = r.json().get("data", [])
+        for m in data:
+            uid = m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")
+            role = (m.get("role") or "").strip().lower()
+            if uid == user_id and role in {"admin", "org:admin", "owner"}:
+                return True
+    except Exception:
+        current_app.logger.exception("clerk_is_org_admin error")
+    return False
+
+
 # ───────────────── Decoradores ─────────────────
 def require_auth(fn: Callable) -> Callable:
     @wraps(fn)
@@ -178,13 +208,28 @@ def require_org(fn: Callable) -> Callable:
 
 
 def require_org_admin(fn: Callable) -> Callable:
+    """
+    Requiere rol admin en la organización:
+    - Si el token trae org_role=admin, OK.
+    - Si no, se hace fallback consultando a Clerk (server-to-server).
+    """
     @wraps(fn)
     def _wrap(*args, **kwargs):
-        if not getattr(g, "org_id", None):
+        org_id = getattr(g, "org_id", None)
+        if not org_id:
             return jsonify({"ok": False, "error": "Missing X-Org-Id or org in token"}), 400
-        if getattr(g, "org_role", None) != "admin":
-            return jsonify({"ok": False, "error": "Admin role required"}), 403
-        return fn(*args, **kwargs)
+
+        # Si el token ya indica admin, adelante
+        if getattr(g, "org_role", None) == "admin":
+            return fn(*args, **kwargs)
+
+        # Fallback robusto: consulta Clerk con la clave server-to-server
+        user_id = getattr(g, "user_id", None)
+        if user_id and _clerk_is_org_admin(org_id, user_id):
+            g.org_role = "admin"  # cacheamos para el handler actual
+            return fn(*args, **kwargs)
+
+        return jsonify({"ok": False, "error": "Admin role required"}), 403
     return _wrap
 
 
