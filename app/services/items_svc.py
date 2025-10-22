@@ -87,58 +87,38 @@ def _fts_available(conn) -> bool:
 def _ts_lang(conn) -> str:
     return "spanish"
 
-# ---------- inflate helpers (b64+gzip -> str/obj) ----------
+# ---- Inflado gzip+base64 seguro -----------------------------------------
 
-def _is_b64(s: str) -> bool:
-    try:
-        if not isinstance(s, str) or len(s) < 8:
-            return False
-        # fast base64 check
-        return all(c.isalnum() or c in "+/=" for c in s)
-    except Exception:
-        return False
-
-def _inflate_b64_gzip(s: str) -> Optional[str]:
-    try:
-        raw = base64.b64decode(s)
-        out = gzip.decompress(raw)
-        return out.decode("utf-8", "ignore")
-    except Exception:
-        return None
-
-def _inflate_any(value: Any) -> Any:
+def _inflate_b64_gzip_maybe(val: Any) -> Any:
     """
-    - Si es b64+gzip -> descomprime
-    - Si es JSON string -> parsea
-    - Si no, lo devuelve tal cual (texto plano o None)
+    Si `val` es una cadena gzip+base64 la descomprime a texto.
+    Si no lo es, la devuelve tal cual.
     """
-    if value is None:
-        return None
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, (bytes, bytearray)):
+    if not isinstance(val, str) or len(val) < 8:
+        return val
+    try:
+        b = base64.b64decode(val, validate=True)
         try:
-            value = value.decode("utf-8", "ignore")
+            out = gzip.decompress(b).decode("utf-8", errors="replace")
+            return out
         except Exception:
-            return None
-    if isinstance(value, str):
-        txt = value
-        if _is_b64(txt):
-            inflated = _inflate_b64_gzip(txt)
-            if inflated is not None:
-                txt = inflated
+            # No era gzip tras base64; devolvemos original
+            return val
+    except Exception:
+        return val
 
-        s = (txt or "").strip()
-        if not s:
-            return None
-        if s.startswith("{") or s.startswith("["):
-            try:
-                return json.loads(s)
-            except Exception:
-                return s
-        return s
-    # cualquier otro tipo no lo consideramos “mostrable”
-    return None
+def _parse_json_maybe(text: Optional[str]) -> Any:
+    if not isinstance(text, str):
+        return text
+    t = text.strip()
+    if not t:
+        return ""
+    if t.startswith("{") or t.startswith("["):
+        try:
+            return json.loads(t)
+        except Exception:
+            return text
+    return text
 
 # ====================== Búsqueda / listado ======================
 
@@ -172,7 +152,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     fecha_desde = _to_date(_norm(params.get("fecha_desde")))
     fecha_hasta = _to_date(_norm(params.get("fecha_hasta")))
 
-    # listas (acepta CSV o array y varios nombres)
+    # listas
     dep_list = _list_param(params, "departamento_codigo", "departamento", "departamentos")
     sec_list = _list_param(params, "seccion_codigo", "seccion", "secciones")
     epi_list = _list_param(params, "epigrafe", "epigrafes")
@@ -183,10 +163,12 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     control_val = _norm(params.get("control"))
 
     with get_db() as conn:
-        # columnas disponibles
         has_titulo_resumen = _col_exists(conn, "items", "titulo_resumen")
         has_titulo_corto = _col_exists(conn, "items", "titulo_corto")
         has_titulo_completo = _col_exists(conn, "items", "titulo_completo")
+        has_created_at_date = _col_exists(conn, "items", "created_at_date")
+        has_created_at = _col_exists(conn, "items", "created_at")
+        has_control = _col_exists(conn, "items", "control")
         has_contenido = _col_exists(conn, "items", "contenido")
         has_resumen = _col_exists(conn, "items", "resumen")
         has_titulo = _col_exists(conn, "items", "titulo")
@@ -195,11 +177,11 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         has_informe_imp = _col_exists(conn, "items", "informe_impacto")
         has_impacto = _col_exists(conn, "items", "impacto")
 
-        # WHERE dinámico
+        # WHERE
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        date_expr = sql.SQL("DATE(i.created_at)") if _col_exists(conn, "items", "created_at") else sql.SQL("DATE(i.created_at_date)")
+        date_expr = sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)")
         if fecha_eq:
             where_sql_parts.append(sql.SQL("{} = %s").format(date_expr)); args.append(fecha_eq)
         else:
@@ -257,7 +239,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             where_sql_parts.append(sql.SQL("i.identificador ILIKE %s"))
             args.append(f"%{identificador}%")
 
-        if control_val and _col_exists(conn, "items", "control"):
+        if control_val and has_control:
             where_sql_parts.append(sql.SQL("i.control ILIKE %s"))
             args.append(f"%{control_val}%")
 
@@ -271,7 +253,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.titulo_resumen") if has_titulo_resumen else sql.SQL("NULL AS titulo_resumen"),
             sql.SQL("i.titulo_corto") if has_titulo_corto else sql.SQL("NULL AS titulo_corto"),
             sql.SQL("i.titulo_completo") if has_titulo_completo else sql.SQL("NULL AS titulo_completo"),
-            sql.SQL("i.resumen") if _col_exists(conn, "items", "resumen") else sql.SQL("NULL AS resumen"),
+            sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
             sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
                 else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
             sql.SQL("i.departamento_codigo"),
@@ -282,7 +264,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             ),
             sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
             sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
-            sql.SQL("i.control") if _col_exists(conn, "items", "control") else sql.SQL("NULL AS control"),
+            sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
         ]
         joins: List[sql.SQL] = []
 
@@ -342,7 +324,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
 
-    # En listado NO inflamos para ahorrar CPU/ancho de banda
+    # (listado no infla por rendimiento; los detalle/derivados sí)
     return {
         "items": data,
         "page": page,
@@ -353,7 +335,6 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         "sort_dir": sort_dir,
     }
 
-# Compat: mismo nombre que usabas en el controller
 def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
     return search_items(params)
 
@@ -419,16 +400,22 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         names = [desc.name for desc in cur.description]
         data = dict(zip(names, row))
 
-    # Campos esperados
+    # Normalizaciones + inflado (detalle)
     for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
               "contenido", "resumen", "impacto", "likes", "dislikes", "control",
               "departamento_codigo", "seccion_codigo", "epigrafe", "created_at",
               "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"):
         data.setdefault(k, None)
 
-    # Inflar resumen/impacto si vienen comprimidos o como JSON string
-    data["resumen"] = _inflate_any(data.get("resumen"))
-    data["impacto"] = _inflate_any(data.get("impacto"))
+    # Inflar gzip+base64 si procede
+    if data.get("resumen") is not None:
+        inflated = _inflate_b64_gzip_maybe(data["resumen"])
+        data["resumen"] = (inflated or "").strip() or None
+
+    if "impacto" in data and data["impacto"] is not None:
+        imp_text = _inflate_b64_gzip_maybe(data["impacto"])
+        parsed = _parse_json_maybe(imp_text)
+        data["impacto"] = parsed
 
     return data
 
@@ -438,19 +425,31 @@ def get_item_resumen(identificador: str) -> Dict[str, Any]:
             return {"identificador": identificador, "resumen": None}
         cur.execute("SELECT resumen FROM items WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
-    return {"identificador": identificador, "resumen": _inflate_any(row[0]) if row else None}
+    raw = row[0] if row else None
+    inflated = _inflate_b64_gzip_maybe(raw)
+    text = (inflated or "").strip()
+    return {"identificador": identificador, "resumen": text if text != "" else None}
 
 def get_item_impacto(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
-        if not _col_exists(conn, "items", "informe_impacto"):
-            if _col_exists(conn, "items", "impacto"):
-                cur.execute("SELECT impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
-                row = cur.fetchone()
-                return {"identificador": identificador, "impacto": _inflate_any(row[0]) if row else None}
+        col = None
+        if _col_exists(conn, "items", "informe_impacto"):
+            col = "informe_impacto"
+        elif _col_exists(conn, "items", "impacto"):
+            col = "impacto"
+        else:
             return {"identificador": identificador, "impacto": None}
-        cur.execute("SELECT informe_impacto FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+
+        cur.execute(f"SELECT {col} FROM items WHERE identificador = %s LIMIT 1", (identificador,))
         row = cur.fetchone()
-    return {"identificador": identificador, "impacto": _inflate_any(row[0]) if row else None}
+
+    raw = row[0] if row else None
+    inflated = _inflate_b64_gzip_maybe(raw)
+    parsed = _parse_json_maybe(inflated)
+    # Si quedó cadena vacía -> None ; si es {} se devolverá {}
+    if isinstance(parsed, str) and parsed.strip() == "":
+        parsed = None
+    return {"identificador": identificador, "impacto": parsed}
 
 def like_item(identificador: str) -> Dict[str, Any]:
     with get_db() as conn, conn.cursor() as cur:
