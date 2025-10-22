@@ -9,21 +9,37 @@ from app.auth import require_auth, require_org_admin
 
 bp = Blueprint("enterprise", __name__)
 
-# ───────────────── Mapeos de roles ─────────────────
+# ───────────────── Roles (Clerk ↔ API) ─────────────────
+# → Cuando escribimos a Clerk
 CLERK_ROLE_TO_API = {
     "admin": "admin",
+    "owner": "admin",
+    "org:admin": "admin",
     "member": "basic_member",
+    "org:member": "basic_member",
     "basic_member": "basic_member",
 }
+# ← Cuando leemos de Clerk
 CLERK_ROLE_FROM_API = {
     "admin": "admin",
+    "owner": "admin",
+    "org:admin": "admin",
     "basic_member": "member",
+    "member": "member",
+    "org:member": "member",
 }
+
+def _normalize_role(v: Optional[str]) -> Optional[str]:
+    if not v:
+        return None
+    return CLERK_ROLE_FROM_API.get(str(v).strip().lower(), None)
+
 
 @bp.before_request
 def _allow_options():
     if request.method == "OPTIONS":
         return ("", 204)
+
 
 # ───────────────── Clerk helpers ─────────────────
 def _clerk_headers() -> Dict[str, str]:
@@ -59,7 +75,11 @@ def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
     return None
 
 def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
-    """Normaliza un membership de Clerk con varias formas de respuesta (public_user_data / expand=user)."""
+    """
+    Normaliza un membership de Clerk, aceptando respuestas con:
+    - include_public_user_data=true (public_user_data)
+    - expand=user
+    """
     pud = (m.get("public_user_data") or {})
     user = (m.get("user") or {})
     uid = m.get("user_id") or pud.get("user_id") or user.get("id")
@@ -70,7 +90,7 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
         (pud.get("last_name") or user.get("last_name") or "") or "",
     ]).strip()
 
-    role = CLERK_ROLE_FROM_API.get(m.get("role"), "member")
+    role = _normalize_role(m.get("role")) or "member"
     return {
         "id": m.get("id"),  # membership_id
         "membership_id": m.get("id"),
@@ -81,14 +101,19 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
-    res = _req("GET", f"/organizations/{org_id}/memberships?limit=100&include_public_user_data=true")
+    """Devuelve membership_id a partir de org_id + user_id."""
+    res = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
     for m in res.get("data", []):
         if (m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")) == user_id:
             return m.get("id")
     return None
 
 def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """Devuelve el membership del usuario en la org."""
+    """
+    Devuelve el membership del usuario en la org:
+      1) Busca en /organizations/:id/memberships
+      2) Fallback: /users/:id?expand=organization_memberships y, si hay id, hidrata con expand=user
+    """
     try:
         res = _req("GET", f"/organizations/{org_id}/memberships?limit=200&include_public_user_data=true")
         for m in res.get("data", []):
@@ -114,21 +139,37 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None:
+    """
+    Completa email/nombre/user_id si faltan:
+      - Primero, membership con expand=user
+      - Luego, /users/:id?expand=email_addresses
+    """
     for it in items:
-        if it.get("email") and it.get("user_id"):
-            continue
-        mid = it.get("membership_id")
-        try:
-            mem = _req("GET", f"/organizations/{org_id}/memberships/{mid}?expand=user&include_public_user_data=true")
-            n = _normalize_member(mem or {})
-            for k in ("user_id", "email", "name"):
-                if not it.get(k) and n.get(k):
-                    it[k] = n[k]
-            if it.get("user_id") and not it.get("email"):
-                u = _req("GET", f"/users/{it['user_id']}?expand=email_addresses")
-                it["email"] = _extract_email_from_user(u or {}) or it.get("email")
-        except Exception:
-            pass
+        uid = it.get("user_id")
+        if not (it.get("email") and uid):
+            mid = it.get("membership_id")
+            try:
+                mem = _req("GET", f"/organizations/{org_id}/memberships/{mid}?expand=user&include_public_user_data=true")
+                n = _normalize_member(mem or {})
+                for k in ("user_id", "email", "name"):
+                    if not it.get(k) and n.get(k):
+                        it[k] = n[k]
+                uid = it.get("user_id")
+            except Exception:
+                pass
+
+        if uid and (not it.get("email") or not it.get("name")):
+            try:
+                u = _req("GET", f"/users/{uid}?expand=email_addresses")
+                it["email"] = it.get("email") or _extract_email_from_user(u or {})
+                fn = (u or {}).get("first_name") or ""
+                ln = (u or {}).get("last_name") or ""
+                full = (fn + " " + ln).strip()
+                if full:
+                    it["name"] = it.get("name") or full
+            except Exception:
+                pass
+
 
 def _json_ok(payload: Any, code: int = 200):
     return ({"ok": True, "data": payload}, code)
@@ -136,9 +177,10 @@ def _json_ok(payload: Any, code: int = 200):
 def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
 
+
 # ─────────────── Utilidades de asientos / admins ───────────────
 def _org_usage(org_id: str) -> Dict[str, int]:
-    """Devuelve counts: members, pending_invites."""
+    """Devuelve contadores: members (aceptados), pending (invitaciones), used (members+pending)."""
     members = 0
     pending = 0
     try:
@@ -157,18 +199,19 @@ def _org_usage(org_id: str) -> Dict[str, int]:
 def _count_admins(org_id: str) -> int:
     try:
         res = _req("GET", f"/organizations/{org_id}/memberships?limit=200")
-        return sum(1 for m in res.get("data", []) if (m.get("role") == "admin"))
+        return sum(1 for m in res.get("data", []) if _normalize_role(m.get("role")) == "admin")
     except Exception:
         return 0
 
 def _is_last_admin(org_id: str, membership_id: str) -> bool:
     try:
         mem = _req("GET", f"/organizations/{org_id}/memberships/{membership_id}")
-        if mem.get("role") != "admin":
+        if _normalize_role(mem.get("role")) != "admin":
             return False
     except Exception:
         return False
     return _count_admins(org_id) <= 1
+
 
 # ───────────────── Endpoints ─────────────────
 @bp.route("/org", methods=["GET", "OPTIONS"])
@@ -180,18 +223,20 @@ def get_org_info():
     try:
         org = _req("GET", f"/organizations/{g.org_id}")
 
-        # Rol por defecto desde el token (puede ser None si hay placeholders)
+        # Rol "estimado" del token…
         current_role = g.org_role
 
-        # Rol real (robusto)
+        # …y rol "real" consultando membership en Clerk
         try:
             mem = _find_membership(g.org_id, g.user_id)
             if mem and mem.get("role"):
-                current_role = CLERK_ROLE_FROM_API.get(mem.get("role"), current_role or "member")
+                nr = _normalize_role(mem.get("role"))
+                if nr:
+                    current_role = nr
         except Exception:
             pass
 
-        # Seats configurados en metadata
+        # Seats configurados en public_metadata
         seats = int((org.get("public_metadata") or {}).get("seats") or 0)
 
         # Métricas
@@ -204,10 +249,10 @@ def get_org_info():
             "name": org.get("name"),
             "slug": org.get("slug"),
             "seats": seats,
-            "used_seats": used,      # compat
+            "used_seats": used,       # compat
             "pending_invites": usage["pending"],
             "current_user_role": current_role,
-            # Nuevos (más claros)
+            # campos claros
             "used": used,
             "free_seats": free,
             "free": free,
@@ -215,6 +260,7 @@ def get_org_info():
         return _json_ok(out)
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
+
 
 @bp.route("/users", methods=["GET", "OPTIONS"])
 @require_auth
@@ -229,6 +275,7 @@ def list_users():
         return _json_ok({"items": items, "total": len(items)})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
+
 
 @bp.route("/invite", methods=["POST", "OPTIONS"])
 @require_auth
@@ -263,7 +310,8 @@ def invite_user():
     free = max(0, seats - used)
     needed = len(emails)
     if not allow_overbook and needed > free:
-        return ({"ok": False, "error": "not_enough_seats", "details": {"seats": seats, "used": used, "free": free, "needed": needed}}, 409)
+        return ({"ok": False, "error": "not_enough_seats",
+                 "details": {"seats": seats, "used": used, "free": free, "needed": needed}}, 409)
 
     payload = {
         "email_addresses": emails,
@@ -279,6 +327,7 @@ def invite_user():
         return _json_ok({"results": out})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
+
 
 @bp.route("/update-role", methods=["POST", "OPTIONS"])
 @require_auth
@@ -297,7 +346,7 @@ def update_role():
     if not membership_id:
         return _json_err("membership_id o user_id requeridos.", 400)
 
-    # Guard rail: no degradar al último admin
+    # Guard-rail: no degradar al último admin
     if role_api != "admin" and _is_last_admin(g.org_id, membership_id):
         return ({"ok": False, "error": "cannot_demote_last_admin"}, 409)
 
@@ -306,6 +355,7 @@ def update_role():
         return _json_ok(_normalize_member(res))
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
+
 
 @bp.route("/remove", methods=["POST", "OPTIONS"])
 @require_auth
@@ -320,7 +370,7 @@ def remove_user():
     if not membership_id:
         return _json_err("membership_id o user_id requeridos.", 400)
 
-    # Guard rail: no eliminar al último admin
+    # Guard-rail: no eliminar al último admin
     if _is_last_admin(g.org_id, membership_id):
         return ({"ok": False, "error": "cannot_remove_last_admin"}, 409)
 
@@ -329,6 +379,7 @@ def remove_user():
         return _json_ok({"removed": True, "membership_id": membership_id})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
+
 
 @bp.route("/set-seat-limit", methods=["POST", "OPTIONS"])
 @require_auth
