@@ -29,7 +29,7 @@ instance/
 .mypy_cache/
 .pytest_cache/
 
-# ==== Node / React ====
+# ==== Node / React ===
 # dependencies
 node_modules/
 # production build
