@@ -1,3 +1,4 @@
+# app/blueprints/enterprise.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, List
@@ -7,7 +8,7 @@ from flask import Blueprint, current_app, request, g
 
 from app.auth import require_auth, require_org_admin
 
-bp = Blueprint("enterprise", __name__)
+bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
 
 # ───────────────── Roles (Clerk ↔ API) ─────────────────
 # → Cuando escribimos a Clerk
@@ -56,7 +57,12 @@ def _req(method: str, path: str, **kwargs) -> Any:
     r = requests.request(method, url, headers=_clerk_headers(), timeout=20, **kwargs)
     if r.status_code >= 400:
         raise RuntimeError(f"Clerk {method} {path} -> {r.status_code}: {r.text}")
-    return r.json() if r.text.strip() else None
+    if not r.text or not r.text.strip():
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return r.text
 
 def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
     if not user:
@@ -277,6 +283,73 @@ def list_users():
         return _json_err(f"Clerk error: {e}", 502)
 
 
+@bp.route("/invitations", methods=["GET", "OPTIONS"])
+@require_auth
+@require_org_admin
+def list_invitations():
+    """Lista invitaciones (por defecto solo 'pending'). Soporta ?status=pending|accepted|revoked|expired|all."""
+    if not g.org_id:
+        return _json_err("Missing org (X-Org-Id).", 400)
+    status = (request.args.get("status") or "pending").strip().lower()
+    q = "" if status in ("all", "*") else f"?status={status}"
+    try:
+        res = _req("GET", f"/organizations/{g.org_id}/invitations{q}&limit=200" if q else f"/organizations/{g.org_id}/invitations?limit=200")
+        arr = res if isinstance(res, list) else (res.get("data") or [])
+        items = [{
+            "id": it.get("id"),
+            "email": it.get("email_address"),
+            "status": it.get("status"),
+            "role": CLERK_ROLE_FROM_API.get((it.get("role") or "").lower(), it.get("role")),
+            "created_at": it.get("created_at"),
+            "updated_at": it.get("updated_at"),
+            "expires_at": it.get("expires_at"),
+        } for it in arr]
+        return _json_ok({"items": items, "total": len(items)})
+    except Exception as e:
+        return _json_err(f"Clerk error: {e}", 502)
+
+
+@bp.route("/invitations/revoke", methods=["POST", "OPTIONS"])
+@require_auth
+@require_org_admin
+def revoke_invitation():
+    """Revoca invitaciones por id (preferido) o por email(s)."""
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids") or []
+    emails = data.get("emails") or []
+    if isinstance(ids, str):
+        ids = [ids]
+    if isinstance(emails, str):
+        emails = [emails]
+
+    revoked: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    try:
+        # Si llegan emails, mapear a ids
+        if emails and not ids:
+            res = _req("GET", f"/organizations/{g.org_id}/invitations?status=pending&limit=200")
+            arr = res if isinstance(res, list) else (res.get("data") or [])
+            email_to_id = {it.get("email_address"): it.get("id") for it in arr}
+            ids = [email_to_id[e] for e in emails if e in email_to_id]
+
+        if not ids:
+            return _json_err("Debes indicar 'ids' o 'emails'.", 400)
+
+        for inv_id in ids:
+            try:
+                _req("DELETE", f"/organizations/{g.org_id}/invitations/{inv_id}")
+                revoked.append({"id": inv_id, "revoked": True})
+            except Exception as ex:
+                errors.append({"id": inv_id, "error": str(ex)})
+
+        ok = {"results": revoked, "errors": errors, "revoked": len(revoked), "failed": len(errors)}
+        code = 207 if errors and revoked else 200 if revoked and not errors else 502
+        return _json_ok(ok, code=code)
+    except Exception as e:
+        return _json_err(f"Clerk error: {e}", 502)
+
+
 @bp.route("/invite", methods=["POST", "OPTIONS"])
 @require_auth
 @require_org_admin
@@ -299,6 +372,14 @@ def invite_user():
         + "/auth/callback"
     )
 
+    expires_in_days = data.get("expires_in_days")
+    try:
+        expires_in_days = int(expires_in_days) if expires_in_days is not None else None
+        if expires_in_days is not None and not (1 <= expires_in_days <= 30):
+            return _json_err("'expires_in_days' debe estar entre 1 y 30.", 400)
+    except Exception:
+        return _json_err("'expires_in_days' debe ser entero.", 400)
+
     # Asientos disponibles
     try:
         org = _req("GET", f"/organizations/{g.org_id}")
@@ -320,10 +401,14 @@ def invite_user():
         "allow_duplicates": False,
         "send_email": True,
     }
+    if expires_in_days is not None:
+        payload["expires_in_days"] = expires_in_days
 
     try:
         res = _req("POST", f"/organizations/{g.org_id}/invitations", json=payload)
-        out = [{"email": r.get("email_address"), "status": r.get("status")} for r in (res or [])]
+        # Clerk devuelve array de resultados
+        arr = res if isinstance(res, list) else (res.get("data") or [])
+        out = [{"email": r.get("email_address"), "status": r.get("status"), "id": r.get("id")} for r in arr]
         return _json_ok({"results": out})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
