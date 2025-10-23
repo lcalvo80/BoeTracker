@@ -13,10 +13,21 @@ def _allow_options():
 
 @bp.get("/filters")
 def filters():
+    """
+    Respuesta estable:
+    {
+      "ok": true,
+      "data": {
+        "sections": [{ "codigo": "...", "nombre": "..." }, ...],
+        "departments": [{ "codigo": "...", "nombre": "..." }, ...],
+        "epigraphs": ["...", "..."]
+      }
+    }
+    """
     try:
-        sections = items_svc.list_secciones()       # [{codigo, nombre}]
-        departments = items_svc.list_departamentos()# [{codigo, nombre}]
-        epigraphs = items_svc.list_epigrafes()      # [str]
+        sections = items_svc.list_secciones()        # [{codigo, nombre}]
+        departments = items_svc.list_departamentos() # [{codigo, nombre}]
+        epigraphs = items_svc.list_epigrafes()       # [str]
         return jsonify({
             "ok": True,
             "data": {
