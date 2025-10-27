@@ -1,3 +1,4 @@
+# app/services/parser.py
 import logging
 from datetime import datetime, date
 from typing import Optional
@@ -6,6 +7,7 @@ from xml.etree import ElementTree as ET
 from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
+from app.services.lookup import ensure_seccion_cur, ensure_departamento_cur
 
 logger = logging.getLogger(__name__)
 
@@ -163,22 +165,48 @@ def parse_and_insert(root: ET.Element) -> int:
         "omitidos_vacios": 0,
         "fallos_openai": 0,
         "huerfanos_en_seccion": 0,
+        # contadores de lookup (secciones/departamentos)
+        "lookup_sec_insert": 0,
+        "lookup_sec_update": 0,
+        "lookup_dep_insert": 0,
+        "lookup_dep_update": 0,
     }
 
     with get_db() as conn:
         cur = conn.cursor()
 
         for seccion in root.findall(".//seccion"):
-            clase_item = clasificar_item(seccion.get("nombre", ""))
+            # Asegurar SECCIÓN en tabla de lookup
+            sec_codigo = (seccion.get("codigo", "") or "").strip()
+            sec_nombre = (seccion.get("nombre", "") or "").strip()
+            act_sec = ensure_seccion_cur(cur, sec_codigo, sec_nombre)
+            if act_sec == "insert":
+                counters["lookup_sec_insert"] += 1
+            elif act_sec == "update_name":
+                counters["lookup_sec_update"] += 1
+
+            clase_item = clasificar_item(sec_nombre)
 
             for dept in seccion.findall("departamento"):
+                # Asegurar DEPARTAMENTO en tabla de lookup
+                dep_codigo = (dept.get("codigo", "") or "").strip()
+                dep_nombre = (dept.get("nombre", "") or "").strip()
+                act_dep = ensure_departamento_cur(cur, dep_codigo, dep_nombre)
+                if act_dep == "insert":
+                    counters["lookup_dep_insert"] += 1
+                elif act_dep == "update_name":
+                    counters["lookup_dep_update"] += 1
+
+                # Items agrupados por epígrafe
                 for epigrafe in dept.findall("epigrafe"):
                     for item in epigrafe.findall("item"):
                         procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters)
 
+                # Items colgados directamente del departamento
                 for item in dept.findall("item"):
                     procesar_item(cur, item, seccion, dept, None, clase_item, counters)
 
+            # Items huérfanos colgados de sección
             for item in seccion.findall("item"):
                 procesar_item(cur, item, seccion, None, None, clase_item, counters)
                 counters["huerfanos_en_seccion"] += 1
