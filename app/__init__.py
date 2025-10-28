@@ -6,6 +6,27 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 
+def _build_cors_origins(app: Flask):
+    cand = [
+        app.config.get("FRONTEND_ORIGIN"),
+        app.config.get("FRONTEND_BASE_URL"),
+        os.getenv("ADDITIONAL_FRONTEND_ORIGIN", ""),
+    ]
+    # filtra vacíos y duplicados
+    seen, out = set(), []
+    for o in cand:
+        if not o:
+            continue
+        v = str(o).strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    # en debug, si no hay orígenes configurados, permite todos (solo dev)
+    if app.config.get("DEBUG") and not out:
+        out = ["*"]
+    return out
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -36,19 +57,22 @@ def create_app() -> Flask:
     )
 
     # ───────────────── CORS ─────────────────
+    cors_origins = _build_cors_origins(app)
     CORS(
         app,
-        resources={r"/api/*": {"origins": [app.config["FRONTEND_ORIGIN"], app.config["FRONTEND_BASE_URL"]]}},
+        resources={
+            r"/api/*": {
+                "origins": cors_origins,
+                "allow_headers": ["Content-Type", "Authorization", "X-Org-Id"],
+                "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            }
+        },
         supports_credentials=True,
-        allow_headers=["Content-Type", "Authorization", "X-Org-Id"],
-        methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     )
 
     # ───────────────── Blueprints ─────────────────
     # Canónicos:
-    # - /api/stripe  (webhook Stripe)
-    # - /api/clerk   (webhook Clerk)
-    from app.blueprints.webhooks import bp as webhooks_bp
+    from app.blueprints.webhooks import bp as webhooks_bp   # expone /api/stripe y /api/clerk
     from app.blueprints.billing import bp as billing_bp
     from app.blueprints.enterprise import bp as enterprise_bp
 
@@ -60,22 +84,21 @@ def create_app() -> Flask:
     # DEV only (_int/claims)
     from app.auth import int_bp  # solo en DEBUG
 
-    # Registro (IMPORTANTE: webhooks bajo /api para exponer /api/stripe y /api/clerk)
+    # Registro
     app.register_blueprint(webhooks_bp, url_prefix="/api")
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
     app.register_blueprint(enterprise_bp, url_prefix="/api/enterprise")
-
-    # Items & Comments: mismos prefijos que espera el FE
     app.register_blueprint(items_bp, url_prefix="/api/items")
-    app.register_blueprint(comments_bp, url_prefix="/api/items")  # expone /api/items/<ident>/comments
+    app.register_blueprint(comments_bp, url_prefix="/api/items")  # /api/items/<ident>/comments
     app.register_blueprint(meta_bp, url_prefix="/api/meta")       # /api/meta/filters
 
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")
 
     # ───────────────── Salud y errores ─────────────────
+    @app.route("/health")
     @app.route("/healthz")
-    def healthz():
+    def health():
         return {"ok": True, "status": "healthy"}
 
     @app.errorhandler(404)

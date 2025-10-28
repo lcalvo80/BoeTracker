@@ -1,13 +1,11 @@
-# app/blueprints/meta.py
 from __future__ import annotations
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 from app.services import items_svc
 
 bp = Blueprint("meta", __name__)
 
 @bp.before_request
 def _allow_options():
-    from flask import request
     if request.method == "OPTIONS":
         return ("", 204)
 
@@ -18,23 +16,30 @@ def filters():
     {
       "ok": true,
       "data": {
-        "sections": [{ "codigo": "...", "nombre": "..." }, ...],
-        "departments": [{ "codigo": "...", "nombre": "..." }, ...],
-        "epigraphs": ["...", "..."]
+        "sections":     [{ "codigo": "...", "nombre": "..." }, ...],
+        "departments":  [{ "codigo": "...", "nombre": "..." }, ...],
+        "epigraphs":    ["...", "..."],
+        // compat:
+        "secciones":    [...],
+        "departamentos":[...],
+        "epigrafes":    [...]
       }
     }
     """
     try:
-        sections = items_svc.list_secciones()        # [{codigo, nombre}]
-        departments = items_svc.list_departamentos() # [{codigo, nombre}]
-        epigraphs = items_svc.list_epigrafes()       # [str]
-        return jsonify({
-            "ok": True,
-            "data": {
-                "sections": sections,
-                "departments": departments,
-                "epigraphs": epigraphs,
-            }
-        }), 200
+        sections = items_svc.list_secciones()         # [{codigo, nombre}]
+        departments = items_svc.list_departamentos()  # [{codigo, nombre}]
+        epigraphs = items_svc.list_epigrafes()        # [str]
+
+        data = {
+            "sections": sections,
+            "departments": departments,
+            "epigraphs": epigraphs,
+            # compat ES
+            "secciones": sections,
+            "departamentos": departments,
+            "epigrafes": epigraphs,
+        }
+        return jsonify({"ok": True, "data": data}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
