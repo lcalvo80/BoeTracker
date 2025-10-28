@@ -1,233 +1,91 @@
 # app/services/lookup.py
-import os
-from typing import Optional, List, Dict, Literal
-from psycopg2 import sql
-from app.services.postgres import get_db
+from __future__ import annotations
 
-# ENV opcionales
-ENV_DEP_TABLE = os.getenv("LOOKUP_DEPARTAMENTOS_TABLE")  # p.ej., "departamentos"
-ENV_SEC_TABLE = os.getenv("LOOKUP_SECCIONES_TABLE")      # p.ej., "secciones"
-ENV_CODE_COL  = os.getenv("LOOKUP_CODE_COLUMN", "codigo")
-ENV_NAME_COL  = os.getenv("LOOKUP_NAME_COLUMN", "nombre")
+import re
+from typing import Optional
 
-DEP_TABLE_CANDIDATES = [t for t in [ENV_DEP_TABLE, "departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"] if t]
-SEC_TABLE_CANDIDATES = [t for t in [ENV_SEC_TABLE, "secciones", "lookup_secciones", "cat_secciones", "dim_secciones"] if t]
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalización y upsert de códigos de SECCIÓN/DEPARTAMENTO
+# Esquema esperado en BD:
+#   - Tabla secciones(codigo TEXT PRIMARY KEY, nombre TEXT)
+#   - Tabla departamentos(codigo TEXT PRIMARY KEY, nombre TEXT)
+# Notas:
+#   * Los códigos se guardan como texto de 4 dígitos (ej. "0310", "1410").
+#   * Si no llega nombre, se usa un placeholder ("Sección {code}" / "Dept. {code}").
+#   * Si ya existe y posteriormente llega un nombre real distinto, se actualiza.
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _table_exists(conn, table: str) -> bool:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 1 FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_name = %s
-            LIMIT 1
-        """, (table,))
-        return cur.fetchone() is not None
+_ONLY_DIGITS_RE = re.compile(r"\D+")
+_WS_RE = re.compile(r"\s+")
 
-def _column_exists(conn, table: str, column: str) -> bool:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s AND column_name = %s
-            LIMIT 1
-        """, (table, column))
-        return cur.fetchone() is not None
 
-def _first_existing_table(conn, candidates: List[str]) -> Optional[str]:
-    for t in candidates:
-        if _table_exists(conn, t):
-            return t
-    return None
+def normalize_code(code_raw: Optional[str]) -> str:
+    """
+    Normaliza códigos de secciones/departamentos:
+      - Mantiene solo dígitos.
+      - Rellena a 4 dígitos con ceros a la izquierda (zfill(4)).
+      - Si queda vacío → '0000'.
+    """
+    if code_raw is None:
+        return "0000"
+    s = str(code_raw).strip()
+    s = _ONLY_DIGITS_RE.sub("", s)
+    s = s.zfill(4)
+    return s if s else "0000"
 
-def list_lookup(table_candidates: List[str], code_col: str = ENV_CODE_COL, name_col: str = ENV_NAME_COL) -> List[Dict]:
-    with get_db() as conn:
-        table = _first_existing_table(conn, table_candidates)
-        if not table:
-            return []
-        has_code = _column_exists(conn, table, code_col)
-        has_name = _column_exists(conn, table, name_col)
-        if not has_code and not has_name:
-            return []
 
-        if has_code and has_name:
-            q = sql.SQL("""
-                SELECT DISTINCT {code} AS codigo, {name} AS nombre
-                FROM {tbl}
-                WHERE TRIM(COALESCE({code}::text,'')) <> ''
-                ORDER BY nombre, codigo
-            """).format(code=sql.Identifier(code_col),
-                        name=sql.Identifier(name_col),
-                        tbl=sql.Identifier(table))
-            with conn.cursor() as cur:
-                cur.execute(q)
-                return [{"codigo": r[0], "nombre": r[1]} for r in cur.fetchall()]
-        elif has_code:
-            q = sql.SQL("""
-                SELECT DISTINCT {code} AS codigo
-                FROM {tbl}
-                WHERE TRIM(COALESCE({code}::text,'')) <> ''
-                ORDER BY codigo
-            """).format(code=sql.Identifier(code_col),
-                        tbl=sql.Identifier(table))
-            with conn.cursor() as cur:
-                cur.execute(q)
-                return [{"codigo": r[0], "nombre": None} for r in cur.fetchall()]
-        else:
-            q = sql.SQL("""
-                SELECT DISTINCT {name} AS nombre
-                FROM {tbl}
-                WHERE TRIM(COALESCE({name}::text,'')) <> ''
-                ORDER BY nombre
-            """).format(name=sql.Identifier(name_col),
-                        tbl=sql.Identifier(table))
-            with conn.cursor() as cur:
-                cur.execute(q)
-                return [{"codigo": r[0], "nombre": r[0]} for r in cur.fetchall()]
-
-def list_departamentos_lookup() -> List[Dict]:
-    return list_lookup(DEP_TABLE_CANDIDATES)
-
-def list_secciones_lookup() -> List[Dict]:
-    return list_lookup(SEC_TABLE_CANDIDATES)
-
-# ────────────────────────── NUEVO: upsert idempotente ──────────────────────────
-
-def _norm_code_py(code: Optional[str]) -> str:
-    s = (code or "").strip()
-    if s == "":
+def _normalize_name(name_raw: Optional[str]) -> str:
+    """
+    Limpia el nombre: trim + colapsa espacios internos. Mantiene mayúsculas originales.
+    """
+    if not name_raw:
         return ""
-    n = s.lstrip("0")
-    return n if n != "" else "0"
+    s = _WS_RE.sub(" ", str(name_raw).strip())
+    return s
 
-def _ensure_lookup_cur(
-    cur,
-    table_candidates: List[str],
-    codigo: Optional[str],
-    nombre: Optional[str],
-    code_col: str = ENV_CODE_COL,
-    name_col: str = ENV_NAME_COL,
-) -> Literal["insert", "update_name", "noop", "skip_no_table", "skip_need_code_or_name"]:
+
+def _upsert_row_cur(cur, table: str, code: str, name: str, placeholder_prefix: str) -> str:
     """
-    Garantiza que (codigo,nombre) exista en la tabla de lookup. Comparación por código normalizado (sin ceros a la izq).
-    - Si existen ambas columnas (codigo, nombre):
-        * si existe por código (normalizado) y nombre vacío -> update nombre
-        * si no existe -> insert (codigo, nombre)
-    - Si solo hay 'codigo' -> inserta código si no existe
-    - Si solo hay 'nombre' -> inserta nombre si no existe
+    Upsert manual con retorno de acción:
+      - 'insert'      → se ha insertado la fila (con nombre o con placeholder).
+      - 'update_name' → se ha actualizado el nombre existente.
+      - 'noop'        → ya existía y no se ha cambiado el nombre.
+
+    No hace commit (lo gestiona el caller).
     """
-    conn = cur.connection
-    table = _first_existing_table(conn, table_candidates)
-    if not table:
-        return "skip_no_table"
+    cur.execute(f"SELECT nombre FROM {table} WHERE codigo = %s", (code,))
+    row = cur.fetchone()
 
-    has_code = _column_exists(conn, table, code_col)
-    has_name = _column_exists(conn, table, name_col)
+    if row:
+        current_name = _normalize_name(row[0] or "")
+        new_name = _normalize_name(name)
+        # Si llega un nombre no vacío y diferente, actualiza
+        if new_name and new_name != current_name:
+            cur.execute(f"UPDATE {table} SET nombre = %s WHERE codigo = %s", (new_name, code))
+            return "update_name"
+        return "noop"
 
-    codigo_raw = (codigo or "").strip()
-    nombre_raw = (nombre or "").strip()
-    codigo_norm = _norm_code_py(codigo_raw)
+    # Inserta aunque el nombre venga vacío → placeholder
+    final_name = _normalize_name(name) or f"{placeholder_prefix} {code}"
+    cur.execute(f"INSERT INTO {table} (codigo, nombre) VALUES (%s, %s)", (code, final_name))
+    return "insert"
 
-    if not has_code and not has_name:
-        return "skip_no_table"
 
-    if has_code and has_name:
-        if not codigo_norm:
-            if not nombre_raw:
-                return "skip_need_code_or_name"
-            # Si no hay código y la tabla lo requiere, evitamos insertar fila incompleta.
-            q_sel_by_name = sql.SQL("""
-                SELECT 1 FROM {tbl}
-                WHERE TRIM(COALESCE({name}::text,'')) = %s
-                LIMIT 1
-            """).format(tbl=sql.Identifier(table), name=sql.Identifier(name_col))
-            cur.execute(q_sel_by_name, (nombre_raw,))
-            return "noop" if cur.fetchone() else "skip_need_code_or_name"
+def ensure_seccion_cur(cur, codigo_raw: str, nombre_raw: str) -> str:
+    """
+    Garantiza que exista la fila en 'secciones' con el código normalizado.
+    Inserta con placeholder si el nombre viene vacío.
+    """
+    code = normalize_code(codigo_raw)
+    name = _normalize_name(nombre_raw)
+    return _upsert_row_cur(cur, "secciones", code, name, "Sección")
 
-        q_sel = sql.SQL("""
-            SELECT {name}
-            FROM {tbl}
-            WHERE REGEXP_REPLACE(TRIM({code}::text), '^0+', '') = %s
-            LIMIT 1
-        """).format(tbl=sql.Identifier(table),
-                    name=sql.Identifier(name_col),
-                    code=sql.Identifier(code_col))
-        cur.execute(q_sel, (codigo_norm,))
-        row = cur.fetchone()
-        if row:
-            current_name = (row[0] or "").strip()
-            if not current_name and nombre_raw:
-                q_upd = sql.SQL("""
-                    UPDATE {tbl}
-                    SET {name} = %s
-                    WHERE REGEXP_REPLACE(TRIM({code}::text), '^0+', '') = %s
-                """).format(tbl=sql.Identifier(table),
-                            name=sql.Identifier(name_col),
-                            code=sql.Identifier(code_col))
-                cur.execute(q_upd, (nombre_raw, codigo_norm))
-                return "update_name"
-            return "noop"
 
-        q_ins = sql.SQL("""
-            INSERT INTO {tbl} ({code}, {name})
-            VALUES (%s, %s)
-        """).format(tbl=sql.Identifier(table),
-                    code=sql.Identifier(code_col),
-                    name=sql.Identifier(name_col))
-        cur.execute(q_ins, (codigo_raw, (nombre_raw or None)))
-        return "insert"
-
-    if has_code and not has_name:
-        if not codigo_norm:
-            return "skip_need_code_or_name"
-        q_sel = sql.SQL("""
-            SELECT 1 FROM {tbl}
-            WHERE REGEXP_REPLACE(TRIM({code}::text), '^0+', '') = %s
-            LIMIT 1
-        """).format(tbl=sql.Identifier(table), code=sql.Identifier(code_col))
-        cur.execute(q_sel, (codigo_norm,))
-        if cur.fetchone():
-            return "noop"
-        q_ins = sql.SQL("""
-            INSERT INTO {tbl} ({code}) VALUES (%s)
-        """).format(tbl=sql.Identifier(table), code=sql.Identifier(code_col))
-        cur.execute(q_ins, (codigo_raw,))
-        return "insert"
-
-    if not has_code and has_name:
-        if not nombre_raw:
-            return "skip_need_code_or_name"
-        q_sel = sql.SQL("""
-            SELECT 1 FROM {tbl}
-            WHERE TRIM(COALESCE({name}::text,'')) = %s
-            LIMIT 1
-        """).format(tbl=sql.Identifier(table), name=sql.Identifier(name_col))
-        cur.execute(q_sel, (nombre_raw,))
-        if cur.fetchone():
-            return "noop"
-        q_ins = sql.SQL("""
-            INSERT INTO {tbl} ({name}) VALUES (%s)
-        """).format(tbl=sql.Identifier(table), name=sql.Identifier(name_col))
-        cur.execute(q_ins, (nombre_raw,))
-        return "insert"
-
-    return "noop"
-
-def ensure_departamento_cur(cur, codigo: Optional[str], nombre: Optional[str]) -> str:
-    return _ensure_lookup_cur(cur, DEP_TABLE_CANDIDATES, codigo, nombre)
-
-def ensure_seccion_cur(cur, codigo: Optional[str], nombre: Optional[str]) -> str:
-    return _ensure_lookup_cur(cur, SEC_TABLE_CANDIDATES, codigo, nombre)
-
-# Wrappers por si se quieren usar fuera de una transacción existente
-def ensure_departamento(codigo: Optional[str], nombre: Optional[str]) -> str:
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            action = ensure_departamento_cur(cur, codigo, nombre)
-        conn.commit()
-        return action
-
-def ensure_seccion(codigo: Optional[str], nombre: Optional[str]) -> str:
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            action = ensure_seccion_cur(cur, codigo, nombre)
-        conn.commit()
-        return action
-    
+def ensure_departamento_cur(cur, codigo_raw: str, nombre_raw: str) -> str:
+    """
+    Garantiza que exista la fila en 'departamentos' con el código normalizado.
+    Inserta con placeholder si el nombre viene vacío.
+    """
+    code = normalize_code(codigo_raw)
+    name = _normalize_name(nombre_raw)
+    return _upsert_row_cur(cur, "departamentos", code, name, "Dept.")
