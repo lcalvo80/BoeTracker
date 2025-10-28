@@ -7,8 +7,7 @@ import base64, gzip, json
 from psycopg2 import sql
 from app.services.postgres import get_db
 
-# catálogos
-from app.services.lookup import _table_exists as _lookup_table_exists
+# catálogos (NO importamos helpers privados)
 from app.services.lookup import (
     list_departamentos_lookup,
     list_secciones_lookup,
@@ -65,6 +64,22 @@ def _list_param(params: Dict[str, Any], *names: str) -> List[str]:
         if n in params and params[n] is not None:
             return _as_list(params[n])
     return []
+
+def _table_exists(conn, table: str) -> bool:
+    """Comprueba si existe la tabla (en schema public)."""
+    if not table:
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema='public' AND table_name=%s
+            LIMIT 1
+            """,
+            (table,),
+        )
+        return cur.fetchone() is not None
 
 def _col_exists(conn, table: str, col: str) -> bool:
     with conn.cursor() as cur:
@@ -124,7 +139,7 @@ def _parse_json_maybe(text: Optional[str]) -> Any:
 
 def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Igual que el antiguo get_filtered_items(params).
+    Igual que el antiguo get_filtered_items(params), robusto a columnas opcionales.
     """
     # paginación segura
     try:
@@ -163,32 +178,47 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     control_val = _norm(params.get("control"))
 
     with get_db() as conn:
-        has_titulo_resumen = _col_exists(conn, "items", "titulo_resumen")
-        has_titulo_corto = _col_exists(conn, "items", "titulo_corto")
-        has_titulo_completo = _col_exists(conn, "items", "titulo_completo")
-        has_created_at_date = _col_exists(conn, "items", "created_at_date")
-        has_created_at = _col_exists(conn, "items", "created_at")
-        has_control = _col_exists(conn, "items", "control")
-        has_contenido = _col_exists(conn, "items", "contenido")
-        has_resumen = _col_exists(conn, "items", "resumen")
-        has_titulo = _col_exists(conn, "items", "titulo")
-        has_likes = _col_exists(conn, "items", "likes")
-        has_dislikes = _col_exists(conn, "items", "dislikes")
-        has_informe_imp = _col_exists(conn, "items", "informe_impacto")
-        has_impacto = _col_exists(conn, "items", "impacto")
+        # columnas presentes
+        has_titulo_resumen   = _col_exists(conn, "items", "titulo_resumen")
+        has_titulo_corto     = _col_exists(conn, "items", "titulo_corto")
+        has_titulo_completo  = _col_exists(conn, "items", "titulo_completo")
+        has_created_at       = _col_exists(conn, "items", "created_at")
+        has_created_at_date  = _col_exists(conn, "items", "created_at_date")
+        has_control          = _col_exists(conn, "items", "control")
+        has_contenido        = _col_exists(conn, "items", "contenido")
+        has_resumen          = _col_exists(conn, "items", "resumen")
+        has_titulo           = _col_exists(conn, "items", "titulo")
+        has_likes            = _col_exists(conn, "items", "likes")
+        has_dislikes         = _col_exists(conn, "items", "dislikes")
+        has_informe_imp      = _col_exists(conn, "items", "informe_impacto")
+        has_impacto          = _col_exists(conn, "items", "impacto")
 
         # WHERE
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        date_expr = sql.SQL("DATE(i.created_at)") if has_created_at else sql.SQL("DATE(i.created_at_date)")
-        if fecha_eq:
-            where_sql_parts.append(sql.SQL("{} = %s").format(date_expr)); args.append(fecha_eq)
+        # date expr consistente en WHERE/ORDER/SELECT
+        if has_created_at:
+            date_expr = sql.SQL("DATE(i.created_at)")
+            created_expr = sql.SQL("i.created_at AS created_at")
+            created_order_col = sql.SQL("i.created_at")
+        elif has_created_at_date:
+            date_expr = sql.SQL("DATE(i.created_at_date)")
+            created_expr = sql.SQL("i.created_at_date AS created_at")
+            created_order_col = sql.SQL("i.created_at_date")
         else:
-            if fecha_desde:
-                where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr)); args.append(fecha_desde)
-            if fecha_hasta:
-                where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr)); args.append(fecha_hasta)
+            date_expr = None
+            created_expr = sql.SQL("NULL AS created_at")
+            created_order_col = sql.SQL("i.id")
+
+        if date_expr is not None:
+            if fecha_eq:
+                where_sql_parts.append(sql.SQL("{} = %s").format(date_expr)); args.append(fecha_eq)
+            else:
+                if fecha_desde:
+                    where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr)); args.append(fecha_desde)
+                if fecha_hasta:
+                    where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr)); args.append(fecha_hasta)
 
         def _in_clause(col_name: str, values: Sequence[str]) -> Optional[Tuple[sql.SQL, List[str]]]:
             if not values:
@@ -230,8 +260,9 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
                     text_clauses.append(sql.SQL("i.resumen ILIKE %s")); args.append(like_val)
                 if has_contenido:
                     text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
-                if _col_exists(conn, "items", "informe_impacto"):
-                    text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s")); args.append(like_val)
+                if has_informe_imp or has_impacto:
+                    text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s" if has_informe_imp else "CAST(i.impacto AS TEXT) ILIKE %s"))
+                    args.append(like_val)
                 if text_clauses:
                     where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
 
@@ -254,14 +285,11 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.titulo_corto") if has_titulo_corto else sql.SQL("NULL AS titulo_corto"),
             sql.SQL("i.titulo_completo") if has_titulo_completo else sql.SQL("NULL AS titulo_completo"),
             sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
-            sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
-                else (sql.SQL("i.impacto") if has_impacto else sql.SQL("NULL AS impacto")),
+            (sql.SQL("i.informe_impacto AS impacto") if has_informe_imp else (sql.SQL("i.impacto AS impacto") if has_impacto else sql.SQL("NULL AS impacto"))),
             sql.SQL("i.departamento_codigo"),
             sql.SQL("i.seccion_codigo"),
             sql.SQL("i.epigrafe"),
-            sql.SQL("i.created_at") if _col_exists(conn, "items", "created_at") else (
-                sql.SQL("i.created_at_date AS created_at") if _col_exists(conn, "items", "created_at_date") else sql.SQL("NULL AS created_at")
-            ),
+            created_expr,
             sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
             sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
             sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
@@ -270,11 +298,11 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
-            if _lookup_table_exists(conn, t):
+            if _table_exists(conn, t):
                 dep_table = t; break
         sec_table = None
         for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
-            if _lookup_table_exists(conn, t):
+            if _table_exists(conn, t):
                 sec_table = t; break
 
         if dep_table:
@@ -296,7 +324,10 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
             order_clause = order_by_sql + sort_dir_sql
         else:
-            sort_by_sql = sql.SQL("i.created_at") if sort_by == "created_at" else sql.SQL("i." + sort_by)
+            if sort_by == "created_at":
+                sort_by_sql = created_order_col
+            else:
+                sort_by_sql = sql.SQL("i." + sort_by)
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
             order_clause = sort_by_sql + sql.SQL(" ") + sort_dir_sql
             order_params = []
@@ -370,11 +401,11 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
 
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
-            if _lookup_table_exists(conn, t):
+            if _table_exists(conn, t):
                 dep_table = t; break
         sec_table = None
         for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
-            if _lookup_table_exists(conn, t):
+            if _table_exists(conn, t):
                 sec_table = t; break
 
         sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
