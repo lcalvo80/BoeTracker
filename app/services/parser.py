@@ -1,4 +1,6 @@
 # app/services/parser.py
+from __future__ import annotations
+
 import logging
 from datetime import datetime, date
 from typing import Optional
@@ -37,43 +39,50 @@ def safe_date(text: str) -> Optional[date]:
         return None
 
 def _emptyish(x) -> bool:
-    """True si x es vacío/irrelevante (None, '', {}, [])."""
     if x is None:
         return True
     if isinstance(x, str):
-        return len(x.strip()) == 0 or x.strip() in ("{}", "[]")
+        s = x.strip()
+        return len(s) == 0 or s in ("{}", "[]")
     if isinstance(x, (list, dict)):
         return len(x) == 0
     return False
 
 def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
     """
-    Intenta construir un 'cuerpo' con contenido útil para OpenAI.
-    Busca varias etiquetas habituales y añade metadatos (sección/departamento/epígrafe/control).
+    Construye un cuerpo útil para OpenAI: posibles campos de texto + metadatos.
     """
     candidates = []
 
-    # campos típicos de contenido en feeds XML (ponemos varias por si cambia el proveedor)
-    for tag in ("contenido", "texto", "sumario", "extracto", "resumen", "descripcion", "descripción", "cuerpo"):
+    # Campos comunes en el XML del BOE (cubrimos varias denominaciones)
+    preferred_tags = (
+        "contenido",
+        "texto",
+        "sumario",
+        "extracto",
+        "resumen",
+        "descripcion",
+        "descripción",
+        "cuerpo",
+        "detalle",
+    )
+    for tag in preferred_tags:
         val = item.findtext(tag)
         if val and val.strip():
             candidates.append(val.strip())
 
-    # metadatos que ayudan a contextualizar
+    # Metadatos
     meta_parts = [
         (seccion.get("nombre", "").strip() if seccion is not None else ""),
         (dept.get("nombre", "").strip() if dept is not None else ""),
         (epigrafe.get("nombre", "").strip() if epigrafe is not None else ""),
-        item.findtext("control", "").strip(),
+        (item.findtext("control", "") or "").strip(),
     ]
     meta = " | ".join([m for m in meta_parts if m])
     if meta:
         candidates.append(meta)
 
-    # construir texto final
     text = "\n\n".join([c for c in candidates if c]).strip()
-
-    # si sigue vacío, devolvemos cadena vacía (el caller decidirá fallback al título)
     return text
 
 # ------------------------------ pipeline ------------------------------
@@ -93,19 +102,16 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         counters["omitidos_existentes"] += 1
         return
 
-    # ---- construir texto fuente para OpenAI (NO usar titulo como 'texto')
     cuerpo = _compose_text(item, seccion, dept, epigrafe)
     if _emptyish(cuerpo):
-        # último recurso: al menos incluye el título y algo de metadatos
         meta = " | ".join(filter(None, [
             seccion.get("nombre", "") if seccion is not None else "",
             dept.get("nombre", "") if dept is not None else "",
             epigrafe.get("nombre", "") if epigrafe is not None else "",
-            item.findtext("control", "").strip(),
+            (item.findtext("control", "") or "").strip(),
         ]))
         cuerpo = (titulo + ("\n\n" + meta if meta else "")).strip()
 
-    # ---- pedir a OpenAI con (titulo, cuerpo)
     try:
         titulo_resumen, resumen_json, impacto_json = get_openai_responses(titulo, cuerpo)
     except Exception as e:
@@ -113,7 +119,6 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         counters["fallos_openai"] += 1
         return
 
-    # normalizar vacíos: no guardamos {} / [] / "" -> NULL
     resumen_comp = None if _emptyish(resumen_json) else compress_json(resumen_json)
     impacto_comp = None if _emptyish(impacto_json) else compress_json(impacto_json)
 
@@ -123,8 +128,6 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         logger.debug(f"ℹ️  Impacto vacío para {identificador} (no se guarda).")
 
     fecha_publicacion = safe_date((item.findtext("fecha_publicacion", "") or "").strip())
-
-    # título corto: si OpenAI devuelve vacío, usamos el título normal
     titulo_resumen_final = (titulo_resumen or "").strip().rstrip(".") or titulo
 
     cur.execute(
@@ -165,7 +168,6 @@ def parse_and_insert(root: ET.Element) -> int:
         "omitidos_vacios": 0,
         "fallos_openai": 0,
         "huerfanos_en_seccion": 0,
-        # contadores de lookup (secciones/departamentos)
         "lookup_sec_insert": 0,
         "lookup_sec_update": 0,
         "lookup_dep_insert": 0,
@@ -173,45 +175,39 @@ def parse_and_insert(root: ET.Element) -> int:
     }
 
     with get_db() as conn:
-        cur = conn.cursor()
+        with conn.cursor() as cur:
+            for seccion in root.findall(".//seccion"):
+                # Lookup seccion
+                sec_codigo = (seccion.get("codigo", "") or "").strip()
+                sec_nombre = (seccion.get("nombre", "") or "").strip()
+                act_sec = ensure_seccion_cur(cur, sec_codigo, sec_nombre)
+                if act_sec == "insert":
+                    counters["lookup_sec_insert"] += 1
+                elif act_sec == "update_name":
+                    counters["lookup_sec_update"] += 1
 
-        for seccion in root.findall(".//seccion"):
-            # Asegurar SECCIÓN en tabla de lookup
-            sec_codigo = (seccion.get("codigo", "") or "").strip()
-            sec_nombre = (seccion.get("nombre", "") or "").strip()
-            act_sec = ensure_seccion_cur(cur, sec_codigo, sec_nombre)
-            if act_sec == "insert":
-                counters["lookup_sec_insert"] += 1
-            elif act_sec == "update_name":
-                counters["lookup_sec_update"] += 1
+                clase_item = clasificar_item(sec_nombre)
 
-            clase_item = clasificar_item(sec_nombre)
+                for dept in seccion.findall("departamento"):
+                    # Lookup dept
+                    dep_codigo = (dept.get("codigo", "") or "").strip()
+                    dep_nombre = (dept.get("nombre", "") or "").strip()
+                    act_dep = ensure_departamento_cur(cur, dep_codigo, dep_nombre)
+                    if act_dep == "insert":
+                        counters["lookup_dep_insert"] += 1
+                    elif act_dep == "update_name":
+                        counters["lookup_dep_update"] += 1
 
-            for dept in seccion.findall("departamento"):
-                # Asegurar DEPARTAMENTO en tabla de lookup
-                dep_codigo = (dept.get("codigo", "") or "").strip()
-                dep_nombre = (dept.get("nombre", "") or "").strip()
-                act_dep = ensure_departamento_cur(cur, dep_codigo, dep_nombre)
-                if act_dep == "insert":
-                    counters["lookup_dep_insert"] += 1
-                elif act_dep == "update_name":
-                    counters["lookup_dep_update"] += 1
+                    for epigrafe in dept.findall("epigrafe"):
+                        for item in epigrafe.findall("item"):
+                            procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters)
 
-                # Items agrupados por epígrafe
-                for epigrafe in dept.findall("epigrafe"):
-                    for item in epigrafe.findall("item"):
-                        procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters)
+                    for item in dept.findall("item"):
+                        procesar_item(cur, item, seccion, dept, None, clase_item, counters)
 
-                # Items colgados directamente del departamento
-                for item in dept.findall("item"):
-                    procesar_item(cur, item, seccion, dept, None, clase_item, counters)
-
-            # Items huérfanos colgados de sección
-            for item in seccion.findall("item"):
-                procesar_item(cur, item, seccion, None, None, clase_item, counters)
-                counters["huerfanos_en_seccion"] += 1
-
-        conn.commit()
+                for item in seccion.findall("item"):
+                    procesar_item(cur, item, seccion, None, None, clase_item, counters)
+                    counters["huerfanos_en_seccion"] += 1
 
     logger.info("📊 RESUMEN FINAL:")
     for k, v in counters.items():
