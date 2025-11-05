@@ -40,7 +40,7 @@ jobs:
 
     env:
       # ⚠️ En CI usamos el Postgres del servicio (localhost) para no tocar producción
-      DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
       FROM_DATE: ${{ github.event.inputs.from_date }}
