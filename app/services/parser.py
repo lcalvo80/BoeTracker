@@ -12,68 +12,78 @@ from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
 
-# Import “normal” con fallback defensivo para evitar ImportError en CI
+# ───────────────────── Import robusto del lookup ─────────────────────
+# Cargamos el MÓDULO y luego tomamos símbolos con getattr; si faltan, definimos fallbacks.
 try:
-    from app.services.lookup import ensure_seccion_cur, ensure_departamento_cur, normalize_code  # type: ignore
+    import app.services.lookup as _lookup_mod  # type: ignore
 except Exception:
-    # ───────── Fallback seguro: define normalize_code / ensures mínimos ─────────
-    def normalize_code(code: str) -> str:
-        s = "" if code is None else str(code).strip()
-        s = re.sub(r"^0+", "", s)
-        return s or "0"
+    _lookup_mod = None  # type: ignore
 
-    def _ensure_lookup_table_cur(cur, table: str):
-        schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
+def _fallback_normalize_code(code: str) -> str:
+    s = "" if code is None else str(code).strip()
+    # Quitamos ceros a la izquierda para unificar (0310 -> 310)
+    s = re.sub(r"^0+", "", s)
+    return s or "0"
+
+def _fallback_ensure_lookup_table_cur(cur, table: str):
+    schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
+    cur.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {schema}.{table} (
+                codigo TEXT PRIMARY KEY,
+                nombre TEXT
+            );
+            """
+        ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl))
+    )
+
+def _fallback_generic_cur(cur, table: str, codigo: str, nombre: str) -> str:
+    _fallback_ensure_lookup_table_cur(cur, table)
+    code_norm = _fallback_normalize_code(codigo)
+    name_norm = (nombre or "").strip()
+    schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
+
+    cur.execute(
+        sql.SQL("SELECT nombre FROM {schema}.{table} WHERE codigo = %s").format(
+            schema=sql.Identifier(schema), table=sql.Identifier(tbl)
+        ),
+        (code_norm,),
+    )
+    row = cur.fetchone()
+    if not row:
         cur.execute(
             sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {schema}.{table} (
-                    codigo TEXT PRIMARY KEY,
-                    nombre TEXT
-                );
-                """
-            ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl))
+                "INSERT INTO {schema}.{table} (codigo, nombre) VALUES (%s, %s) "
+                "ON CONFLICT (codigo) DO NOTHING"
+            ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl)),
+            (code_norm, name_norm),
         )
+        return "insert"
 
-    def _ensure_generic_cur(cur, table: str, codigo: str, nombre: str) -> str:
-        _ensure_lookup_table_cur(cur, table)
-        code_norm = normalize_code(codigo)
-        name_norm = (nombre or "").strip()
-        schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
-
+    current = (row[0] or "").strip()
+    if name_norm and name_norm != current:
         cur.execute(
-            sql.SQL("SELECT nombre FROM {schema}.{table} WHERE codigo = %s").format(
+            sql.SQL("UPDATE {schema}.{table} SET nombre = %s WHERE codigo = %s").format(
                 schema=sql.Identifier(schema), table=sql.Identifier(tbl)
             ),
-            (code_norm,),
+            (name_norm, code_norm),
         )
-        row = cur.fetchone()
-        if not row:
-            cur.execute(
-                sql.SQL(
-                    "INSERT INTO {schema}.{table} (codigo, nombre) VALUES (%s, %s) "
-                    "ON CONFLICT (codigo) DO NOTHING"
-                ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl)),
-                (code_norm, name_norm),
-            )
-            return "insert"
+        return "update_name"
+    return "noop"
 
-        current = (row[0] or "").strip()
-        if name_norm and name_norm != current:
-            cur.execute(
-                sql.SQL("UPDATE {schema}.{table} SET nombre = %s WHERE codigo = %s").format(
-                    schema=sql.Identifier(schema), table=sql.Identifier(tbl)
-                ),
-                (name_norm, code_norm),
-            )
-            return "update_name"
-        return "noop"
+# Símbolos a usar en el parser (o fallbacks)
+normalize_code = getattr(_lookup_mod, "normalize_code", _fallback_normalize_code)
 
-    def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
-        return _ensure_generic_cur(cur, "public.secciones_lookup", codigo, nombre)
+def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
+    fn = getattr(_lookup_mod, "ensure_seccion_cur", None)
+    return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.secciones_lookup", codigo, nombre)
 
-    def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
-        return _ensure_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
+def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
+    fn = getattr(_lookup_mod, "ensure_departamento_cur", None)
+    return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
+
+# ───────────────────── Lógica de parseo ─────────────────────
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +142,8 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     identificador = (item.findtext("identificador", "") or "").strip()
     titulo = (item.findtext("titulo", "") or "").strip()
+
+    # ✅ FIX SyntaxError
     if not identificador or not titulo:
         logger.warning("❗ Ítem omitido por identificador o título vacío.")
         counters["omitidos_vacios"] += 1
@@ -143,7 +155,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         counters["omitidos_existentes"] += 1
         return
 
-    # Normaliza a 4 dígitos y asegura lookups (inserta si no existen)
+    # Normaliza códigos y asegura lookups (inserta/actualiza si no existen)
     sec_codigo_norm = normalize_code(seccion.get("codigo", "") if seccion else "")
     dep_codigo_norm = normalize_code(dept.get("codigo", "") if dept else "")
 
@@ -204,9 +216,9 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             (item.findtext("url_xml", "") or "").strip(),
             sec_codigo_norm if seccion else "",
             dep_codigo_norm if dept else "",
-            epigrafe.get("nombre", "") if epigrafe else "",
+            (epigrafe.get("nombre", "") if epigrafe else "").strip(),
             (item.findtext("control", "") or "").strip(),
-            fecha_publicacion,
+            fecha_publicacion,  # psycopg2 acepta date o None
             clase_item,
         ),
     )
@@ -243,6 +255,9 @@ def parse_and_insert(root: ET.Element) -> int:
                 for item in seccion.findall("item"):
                     procesar_item(cur, item, seccion, None, None, clase_item, counters)
                     counters["huerfanos_en_seccion"] += 1
+
+        # Aseguramos persistencia de todo el batch
+        conn.commit()
 
     logger.info("📊 RESUMEN FINAL:")
     for k, v in counters.items():
