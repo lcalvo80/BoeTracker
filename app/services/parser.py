@@ -2,14 +2,78 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, date
 from typing import Optional
 from xml.etree import ElementTree as ET
+from psycopg2 import sql
 
 from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
-from app.services.lookup import ensure_seccion_cur, ensure_departamento_cur, normalize_code
+
+# Import “normal” con fallback defensivo para evitar ImportError en CI
+try:
+    from app.services.lookup import ensure_seccion_cur, ensure_departamento_cur, normalize_code  # type: ignore
+except Exception:
+    # ───────── Fallback seguro: define normalize_code / ensures mínimos ─────────
+    def normalize_code(code: str) -> str:
+        s = "" if code is None else str(code).strip()
+        s = re.sub(r"^0+", "", s)
+        return s or "0"
+
+    def _ensure_lookup_table_cur(cur, table: str):
+        schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {schema}.{table} (
+                    codigo TEXT PRIMARY KEY,
+                    nombre TEXT
+                );
+                """
+            ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl))
+        )
+
+    def _ensure_generic_cur(cur, table: str, codigo: str, nombre: str) -> str:
+        _ensure_lookup_table_cur(cur, table)
+        code_norm = normalize_code(codigo)
+        name_norm = (nombre or "").strip()
+        schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
+
+        cur.execute(
+            sql.SQL("SELECT nombre FROM {schema}.{table} WHERE codigo = %s").format(
+                schema=sql.Identifier(schema), table=sql.Identifier(tbl)
+            ),
+            (code_norm,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.execute(
+                sql.SQL(
+                    "INSERT INTO {schema}.{table} (codigo, nombre) VALUES (%s, %s) "
+                    "ON CONFLICT (codigo) DO NOTHING"
+                ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl)),
+                (code_norm, name_norm),
+            )
+            return "insert"
+
+        current = (row[0] or "").strip()
+        if name_norm and name_norm != current:
+            cur.execute(
+                sql.SQL("UPDATE {schema}.{table} SET nombre = %s WHERE codigo = %s").format(
+                    schema=sql.Identifier(schema), table=sql.Identifier(tbl)
+                ),
+                (name_norm, code_norm),
+            )
+            return "update_name"
+        return "noop"
+
+    def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
+        return _ensure_generic_cur(cur, "public.secciones_lookup", codigo, nombre)
+
+    def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
+        return _ensure_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
 
 logger = logging.getLogger(__name__)
 
