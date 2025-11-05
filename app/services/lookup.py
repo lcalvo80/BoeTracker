@@ -1,353 +1,259 @@
-# app/services/lookup.py
+# app/services/parser.py
 from __future__ import annotations
 
-from typing import List, Dict, Tuple, Optional, Iterable
 import logging
 import re
+from datetime import datetime, date
+from typing import Optional
+from xml.etree import ElementTree as ET
 from psycopg2 import sql
+
+from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
+from app.utils.compression import compress_json
 
-__all__ = [
-    "normalize_code",
-    "ensure_seccion_cur",
-    "ensure_departamento_cur",
-    "list_departamentos_lookup",
-    "list_secciones_lookup",
-]
+# ───────────────────── Import robusto del lookup ─────────────────────
+# Cargamos el MÓDULO y luego tomamos símbolos con getattr; si faltan, definimos fallbacks.
+try:
+    import app.services.lookup as _lookup_mod  # type: ignore
+except Exception:
+    _lookup_mod = None  # type: ignore
 
-# ───────────────────────── Helpers internos ─────────────────────────
-
-def _split_schema_and_table(name: str) -> Tuple[str, str]:
-    """Devuelve (schema, table) con schema='public' por defecto."""
-    if "." in name:
-        schema, table = name.split(".", 1)
-        return schema, table
-    return "public", name
-
-def _table_exists(table_name: str) -> bool:
-    """Comprueba existencia de tabla (admite schema.table)."""
-    schema, table = _split_schema_and_table(table_name)
-    with get_db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_name = %s
-            LIMIT 1
-            """,
-            (schema, table),
-        )
-        return cur.fetchone() is not None
-
-def _list_columns(table_name: str) -> List[str]:
-    """Lista columnas de una tabla (admite schema.table)."""
-    schema, table = _split_schema_and_table(table_name)
-    with get_db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            """,
-            (schema, table),
-        )
-        return [r[0] for r in cur.fetchall()]
-
-def _first_present(candidates: Iterable[str], haystack: Iterable[str]) -> Optional[str]:
-    s = {c.lower() for c in haystack}
-    for c in candidates:
-        if c.lower() in s:
-            return c
-    return None
-
-def _norm_code_expr(identifier: sql.Identifier) -> sql.SQL:
-    """
-    Expr SQL que normaliza códigos:
-      - castea a texto
-      - quita ceros a la izquierda
-      - si queda vacío → '0'
-    """
-    return sql.SQL(
-        "COALESCE(NULLIF(REGEXP_REPLACE({col}::text, '^0+', ''), ''), '0')"
-    ).format(col=identifier)
-
-# ─────────────────────── Normalización y upserts de lookups ───────────────────────
-
-def normalize_code(code: str) -> str:
-    """
-    Normaliza códigos tipo '0310' -> '310'.
-    Si queda vacío o None -> '0'.
-    """
+def _fallback_normalize_code(code: str) -> str:
     s = "" if code is None else str(code).strip()
-    s = re.sub(r"^0+", "", s)  # quitar ceros a la izquierda
+    s = re.sub(r"^0+", "", s)
     return s or "0"
 
-def _ensure_lookup_table_cur(cur, table: str, code_col: str = "codigo", name_col: str = "nombre") -> None:
-    """
-    Garantiza que exista la tabla de lookups con PK en 'codigo'.
-    Usa el cursor proporcionado (misma transacción que el caller).
-    """
-    schema, tbl = _split_schema_and_table(table)
-    q = sql.SQL(
-        """
-        CREATE TABLE IF NOT EXISTS {schema}.{table} (
-            {code_col} TEXT PRIMARY KEY,
-            {name_col} TEXT
-        );
-        """
-    ).format(
-        schema=sql.Identifier(schema),
-        table=sql.Identifier(tbl),
-        code_col=sql.Identifier(code_col),
-        name_col=sql.Identifier(name_col),
+def _fallback_ensure_lookup_table_cur(cur, table: str):
+    schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
+    cur.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {schema}.{table} (
+                codigo TEXT PRIMARY KEY,
+                nombre TEXT
+            );
+            """
+        ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl))
     )
-    cur.execute(q)
 
-def _ensure_lookup_cur(
-    cur,
-    table: str,
-    code: str,
-    name: str,
-    code_col: str = "codigo",
-    name_col: str = "nombre",
-) -> str:
-    """
-    Upsert de un par (codigo, nombre) en la tabla de catálogo indicada.
-    Devuelve:
-      - "insert" si ha insertado
-      - "update_name" si ha actualizado el nombre
-      - "noop" si no ha hecho cambios
-    """
-    code_norm = normalize_code(code)
-    name_norm = (name or "").strip()
+def _fallback_generic_cur(cur, table: str, codigo: str, nombre: str) -> str:
+    _fallback_ensure_lookup_table_cur(cur, table)
+    code_norm = _fallback_normalize_code(codigo)
+    name_norm = (nombre or "").strip()
+    schema, tbl = ("public", table.split(".", 1)[1]) if "." in table else ("public", table)
 
-    _ensure_lookup_table_cur(cur, table, code_col=code_col, name_col=name_col)
-
-    # SELECT nombre actual
-    schema, tbl = _split_schema_and_table(table)
-    q_sel = sql.SQL("SELECT {name_col} FROM {schema}.{table} WHERE {code_col} = %s").format(
-        name_col=sql.Identifier(name_col),
-        schema=sql.Identifier(schema),
-        table=sql.Identifier(tbl),
-        code_col=sql.Identifier(code_col),
+    cur.execute(
+        sql.SQL("SELECT nombre FROM {schema}.{table} WHERE codigo = %s").format(
+            schema=sql.Identifier(schema), table=sql.Identifier(tbl)
+        ),
+        (code_norm,),
     )
-    cur.execute(q_sel, (code_norm,))
     row = cur.fetchone()
     if not row:
-        # INSERT ON CONFLICT DO NOTHING (si ya existiera por carrera)
-        q_ins = sql.SQL(
-            "INSERT INTO {schema}.{table} ({code_col}, {name_col}) VALUES (%s, %s) "
-            "ON CONFLICT ({code_col}) DO NOTHING"
-        ).format(
-            schema=sql.Identifier(schema),
-            table=sql.Identifier(tbl),
-            code_col=sql.Identifier(code_col),
-            name_col=sql.Identifier(name_col),
+        cur.execute(
+            sql.SQL(
+                "INSERT INTO {schema}.{table} (codigo, nombre) VALUES (%s, %s) "
+                "ON CONFLICT (codigo) DO NOTHING"
+            ).format(schema=sql.Identifier(schema), table=sql.Identifier(tbl)),
+            (code_norm, name_norm),
         )
-        cur.execute(q_ins, (code_norm, name_norm))
         return "insert"
 
-    current_name = (row[0] or "").strip()
-    if name_norm and name_norm != current_name:
-        q_upd = sql.SQL(
-            "UPDATE {schema}.{table} SET {name_col} = %s WHERE {code_col} = %s"
-        ).format(
-            schema=sql.Identifier(schema),
-            table=sql.Identifier(tbl),
-            name_col=sql.Identifier(name_col),
-            code_col=sql.Identifier(code_col),
+    current = (row[0] or "").strip()
+    if name_norm and name_norm != current:
+        cur.execute(
+            sql.SQL("UPDATE {schema}.{table} SET nombre = %s WHERE codigo = %s").format(
+                schema=sql.Identifier(schema), table=sql.Identifier(tbl)
+            ),
+            (name_norm, code_norm),
         )
-        cur.execute(q_upd, (name_norm, code_norm))
         return "update_name"
-
     return "noop"
 
+# Símbolos a usar en el parser (o fallbacks)
+normalize_code = getattr(_lookup_mod, "normalize_code", _fallback_normalize_code)
 def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
-    """
-    Asegura la presencia de la sección en 'public.secciones_lookup'.
-    Retorna: 'insert' | 'update_name' | 'noop'
-    """
-    return _ensure_lookup_cur(
-        cur,
-        table="public.secciones_lookup",
-        code=codigo,
-        name=nombre,
-        code_col="codigo",
-        name_col="nombre",
-    )
+    fn = getattr(_lookup_mod, "ensure_seccion_cur", None)
+    return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.secciones_lookup", codigo, nombre)
 
 def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
-    """
-    Asegura la presencia del departamento en 'public.departamentos_lookup'.
-    Retorna: 'insert' | 'update_name' | 'noop'
-    """
-    return _ensure_lookup_cur(
-        cur,
-        table="public.departamentos_lookup",
-        code=codigo,
-        name=nombre,
-        code_col="codigo",
-        name_col="nombre",
-    )
+    fn = getattr(_lookup_mod, "ensure_departamento_cur", None)
+    return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
 
-# ─────────────────────── Selectores genéricos para filtros ───────────────────────
+# ───────────────────── Lógica de parseo ─────────────────────
 
-def _select_lookup_generic(
-    table_name: str,
-    code_candidates: List[str],
-    name_candidates: List[str],
-) -> List[Dict[str, str]]:
-    """
-    Selecciona pares {value, label} desde una tabla de catálogo flexible.
-    """
-    schema, table = _split_schema_and_table(table_name)
-    cols = _list_columns(table_name)
-    code_col = _first_present(code_candidates, cols)
-    name_col = _first_present(name_candidates, cols)
+logger = logging.getLogger(__name__)
 
-    if not code_col:
-        raise RuntimeError(f"No se encontró columna de código en {table_name}. Cols: {cols}")
-    if not name_col:
-        # A falta de nombre, usamos el propio código como label
-        name_col = code_col
+def clasificar_item(nombre_seccion: str) -> str:
+    nombre = (nombre_seccion or "").lower()
+    if "anuncio" in nombre:
+        return "Anuncio"
+    elif "disposición" in nombre or "disposicion" in nombre or "otras disposiciones" in nombre:
+        return "Disposición"
+    elif "notificación" in nombre or "notificacion" in nombre:
+        return "Notificación"
+    elif "edicto" in nombre or "judicial" in nombre:
+        return "Edicto judicial"
+    elif "personal" in nombre or "nombramiento" in nombre or "concurso" in nombre:
+        return "Personal"
+    elif "otros" in nombre:
+        return "Otros anuncios"
+    else:
+        return "Disposición"
 
-    with get_db() as conn, conn.cursor() as cur:
-        val_expr = _norm_code_expr(sql.Identifier(code_col))
-        q = sql.SQL(
-            """
-            SELECT {val_expr} AS value, {label}::text AS label
-            FROM {schema}.{table}
-            WHERE {code} IS NOT NULL
-            GROUP BY value, label
-            ORDER BY label ASC
-            """
-        ).format(
-            val_expr=val_expr,
-            label=sql.Identifier(name_col),
-            schema=sql.Identifier(schema),
-            table=sql.Identifier(table),
-            code=sql.Identifier(code_col),
+def safe_date(text: str) -> Optional[date]:
+    try:
+        return datetime.strptime(text.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def _emptyish(x) -> bool:
+    if x is None:
+        return True
+    if isinstance(x, str):
+        s = x.strip()
+        return len(s) == 0 or s in ("{}", "[]")
+    if isinstance(x, (list, dict)):
+        return len(x) == 0
+    return False
+
+def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
+    candidates = []
+    for tag in ("contenido","texto","sumario","extracto","resumen","descripcion","descripción","cuerpo","detalle"):
+        val = item.findtext(tag)
+        if val and val.strip():
+            candidates.append(val.strip())
+
+    meta_parts = [
+        (seccion.get("nombre", "").strip() if seccion is not None else ""),
+        (dept.get("nombre", "").strip() if dept is not None else ""),
+        (epigrafe.get("nombre", "").strip() if epigrafe is not None else ""),
+        (item.findtext("control", "") or "").strip(),
+    ]
+    meta = " | ".join([m for m in meta_parts if m])
+    if meta:
+        candidates.append(meta)
+
+    return "\n\n".join([c for c in candidates if c]).strip()
+
+def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
+    identificador = (item.findtext("identificador", "") or "").strip()
+    titulo = (item.findtext("titulo", "") or "").strip()
+    if not identificador o r not titulo:
+        logger.warning("❗ Ítem omitido por identificador o título vacío.")
+        counters["omitidos_vacios"] += 1
+        return
+
+    cur.execute("SELECT 1 FROM items WHERE identificador = %s", (identificador,))
+    if cur.fetchone():
+        logger.info(f"⏭️  Ya procesado: {identificador}")
+        counters["omitidos_existentes"] += 1
+        return
+
+    # Normaliza a 4 dígitos y asegura lookups (inserta si no existen)
+    sec_codigo_norm = normalize_code(seccion.get("codigo", "") if seccion else "")
+    dep_codigo_norm = normalize_code(dept.get("codigo", "") if dept else "")
+
+    if seccion is not None:
+        sec_nombre = (seccion.get("nombre", "") or "").strip()
+        act_sec = ensure_seccion_cur(cur, sec_codigo_norm, sec_nombre)
+        if act_sec == "insert": counters["lookup_sec_insert"] += 1
+        elif act_sec == "update_name": counters["lookup_sec_update"] += 1
+
+    if dept is not None:
+        dep_nombre = (dept.get("nombre", "") or "").strip()
+        act_dep = ensure_departamento_cur(cur, dep_codigo_norm, dep_nombre)
+        if act_dep == "insert": counters["lookup_dep_insert"] += 1
+        elif act_dep == "update_name": counters["lookup_dep_update"] += 1
+
+    cuerpo = _compose_text(item, seccion, dept, epigrafe)
+    if _emptyish(cuerpo):
+        meta = " | ".join(filter(None, [
+            seccion.get("nombre", "") if seccion is not None else "",
+            dept.get("nombre", "") if dept is not None else "",
+            epigrafe.get("nombre", "") if epigrafe is not None else "",
+            (item.findtext("control", "") or "").strip(),
+        ]))
+        cuerpo = (titulo + ("\n\n" + meta if meta else "")).strip()
+
+    try:
+        titulo_resumen, resumen_json, impacto_json = get_openai_responses(titulo, cuerpo)
+    except Exception as e:
+        logger.error(f"❌ OpenAI error en '{identificador}': {e}")
+        counters["fallos_openai"] += 1
+        return
+
+    resumen_comp = None if _emptyish(resumen_json) else compress_json(resumen_json)
+    impacto_comp = None if _emptyish(impacto_json) else compress_json(impacto_json)
+
+    fecha_publicacion = safe_date((item.findtext("fecha_publicacion", "") or "").strip())
+    titulo_resumen_final = (titulo_resumen or "").strip().rstrip(".") or titulo
+
+    cur.execute(
+        """
+        INSERT INTO items (
+            identificador, titulo, titulo_resumen, resumen, informe_impacto,
+            url_pdf, url_html, url_xml,
+            seccion_codigo, departamento_codigo,
+            epigrafe, control, fecha_publicacion, clase_item
         )
-        cur.execute(q)
-        rows = cur.fetchall()
-        return [{"value": r[0], "label": r[1] or r[0]} for r in rows]
-
-def _fallback_from_items(
-    # Fallback para cuando no hay tablas de catálogo:
-    # intenta deducir {value, label} desde la tabla items.
-    code_candidates: List[str],
-    name_candidates: List[str],
-) -> List[Dict[str, str]]:
-    if not _table_exists("items"):
-        logging.warning("Fallback desde items imposible: no existe tabla 'items'")
-        return []
-
-    cols = _list_columns("items")
-    code_col = _first_present(code_candidates, cols)
-    name_col = _first_present(name_candidates, cols)
-
-    if not code_col and not name_col:
-        logging.warning("No hay columnas compatibles en items para fallback")
-        return []
-
-    schema, table = "public", "items"
-    with get_db() as conn, conn.cursor() as cur:
-        if code_col and name_col:
-            val_expr = _norm_code_expr(sql.Identifier(code_col))
-            q = sql.SQL(
-                """
-                SELECT {val_expr} AS value, {label}::text AS label
-                FROM {schema}.{table}
-                WHERE {code} IS NOT NULL OR {label} IS NOT NULL
-                GROUP BY value, label
-                ORDER BY label ASC
-                """
-            ).format(
-                val_expr=val_expr,
-                label=sql.Identifier(name_col),
-                schema=sql.Identifier(schema),
-                table=sql.Identifier(table),
-                code=sql.Identifier(code_col),
-            )
-        elif code_col:
-            val_expr = _norm_code_expr(sql.Identifier(code_col))
-            q = sql.SQL(
-                """
-                SELECT {val_expr} AS value, {val_expr} AS label
-                FROM {schema}.{table}
-                WHERE {code} IS NOT NULL
-                GROUP BY value
-                ORDER BY value ASC
-                """
-            ).format(
-                val_expr=val_expr,
-                schema=sql.Identifier(schema),
-                table=sql.Identifier(table),
-                code=sql.Identifier(code_col),
-            )
-        else:  # solo nombre
-            q = sql.SQL(
-                """
-                SELECT DISTINCT {label}::text AS value, {label}::text AS label
-                FROM {schema}.{table}
-                WHERE {label} IS NOT NULL AND {label}::text <> ''
-                ORDER BY label ASC
-                """
-            ).format(
-                label=sql.Identifier(name_col),
-                schema=sql.Identifier(schema),
-                table=sql.Identifier(table),
-            )
-
-        cur.execute(q)
-        rows = cur.fetchall()
-        return [{"value": r[0], "label": r[1]} for r in rows]
-
-# ─────────────────────── API pública usada por items_svc ───────────────────────
-
-def list_departamentos_lookup() -> List[Dict[str, str]]:
-    """
-    Devuelve [{ value, label }] para departamentos.
-    Intenta primero tablas de catálogo y luego hace fallback desde items.
-    Normaliza códigos (sin ceros a la izquierda).
-    """
-    # Tablas candidatas (prioridad)
-    catalog_candidates = ["public.departamentos_lookup", "public.departamentos"]
-
-    # Candidatos de columnas
-    code_candidates = ["codigo", "code", "cod", "id", "value", "departamento_codigo", "departamento_cod", "departamento_code"]
-    name_candidates = ["nombre", "name", "label", "descripcion", "departamento_nombre", "departamento_name", "departamento"]
-
-    for tbl in catalog_candidates:
-        if _table_exists(tbl):
-            try:
-                return _select_lookup_generic(tbl, code_candidates, name_candidates)
-            except Exception as e:
-                logging.warning(f"No se pudo leer {tbl}: {e}")
-
-    # Fallback desde items
-    return _fallback_from_items(
-        code_candidates=["departamento_codigo", "departamento_cod", "departamento_code", "departamento", "depto", "dep", "departamento_id", "dep_id", "codigo_departamento"],
-        name_candidates=["departamento_nombre", "departamento_name", "departamento", "dep_nombre", "dep_name"],
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (identificador) DO NOTHING
+        """,
+        (
+            identificador,
+            titulo,
+            titulo_resumen_final,
+            resumen_comp,
+            impacto_comp,
+            (item.findtext("url_pdf", "") or "").strip(),
+            (item.findtext("url_html", "") or "").strip(),
+            (item.findtext("url_xml", "") or "").strip(),
+            sec_codigo_norm if seccion else "",
+            dep_codigo_norm if dept else "",
+            epigrafe.get("nombre", "") if epigrafe else "",
+            (item.findtext("control", "") or "").strip(),
+            fecha_publicacion,
+            clase_item,
+        ),
     )
 
-def list_secciones_lookup() -> List[Dict[str, str]]:
-    """
-    Devuelve [{ value, label }] para secciones.
-    """
-    catalog_candidates = ["public.secciones_lookup", "public.secciones"]
-    code_candidates = ["codigo", "code", "cod", "id", "value", "seccion_codigo", "seccion_cod", "seccion_code", "seccion"]
-    name_candidates = ["nombre", "name", "label", "descripcion", "seccion_nombre", "seccion_name", "seccion"]
+    logger.info(f"✅ Insertado: {identificador}")
+    counters["insertados"] += 1
 
-    for tbl in catalog_candidates:
-        if _table_exists(tbl):
-            try:
-                return _select_lookup_generic(tbl, code_candidates, name_candidates)
-            except Exception as e:
-                logging.warning(f"No se pudo leer {tbl}: {e}")
+def parse_and_insert(root: ET.Element) -> int:
+    counters = {
+        "insertados": 0,
+        "omitidos_existentes": 0,
+        "omitidos_vacios": 0,
+        "fallos_openai": 0,
+        "huerfanos_en_seccion": 0,
+        "lookup_sec_insert": 0,
+        "lookup_sec_update": 0,
+        "lookup_dep_insert": 0,
+        "lookup_dep_update": 0,
+    }
 
-    # Fallback desde items
-    return _fallback_from_items(
-        code_candidates=["seccion_codigo", "seccion_cod", "seccion_code", "seccion"],
-        name_candidates=["seccion_nombre", "seccion_name", "seccion"],
-    )
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for seccion in root.findall(".//seccion"):
+                sec_nombre = (seccion.get("nombre", "") or "").strip()
+                clase_item = clasificar_item(sec_nombre)
+
+                for dept in seccion.findall("departamento"):
+                    for epigrafe in dept.findall("epigrafe"):
+                        for item in epigrafe.findall("item"):
+                            procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters)
+                    for item in dept.findall("item"):
+                        procesar_item(cur, item, seccion, dept, None, clase_item, counters)
+
+                for item in seccion.findall("item"):
+                    procesar_item(cur, item, seccion, None, None, clase_item, counters)
+                    counters["huerfanos_en_seccion"] += 1
+
+    logger.info("📊 RESUMEN FINAL:")
+    for k, v in counters.items():
+        logger.info(f"   {k}: {v}")
+
+    return counters["insertados"]
