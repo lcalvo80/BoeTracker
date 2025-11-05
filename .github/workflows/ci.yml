@@ -39,7 +39,8 @@ jobs:
           --health-retries=5
 
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # ⚠️ En CI usamos el Postgres del servicio (localhost) para no tocar producción
+      DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
       FROM_DATE: ${{ github.event.inputs.from_date }}
@@ -47,11 +48,13 @@ jobs:
 
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONPATH: .
 
+      # OpenAI (tuning razonable por defecto)
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
-      # OPENAI_MODEL: "gpt-4o-mini"
+      # OPENAI_MODEL: "gpt-4o"
 
     steps:
       - name: Checkout repo
@@ -88,11 +91,17 @@ jobs:
           echo "PostgreSQL no respondió a tiempo." >&2
           exit 1
 
+      # (Opcional) Cargar esquema si no usas migraciones automáticas.
+      # - name: Crear esquema mínimo
+      #   run: |
+      #     psql "$DATABASE_URL" <<'SQL'
+      #     -- crea aquí tablas base si no usas migraciones
+      #     SQL
+
       - name: Ejecutar actualización del BOE (keep-alive + normalización)
         shell: bash
         run: |
           set -euo pipefail
-
           # Keep-alive para evitar "no output" >10 min
           ( while true; do echo "💓 runner activo $(date -u +%H:%M:%S)"; sleep 60; done ) &
           KA_PID=$!
@@ -107,7 +116,6 @@ jobs:
               echo "$s"
             fi
           }
-
           FROM_NORM="$(norm_date "${FROM_DATE:-}")"
           TO_NORM="$(norm_date "${TO_DATE:-}")"
 

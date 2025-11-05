@@ -21,7 +21,8 @@ def _build_cors_origins(app: Flask):
         if v and v not in seen:
             seen.add(v)
             out.append(v)
-    # en debug, si no hay orígenes configurados, permite todos (solo dev)
+    # ⚠️ Ojo: con supports_credentials=True, "*" no funciona en navegadores.
+    # Solo lo usamos en DEV para pruebas sin credenciales.
     if app.config.get("DEBUG") and not out:
         out = ["*"]
     return out
@@ -37,7 +38,10 @@ def create_app() -> Flask:
 
         # Frontend
         FRONTEND_ORIGIN=os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"),
-        FRONTEND_BASE_URL=os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")),
+        FRONTEND_BASE_URL=os.getenv(
+            "FRONTEND_BASE_URL",
+            os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"),
+        ),
 
         # Feature flags (dev)
         DEBUG_FILTERS_ENABLED=os.getenv("DEBUG_FILTERS_ENABLED", "0") == "1",
@@ -50,10 +54,10 @@ def create_app() -> Flask:
 
         # Clerk
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
-        CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),   # p.ej., https://<sub>.clerk.accounts.dev/.well-known/jwks.json
-        CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),       # p.ej., https://<sub>.clerk.accounts.dev
+        CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),  # https://<sub>.clerk.../jwks.json
+        CLERK_ISSUER=os.getenv("CLERK_ISSUER", ""),      # https://<sub>.clerk...
         CLERK_API_BASE=os.getenv("CLERK_API_BASE", "https://api.clerk.com/v1"),
-        CLERK_AUDIENCE=os.getenv("CLERK_AUDIENCE", ""),   # opcional; si se define, verificamos 'aud'
+        CLERK_AUDIENCE=os.getenv("CLERK_AUDIENCE", ""),
     )
 
     # ───────────────── CORS ─────────────────
@@ -72,7 +76,7 @@ def create_app() -> Flask:
 
     # ───────────────── Blueprints ─────────────────
     # Canónicos:
-    from app.blueprints.webhooks import bp as webhooks_bp   # expone /api/stripe y /api/clerk
+    from app.blueprints.webhooks import bp as webhooks_bp   # /api/stripe y /api/clerk
     from app.blueprints.billing import bp as billing_bp
     from app.blueprints.enterprise import bp as enterprise_bp
 
@@ -81,8 +85,8 @@ def create_app() -> Flask:
     from app.blueprints.meta import bp as meta_bp
     from app.blueprints.comments import bp as comments_bp
 
-    # DEV only (_int/claims)
-    from app.auth import int_bp  # solo en DEBUG
+    # DEV only (_int: endpoints de prueba OpenAI y utilidades)
+    from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
 
     # Registro
     app.register_blueprint(webhooks_bp, url_prefix="/api")
@@ -94,6 +98,20 @@ def create_app() -> Flask:
 
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")
+
+        # Pequeña introspección de rutas: útil tras deploy en dev
+        @app.get("/api/_int/routes")
+        def _routes():
+            routes = []
+            for r in app.url_map.iter_rules():
+                if str(r.rule).startswith("/api/"):
+                    routes.append({
+                        "rule": str(r.rule),
+                        "methods": sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"}),
+                        "endpoint": r.endpoint,
+                    })
+            routes.sort(key=lambda x: x["rule"])
+            return {"ok": True, "routes": routes}
 
     # ───────────────── Salud y errores ─────────────────
     @app.route("/health")
