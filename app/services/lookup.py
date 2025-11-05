@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import List, Dict, Tuple, Optional, Iterable
 import logging
+import re
 from psycopg2 import sql
 from app.services.postgres import get_db
 
@@ -61,6 +62,127 @@ def _norm_code_expr(identifier: sql.Identifier) -> sql.SQL:
     return sql.SQL(
         "COALESCE(NULLIF(REGEXP_REPLACE({col}::text, '^0+', ''), ''), '0')"
     ).format(col=identifier)
+
+# ─────────────────────── Normalización y upserts de lookups ───────────────────────
+
+def normalize_code(code: str) -> str:
+    """
+    Normaliza códigos tipo '0310' -> '310'.
+    Si queda vacío o None -> '0'.
+    """
+    s = "" if code is None else str(code).strip()
+    s = re.sub(r"^0+", "", s)  # quitar ceros a la izquierda
+    return s or "0"
+
+def _ensure_lookup_table_cur(cur, table: str, code_col: str = "codigo", name_col: str = "nombre") -> None:
+    """
+    Garantiza que exista la tabla de lookups con PK en 'codigo'.
+    Usa el cursor proporcionado (misma transacción que el caller).
+    """
+    schema, tbl = _split_schema_and_table(table)
+    q = sql.SQL(
+        """
+        CREATE TABLE IF NOT EXISTS {schema}.{table} (
+            {code_col} TEXT PRIMARY KEY,
+            {name_col} TEXT
+        );
+        """
+    ).format(
+        schema=sql.Identifier(schema),
+        table=sql.Identifier(tbl),
+        code_col=sql.Identifier(code_col),
+        name_col=sql.Identifier(name_col),
+    )
+    cur.execute(q)
+
+def _ensure_lookup_cur(
+    cur,
+    table: str,
+    code: str,
+    name: str,
+    code_col: str = "codigo",
+    name_col: str = "nombre",
+) -> str:
+    """
+    Upsert de un par (codigo, nombre) en la tabla de catálogo indicada.
+    Devuelve:
+      - "insert" si ha insertado
+      - "update_name" si ha actualizado el nombre
+      - "noop" si no ha hecho cambios
+    """
+    code_norm = normalize_code(code)
+    name_norm = (name or "").strip()
+
+    _ensure_lookup_table_cur(cur, table, code_col=code_col, name_col=name_col)
+
+    # SELECT nombre actual
+    schema, tbl = _split_schema_and_table(table)
+    q_sel = sql.SQL("SELECT {name_col} FROM {schema}.{table} WHERE {code_col} = %s").format(
+        name_col=sql.Identifier(name_col),
+        schema=sql.Identifier(schema),
+        table=sql.Identifier(tbl),
+        code_col=sql.Identifier(code_col),
+    )
+    cur.execute(q_sel, (code_norm,))
+    row = cur.fetchone()
+    if not row:
+        # INSERT ON CONFLICT DO NOTHING (si ya existiera por carrera)
+        q_ins = sql.SQL(
+            "INSERT INTO {schema}.{table} ({code_col}, {name_col}) VALUES (%s, %s) "
+            "ON CONFLICT ({code_col}) DO NOTHING"
+        ).format(
+            schema=sql.Identifier(schema),
+            table=sql.Identifier(tbl),
+            code_col=sql.Identifier(code_col),
+            name_col=sql.Identifier(name_col),
+        )
+        cur.execute(q_ins, (code_norm, name_norm))
+        return "insert"
+
+    current_name = (row[0] or "").strip()
+    if name_norm and name_norm != current_name:
+        q_upd = sql.SQL(
+            "UPDATE {schema}.{table} SET {name_col} = %s WHERE {code_col} = %s"
+        ).format(
+            schema=sql.Identifier(schema),
+            table=sql.Identifier(tbl),
+            name_col=sql.Identifier(name_col),
+            code_col=sql.Identifier(code_col),
+        )
+        cur.execute(q_upd, (name_norm, code_norm))
+        return "update_name"
+
+    return "noop"
+
+def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
+    """
+    Asegura la presencia de la sección en 'public.secciones_lookup'.
+    Retorna: 'insert' | 'update_name' | 'noop'
+    """
+    return _ensure_lookup_cur(
+        cur,
+        table="public.secciones_lookup",
+        code=codigo,
+        name=nombre,
+        code_col="codigo",
+        name_col="nombre",
+    )
+
+def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
+    """
+    Asegura la presencia del departamento en 'public.departamentos_lookup'.
+    Retorna: 'insert' | 'update_name' | 'noop'
+    """
+    return _ensure_lookup_cur(
+        cur,
+        table="public.departamentos_lookup",
+        code=codigo,
+        name=nombre,
+        code_col="codigo",
+        name_col="nombre",
+    )
+
+# ─────────────────────── Selectores genéricos para filtros ───────────────────────
 
 def _select_lookup_generic(
     table_name: str,
