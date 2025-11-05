@@ -7,7 +7,6 @@ import base64, gzip, json
 from psycopg2 import sql
 from app.services.postgres import get_db
 
-# catálogos (NO importamos helpers privados)
 from app.services.lookup import (
     list_departamentos_lookup,
     list_secciones_lookup,
@@ -66,7 +65,6 @@ def _list_param(params: Dict[str, Any], *names: str) -> List[str]:
     return []
 
 def _table_exists(conn, table: str) -> bool:
-    """Comprueba si existe la tabla (en schema public)."""
     if not table:
         return False
     with conn.cursor() as cur:
@@ -105,10 +103,6 @@ def _ts_lang(conn) -> str:
 # ---- Inflado gzip+base64 seguro -----------------------------------------
 
 def _inflate_b64_gzip_maybe(val: Any) -> Any:
-    """
-    Si `val` es una cadena gzip+base64 la descomprime a texto.
-    Si no lo es, la devuelve tal cual.
-    """
     if not isinstance(val, str) or len(val) < 8:
         return val
     try:
@@ -117,7 +111,6 @@ def _inflate_b64_gzip_maybe(val: Any) -> Any:
             out = gzip.decompress(b).decode("utf-8", errors="replace")
             return out
         except Exception:
-            # No era gzip tras base64; devolvemos original
             return val
     except Exception:
         return val
@@ -138,10 +131,7 @@ def _parse_json_maybe(text: Optional[str]) -> Any:
 # ====================== Búsqueda / listado ======================
 
 def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Igual que el antiguo get_filtered_items(params), robusto a columnas opcionales.
-    """
-    # paginación segura
+    # paginación
     try:
         page = max(int(params.get("page", 1)), 1)
     except Exception:
@@ -154,7 +144,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         limit = 12
 
-    # ordenación segura
+    # ordenación
     sort_by = (params.get("sort_by", "created_at") or "").lower()
     sort_dir = (params.get("sort_dir", "desc") or "").lower()
     if sort_by not in {"created_at", "titulo", "id", "likes", "dislikes", "relevancia"}:
@@ -162,28 +152,27 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     if sort_dir not in {"asc", "desc"}:
         sort_dir = "desc"
 
-    # fechas
+    # fechas / filtros
     fecha_eq = _to_date(_norm(params.get("fecha")))
     fecha_desde = _to_date(_norm(params.get("fecha_desde")))
     fecha_hasta = _to_date(_norm(params.get("fecha_hasta")))
 
-    # listas
     dep_list = _list_param(params, "departamento_codigo", "departamento", "departamentos")
     sec_list = _list_param(params, "seccion_codigo", "seccion", "secciones")
     epi_list = _list_param(params, "epigrafe", "epigrafes")
 
-    # texto
     q_adv = _norm(params.get("q")) or _norm(params.get("q_adv"))
     identificador = _norm(params.get("identificador"))
     control_val = _norm(params.get("control"))
 
     with get_db() as conn:
-        # columnas presentes
+        # columnas
         has_titulo_resumen   = _col_exists(conn, "items", "titulo_resumen")
         has_titulo_corto     = _col_exists(conn, "items", "titulo_corto")
         has_titulo_completo  = _col_exists(conn, "items", "titulo_completo")
         has_created_at       = _col_exists(conn, "items", "created_at")
         has_created_at_date  = _col_exists(conn, "items", "created_at_date")
+        has_fecha_public     = _col_exists(conn, "items", "fecha_publicacion")
         has_control          = _col_exists(conn, "items", "control")
         has_contenido        = _col_exists(conn, "items", "contenido")
         has_resumen          = _col_exists(conn, "items", "resumen")
@@ -192,12 +181,13 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         has_dislikes         = _col_exists(conn, "items", "dislikes")
         has_informe_imp      = _col_exists(conn, "items", "informe_impacto")
         has_impacto          = _col_exists(conn, "items", "impacto")
+        has_id               = _col_exists(conn, "items", "id")
 
         # WHERE
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        # date expr consistente en WHERE/ORDER/SELECT
+        # Expresión de fecha coherente
         if has_created_at:
             date_expr = sql.SQL("DATE(i.created_at)")
             created_expr = sql.SQL("i.created_at AS created_at")
@@ -206,10 +196,16 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             date_expr = sql.SQL("DATE(i.created_at_date)")
             created_expr = sql.SQL("i.created_at_date AS created_at")
             created_order_col = sql.SQL("i.created_at_date")
+        elif has_fecha_public:
+            # ⬅️ Fallback seguro usado por el FE
+            date_expr = sql.SQL("DATE(i.fecha_publicacion)")
+            created_expr = sql.SQL("i.fecha_publicacion AS created_at")
+            created_order_col = sql.SQL("i.fecha_publicacion")
         else:
             date_expr = None
             created_expr = sql.SQL("NULL AS created_at")
-            created_order_col = sql.SQL("i.id")
+            # último fallback: usar identificador si no hay id
+            created_order_col = sql.SQL("i.id") if has_id else sql.SQL("i.identificador")
 
         if date_expr is not None:
             if fecha_eq:
@@ -223,7 +219,8 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         def _in_clause(col_name: str, values: Sequence[str]) -> Optional[Tuple[sql.SQL, List[str]]]:
             if not values:
                 return None
-            placeholders = sql.SQL(", ").join(sql.Placeholder() * len(values))
+            # FIX: construir una lista de placeholders iterable
+            placeholders = sql.SQL(", ").join([sql.Placeholder()] * len(values))
             return sql.SQL("{} IN ({})").format(sql.SQL(col_name), placeholders), list(values)
 
         in_dep = _in_clause("i.departamento_codigo", dep_list)
@@ -238,7 +235,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         if in_epi:
             where_sql_parts.append(in_epi[0]); args.extend(in_epi[1])
 
-        # texto: FTS si hay columna, si no ILIKE
+        # texto
         _use_fts_rank = False
         if q_adv and len(q_adv) >= 2:
             if _fts_available(conn):
@@ -261,7 +258,10 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
                 if has_contenido:
                     text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
                 if has_informe_imp or has_impacto:
-                    text_clauses.append(sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s" if has_informe_imp else "CAST(i.impacto AS TEXT) ILIKE %s"))
+                    text_clauses.append(sql.SQL(
+                        "CAST(i.informe_impacto AS TEXT) ILIKE %s" if has_informe_imp else
+                        "CAST(i.impacto AS TEXT) ILIKE %s"
+                    ))
                     args.append(like_val)
                 if text_clauses:
                     where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
@@ -276,9 +276,8 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
         where_sql = sql.SQL("WHERE ") + sql.SQL(" AND ").join(where_sql_parts) if where_sql_parts else sql.SQL("")
 
-        # SELECT + JOINs
+        # SELECT
         select_cols = [
-            sql.SQL("i.id"),
             sql.SQL("i.identificador"),
             sql.SQL("i.titulo") if has_titulo else sql.SQL("NULL AS titulo"),
             sql.SQL("i.titulo_resumen") if has_titulo_resumen else sql.SQL("NULL AS titulo_resumen"),
@@ -289,19 +288,22 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.departamento_codigo"),
             sql.SQL("i.seccion_codigo"),
             sql.SQL("i.epigrafe"),
+            # ⬇️ exponemos fecha_publicacion si existe para el FE
+            (sql.SQL("i.fecha_publicacion") if has_fecha_public else sql.SQL("NULL AS fecha_publicacion")),
             created_expr,
             sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
             sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
             sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
         ]
+
         joins: List[sql.SQL] = []
 
         dep_table = None
-        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
+        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
             if _table_exists(conn, t):
                 dep_table = t; break
         sec_table = None
-        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
+        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
             if _table_exists(conn, t):
                 sec_table = t; break
 
@@ -327,7 +329,11 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             if sort_by == "created_at":
                 sort_by_sql = created_order_col
             else:
-                sort_by_sql = sql.SQL("i." + sort_by)
+                # solo ordenamos por columnas existentes; si no, caemos al fallback seguro
+                cand = sql.SQL(f"i.{sort_by}")
+                if (sort_by == "id" and not has_id) or (sort_by == "titulo" and not has_titulo) or (sort_by == "likes" and not has_likes) or (sort_by == "dislikes" and not has_dislikes):
+                    cand = created_order_col
+                sort_by_sql = cand
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
             order_clause = sort_by_sql + sql.SQL(" ") + sort_dir_sql
             order_params = []
@@ -355,7 +361,6 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
 
-    # (listado no infla por rendimiento; los detalle/derivados sí)
     return {
         "items": data,
         "page": page,
@@ -374,11 +379,10 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
     with get_db() as conn, conn.cursor() as cur:
         base_cols = [
-            "id", "identificador",
+            "identificador",
             "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
             "contenido", "resumen",
             "departamento_codigo", "seccion_codigo", "epigrafe",
-            "created_at", "likes", "dislikes", "control"
         ]
         def _col_exists_inner(c): return _col_exists(conn, "items", c)
         existing_cols = [c for c in base_cols if _col_exists_inner(c)]
@@ -399,21 +403,25 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
             if _col_exists_inner(cand):
                 source_url_expr = f"i.{cand} AS sourceUrl"; break
 
-        dep_table = None
-        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos"):
-            if _table_exists(conn, t):
-                dep_table = t; break
-        sec_table = None
-        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones"):
-            if _table_exists(conn, t):
-                sec_table = t; break
+        fecha_pub_expr = "i.fecha_publicacion AS fecha_publicacion" if _col_exists_inner("fecha_publicacion") else "NULL AS fecha_publicacion"
 
         sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
+        sel_parts.append(fecha_pub_expr)
         if impacto_expr:    sel_parts.append(impacto_expr)
         if url_pdf_expr:    sel_parts.append(url_pdf_expr)
         if source_url_expr: sel_parts.append(source_url_expr)
-        if dep_table:       sel_parts.append("d.nombre AS departamento_nombre")
-        if sec_table:       sel_parts.append("s.nombre AS seccion_nombre")
+
+        dep_table = None
+        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
+            if _table_exists(conn, t):
+                dep_table = t; break
+        sec_table = None
+        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
+            if _table_exists(conn, t):
+                sec_table = t; break
+
+        if dep_table: sel_parts.append("d.nombre AS departamento_nombre")
+        if sec_table: sel_parts.append("s.nombre AS seccion_nombre")
 
         sel = ", ".join(sel_parts) or "i.identificador"
 
@@ -431,14 +439,13 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         names = [desc.name for desc in cur.description]
         data = dict(zip(names, row))
 
-    # Normalizaciones + inflado (detalle)
+    # Inflados / normalizaciones
     for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
               "contenido", "resumen", "impacto", "likes", "dislikes", "control",
-              "departamento_codigo", "seccion_codigo", "epigrafe", "created_at",
-              "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"):
+              "departamento_codigo", "seccion_codigo", "epigrafe",
+              "fecha_publicacion", "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"):
         data.setdefault(k, None)
 
-    # Inflar gzip+base64 si procede
     if data.get("resumen") is not None:
         inflated = _inflate_b64_gzip_maybe(data["resumen"])
         data["resumen"] = (inflated or "").strip() or None
@@ -477,7 +484,6 @@ def get_item_impacto(identificador: str) -> Dict[str, Any]:
     raw = row[0] if row else None
     inflated = _inflate_b64_gzip_maybe(raw)
     parsed = _parse_json_maybe(inflated)
-    # Si quedó cadena vacía -> None ; si es {} se devolverá {}
     if isinstance(parsed, str) and parsed.strip() == "":
         parsed = None
     return {"identificador": identificador, "impacto": parsed}

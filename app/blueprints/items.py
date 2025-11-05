@@ -57,6 +57,7 @@ NORMALIZE_KEYS = {
     "seccion_codigo": "secciones",
     "departamento_codigo": "departamentos",
     "q": "q", "query": "q", "search": "q", "q_adv": "q",
+    "search_mode": "search_mode",
     "fecha": "fecha",
     "fecha_desde": "fecha_desde", "desde": "fecha_desde", "from": "fecha_desde", "date_from": "fecha_desde",
     "fecha_hasta": "fecha_hasta", "hasta": "fecha_hasta", "to": "fecha_hasta", "date_to": "fecha_hasta",
@@ -141,14 +142,12 @@ def _allow_options():
 
 # ===== Rutas =====
 
-# Listado
 @bp.get("")
 def list_items():
     try:
         parsed = _parse_query_args(request.args)
         result = items_svc.search_items(parsed)
 
-        # Asegura 'pages' si el service no lo aportara (lo aporta)
         if isinstance(result, dict):
             total = result.get("total", 0) or 0
             limit = result.get("limit", parsed.get("limit", 12)) or 12
@@ -189,7 +188,6 @@ def list_items():
             "sort_dir": sort_dir,
         }), 200
 
-# Detalle y derivados
 @bp.get("/<identificador>")
 def get_item(identificador):
     data = items_svc.get_item_by_id(identificador)
@@ -205,7 +203,6 @@ def get_resumen(identificador):
 def get_impacto(identificador):
     return jsonify(items_svc.get_item_impacto(identificador)), 200
 
-# Reacciones
 @bp.post("/<identificador>/like")
 def like(identificador):
     return jsonify(items_svc.like_item(identificador)), 200
@@ -214,7 +211,6 @@ def like(identificador):
 def dislike(identificador):
     return jsonify(items_svc.dislike_item(identificador)), 200
 
-# Catálogos (cache)
 @bp.get("/departamentos")
 def departamentos():
     try:
@@ -242,7 +238,6 @@ def epigrafes():
         current_app.logger.exception("epigrafes failed")
         return _json_with_cache([], 200, max_age=60)
 
-# Debug (solo si está habilitado)
 @bp.get("/_debug/echo")
 def echo():
     if not current_app.config.get("DEBUG_FILTERS_ENABLED", False):
