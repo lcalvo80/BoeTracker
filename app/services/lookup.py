@@ -7,6 +7,14 @@ import re
 from psycopg2 import sql
 from app.services.postgres import get_db
 
+__all__ = [
+    "normalize_code",
+    "ensure_seccion_cur",
+    "ensure_departamento_cur",
+    "list_departamentos_lookup",
+    "list_secciones_lookup",
+]
+
 # ───────────────────────── Helpers internos ─────────────────────────
 
 def _split_schema_and_table(name: str) -> Tuple[str, str]:
