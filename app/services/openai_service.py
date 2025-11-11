@@ -1,27 +1,25 @@
 # app/services/openai_service.py
 from __future__ import annotations
 
-import os, json, time, logging, random, re, copy, math
+import os, json, time, logging, random, re, copy
 from typing import Dict, Any, Tuple, List, Optional
 from utils.helpers import extract_section, clean_code_block  # noqa: F401
 
-# ─────────────────────────── Config ───────────────────────────
-_OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))               # ↑ leve
+_OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "45"))
 _OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
 _OPENAI_BACKOFF_BASE = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
 _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-_OPENAI_BUDGET_SECS = float(os.getenv("OPENAI_BUDGET_SECS", "180"))    # ↑ margen
+_OPENAI_BUDGET_SECS = float(os.getenv("OPENAI_BUDGET_SECS", "120"))
 _OPENAI_DISABLE = os.getenv("OPENAI_DISABLE", "0") == "1"
 
-# Chunking (ajustable)
-_CHUNK_MAX_CHARS = int(os.getenv("OPENAI_CHUNK_MAX_CHARS", "9000"))
-_CHUNK_OVERLAP = int(os.getenv("OPENAI_CHUNK_OVERLAP", "800"))
-_CHUNK_MAX_COUNT = int(os.getenv("OPENAI_CHUNK_MAX_COUNT", "12"))  # tope de trozos
-
-# Modelos por tarea
 _MODEL_TITLE = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
 _MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL)
 _MODEL_IMPACT = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
+
+# Chunking
+_OPENAI_CHUNK_SIZE_CHARS = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
+_OPENAI_CHUNK_OVERLAP_CHARS = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
+_OPENAI_MAX_CHUNKS = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))  # hard cap anti-coste
 
 # ─────────────────────────── Estructuras vacías ───────────────────────────
 _EMPTY_RESUMEN = {
@@ -46,8 +44,16 @@ _RESUMEN_JSON_SCHEMA_BASE: Dict[str, Any] = {
         "additionalProperties": False,
         "properties": {
             "summary": {"type": "string", "maxLength": 600},
-            "key_changes": {"type": "array", "maxItems": 12, "items": {"type": "string", "maxLength": 200}},
-            "key_dates_events": {"type": "array", "maxItems": 10, "items": {"type": "string"}},
+            "key_changes": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "string", "maxLength": 200},
+            },
+            "key_dates_events": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {"type": "string"},
+            },
             "conclusion": {"type": "string", "maxLength": 300},
         },
         "required": ["summary", "key_changes", "key_dates_events", "conclusion"],
@@ -66,7 +72,13 @@ _IMPACTO_JSON_SCHEMA: Dict[str, Any] = {
             "beneficios_previstos": {"type": "array", "items": {"type": "string"}},
             "recomendaciones": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["afectados","cambios_operativos","riesgos_potenciales","beneficios_previstos","recomendaciones"],
+        "required": [
+            "afectados",
+            "cambios_operativos",
+            "riesgos_potenciales",
+            "beneficios_previstos",
+            "recomendaciones",
+        ],
     },
 }
 
@@ -81,10 +93,11 @@ _TIME_PAT = re.compile(r"\b(\d{1,2}:\d{2})\s*(h|horas)?\b", re.I)
 _CONV_PAT = re.compile(r"\b(primera|segunda)\s+convocatoria\b", re.I)
 _LOC_PAT = re.compile(r"\b(calle|avda\.?|avenida|plaza|edificio|local|sede|km\s*\d+|pol[íi]gono)\b.*", re.I | re.M)
 _AGENDA_PAT = re.compile(r"(?im)^(primero|segundo|tercero|cuarto|quinto|sexto|s[eé]ptimo)[\.\-:]\s*(.+)$")
-_KEYWORDS_DATES = re.compile(r"(entra\s+en\s+vigor|vigencia|firma[do]? en|publicaci[oó]n|plazo|presentaci[oó]n)", re.I)
+_KEYWORDS_DATES = re.compile(
+    r"(entra\s+en\s+vigor|vigencia|firma[do]? en|publicaci[oó]n|plazo|presentaci[oó]n)", re.I
+)
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
 
-# ─────────────────────────── Utilidades ───────────────────────────
 def _extract_hints(text: str, max_per_type: int = 6) -> Dict[str, List[str]]:
     def _uniq(lst):
         seen, out = set(), []
@@ -98,16 +111,24 @@ def _extract_hints(text: str, max_per_type: int = 6) -> Dict[str, List[str]]:
         dates += [m.group(1).strip() for m in rx.finditer(text)]
     if _MONTH_YEAR_RX.search(text):
         dates += [m.group(0).strip() for m in _MONTH_YEAR_RX.finditer(text)]
-    times  += [m.group(1).strip() for m in _TIME_PAT.finditer(text)]
+    times += [m.group(1).strip() for m in _TIME_PAT.finditer(text)]
     convoc += [m.group(0).strip() for m in _CONV_PAT.finditer(text)]
     locs   += [m.group(0).strip() for m in _LOC_PAT.finditer(text)]
     agenda += [m.group(0).strip() for m in _AGENDA_PAT.finditer(text)]
-    return {"dates": _uniq(dates), "times": _uniq(times), "convocatorias": _uniq(convoc), "locations": _uniq(locs), "agenda": _uniq(agenda)}
+    return {
+        "dates": _uniq(dates),
+        "times": _uniq(times),
+        "convocatorias": _uniq(convoc),
+        "locations": _uniq(locs),
+        "agenda": _uniq(agenda),
+    }
 
 def _has_dates(text: str, hints: Dict[str, List[str]]) -> bool:
-    if hints.get("dates") or hints.get("times"): return True
+    if hints.get("dates") or hints.get("times"):
+        return True
     return bool(_KEYWORDS_DATES.search(text))
 
+# ─────────────────────────── utilidades OpenAI ───────────────────────────
 def _sleep_with_retry_after(exc: Exception, attempt: int) -> None:
     ra = None
     try:
@@ -135,16 +156,6 @@ def _make_client():
         logging.error(f"❌ Error inicializando cliente OpenAI: {e}")
         return None
 
-def _normalize_content(content: str, hard_limit_chars: int = 120_000) -> str:
-    """Limpia y limita a un máximo muy alto (modelos 4o admiten contextos grandes)."""
-    if not isinstance(content, str):
-        return ""
-    s = content.replace("\u00A0", " ")
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    s = _WHITESPACE_RE.sub(" ", s).strip()
-    return s[:hard_limit_chars]
-
-# ─────────────────────────── OpenAI invocaciones ───────────────────────────
 def _chat_completion_with_retry(client, *, messages, model=None, max_tokens=600, temperature=0.2, deadline_ts=None, seed: Optional[int]=7):
     use_model = model or _OPENAI_MODEL
     last_err = None
@@ -154,30 +165,36 @@ def _chat_completion_with_retry(client, *, messages, model=None, max_tokens=600,
             raise last_err or TimeoutError("Presupuesto agotado")
         try:
             return client.chat.completions.create(
-                model=use_model, messages=messages,
-                max_tokens=max_tokens, temperature=temperature, seed=seed
+                model=use_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=seed,
             )
         except Exception as e:
             last_err = e
             code = getattr(getattr(e, "response", None), "status_code", None)
-            msg = str(e).lower()
-            if attempt < _OPENAI_MAX_RETRIES and (code in (429,500,502,503,504) or "timeout" in msg or "overloaded" in msg):
+            if attempt < _OPENAI_MAX_RETRIES and (code in (429, 500, 502, 503, 504) or "timeout" in str(e).lower()):
                 _sleep_with_retry_after(e, attempt + 1); continue
             logging.error(f"❌ OpenAI error (texto final): code={code} {e}")
             raise
-    raise last_err
+    raise last_err  # pragma: no cover
 
 def _json_completion_with_retry(client, *, messages, model=None, max_tokens=900, temperature=0.2, deadline_ts=None, seed: Optional[int]=7) -> Dict[str, Any]:
     use_model = model or _OPENAI_MODEL
     last_err = None
     for attempt in range(_OPENAI_MAX_RETRIES + 1):
         if deadline_ts is not None and time.time() >= deadline_ts:
-            logging.error("⏰ Presupuesto agotado (JSON).")
+            logging.error("⏰ Presupuesto de tiempo agotado (JSON).")
             raise last_err or TimeoutError("Presupuesto agotado")
         try:
             resp = client.chat.completions.create(
-                model=use_model, messages=messages, max_tokens=max_tokens,
-                temperature=temperature, response_format={"type": "json_object"}, seed=seed
+                model=use_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+                seed=seed,
             )
             content = (resp.choices[0].message.content or "").strip()
             try:
@@ -187,50 +204,62 @@ def _json_completion_with_retry(client, *, messages, model=None, max_tokens=900,
         except Exception as e:
             last_err = e
             code = getattr(getattr(e, "response", None), "status_code", None)
-            msg = str(e).lower()
-            if attempt < _OPENAI_MAX_RETRIES and (code in (429,500,502,503,504) or "timeout" in msg or "overloaded" in msg):
+            if attempt < _OPENAI_MAX_RETRIES and (code in (429, 500, 502, 503, 504) or "timeout" in str(e).lower()):
                 _sleep_with_retry_after(e, attempt + 1); continue
             logging.error(f"❌ OpenAI error (JSON final): code={code} {e}")
             raise
-    raise last_err
+    raise last_err  # pragma: no cover
 
 def _json_schema_completion_with_retry(client, *, messages, schema: Dict[str, Any], model=None, max_tokens=900, temperature=0.2, deadline_ts=None, seed: Optional[int]=7) -> Dict[str, Any]:
     use_model = model or _OPENAI_MODEL
     last_err = None
     for attempt in range(_OPENAI_MAX_RETRIES + 1):
         if deadline_ts is not None and time.time() >= deadline_ts:
-            logging.error("⏰ Presupuesto agotado (JSON Schema).")
+            logging.error("⏰ Presupuesto de tiempo agotado (JSON Schema).")
             raise last_err or TimeoutError("Presupuesto agotado")
         try:
             resp = client.chat.completions.create(
-                model=use_model, messages=messages, max_tokens=max_tokens, temperature=temperature,
-                response_format={"type": "json_schema", "json_schema": schema}, seed=seed
+                model=use_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={"type": "json_schema", "json_schema": schema},
+                seed=seed,
             )
-            return json.loads((resp.choices[0].message.content or "").strip())
+            content = (resp.choices[0].message.content or "").strip()
+            return json.loads(content)
         except Exception as e:
             last_err = e
             text = f"{e}"
             code = getattr(getattr(e, "response", None), "status_code", None)
             if "response_format" in text or "json_schema" in text or code == 400:
-                logging.warning("⚠️ json_schema no soportado/aceptado. Fallback a json_object.")
+                logging.warning("⚠️ response_format json_schema no soportado. Fallback a json_object.")
                 return _json_completion_with_retry(
-                    client, messages=messages, model=use_model, max_tokens=max_tokens,
-                    temperature=temperature, deadline_ts=deadline_ts, seed=seed
+                    client, messages=messages, model=use_model, max_tokens=max_tokens, temperature=temperature, deadline_ts=deadline_ts, seed=seed
                 )
-            msg = str(e).lower()
-            if attempt < _OPENAI_MAX_RETRIES and (code in (429,500,502,503,504) or "timeout" in msg or "overloaded" in msg):
+            if attempt < _OPENAI_MAX_RETRIES and (code in (429, 500, 502, 503, 504) or "timeout" in str(e).lower()):
                 _sleep_with_retry_after(e, attempt + 1); continue
             logging.error(f"❌ OpenAI error (JSON schema): code={code} {e}")
             raise
-    raise last_err
+    raise last_err  # pragma: no cover
 
 # ─────────────────────────── Normalización/limpieza ───────────────────────────
+def _normalize_content(content: str, hard_limit_chars: int = 28000) -> str:
+    if not isinstance(content, str):
+        return ""
+    s = content.replace("\u00A0", " ")
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = _WHITESPACE_RE.sub(" ", s).strip()
+    if len(s) <= hard_limit_chars:
+        return s
+    return f"{s[:24000]}\n...\n{s[-4000:]}"
+
 def _ensure_resumen_shape(obj: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(_EMPTY_RESUMEN)
     if isinstance(obj, dict):
         summary = obj.get("summary", None)
         if (summary is None or str(summary).strip() == "") and "context" in obj:
-            summary = obj.get("context")
+            summary = obj.get("context")  # retro-compat
         out["summary"] = str(summary or "").strip()
         out["key_changes"] = [str(x).strip() for x in obj.get("key_changes", []) if str(x).strip()]
         out["key_dates_events"] = [str(x).strip() for x in obj.get("key_dates_events", []) if str(x).strip()]
@@ -247,13 +276,86 @@ def _ensure_impacto_shape(obj: Dict[str, Any]) -> Dict[str, Any]:
         out["recomendaciones"] = [str(x).strip() for x in obj.get("recomendaciones", []) if str(x).strip()]
     return out
 
+# ────────────── helpers chunking & merge ──────────────
+def _split_chunks(text: str, size: int, overlap: int) -> List[str]:
+    if size <= 0:
+        return [text]
+    chunks: List[str] = []
+    i = 0
+    n = max(0, size - overlap)
+    while i < len(text) and len(chunks) < _OPENAI_MAX_CHUNKS:
+        chunks.append(text[i : i + size])
+        i += n if n > 0 else size
+    if i < len(text):  # si quedó cola, la añadimos
+        chunks.append(text[-size:])
+    return chunks
+
+def _uniq_keep_order(seq: List[str], limit: Optional[int] = None) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in seq:
+        s = str(x).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+def _merge_resumen_objs(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not parts:
+        return dict(_EMPTY_RESUMEN)
+    all_changes: List[str] = []
+    all_dates: List[str] = []
+    summs: List[str] = []
+    concls: List[str] = []
+
+    for p in parts:
+        p = _ensure_resumen_shape(p)
+        if p.get("summary"):
+            summs.append(p["summary"])
+        all_changes.extend(p.get("key_changes", []) or [])
+        all_dates.extend(p.get("key_dates_events", []) or [])
+        if p.get("conclusion"):
+            concls.append(p["conclusion"])
+
+    summary_join = " ".join(s for s in summs if s).strip()
+    conclusion_join = " ".join(s for s in concls if s).strip()
+
+    # límites del schema
+    merged = {
+        "summary": summary_join[:600],
+        "key_changes": _uniq_keep_order(all_changes, limit=12),
+        "key_dates_events": _uniq_keep_order(all_dates, limit=10),
+        "conclusion": conclusion_join[:300],
+    }
+    return _ensure_resumen_shape(merged)
+
+def _merge_impacto_objs(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not parts:
+        return dict(_EMPTY_IMPACTO)
+    keys = ["afectados", "cambios_operativos", "riesgos_potenciales", "beneficios_previstos", "recomendaciones"]
+    agg: Dict[str, List[str]] = {k: [] for k in keys}
+    for p in parts:
+        p = _ensure_impacto_shape(p)
+        for k in keys:
+            agg[k].extend(p.get(k, []) or [])
+    merged = {k: _uniq_keep_order(v, limit=20) for k, v in agg.items()}  # límite razonable UI
+    return _ensure_impacto_shape(merged)
+
+# ─────────────────────────── Título: grader/normalizador ───────────────────────────
 _STOP_PUNCT_RE = re.compile(r"[\"“”'’`´]+")
 def _grade_title(s: str, max_words: int = 10) -> str:
-    if not isinstance(s, str): s = ""
+    if not isinstance(s, str):
+        s = ""
+    s = s.strip()
     s = clean_code_block(s).strip()
-    s = _STOP_PUNCT_RE.sub("", s).replace(":", " ")
+    s = _STOP_PUNCT_RE.sub("", s)
+    s = s.replace(":", " ")
     s = _WHITESPACE_RE.sub(" ", s).strip()
-    if s.endswith("."): s = s[:-1].rstrip()
+    if s.endswith("."):
+        s = s[:-1].rstrip()
     parts = s.split()
     if len(parts) > max_words:
         low_info = {"de","la","del","al","y","en","por","para","el","los","las","un","una","unos","unas"}
@@ -266,129 +368,6 @@ def _grade_title(s: str, max_words: int = 10) -> str:
         s = " ".join(kept[:max_words])
     return s
 
-# ─────────────────────────── Chunking helpers ───────────────────────────
-def _split_chunks(text: str, max_chars: int, overlap: int, max_count: int) -> List[str]:
-    t = text or ""
-    if len(t) <= max_chars:
-        return [t]
-    chunks = []
-    i = 0
-    while i < len(t) and len(chunks) < max_count:
-        chunk = t[i : i + max_chars]
-        chunks.append(chunk)
-        i += max(1, max_chars - overlap)
-    return chunks
-
-def _fuse_lists(*lists: List[str], max_total: int = 20) -> List[str]:
-    seen, out = set(), []
-    for lst in lists:
-        for x in lst or []:
-            s = str(x).strip()
-            if not s or s in seen: continue
-            seen.add(s); out.append(s)
-            if len(out) >= max_total: return out
-    return out
-
-# ─────────────────────────── Título / Resumen / Impacto ───────────────────────────
-def _title_from_model(client, title: str, deadline_ts: Optional[float]) -> str:
-    messages = [
-        {"role":"system","content":"Eres un asistente que redacta títulos del BOE en español claro. SOLO texto plano; sin comillas; sin dos puntos; sin punto final; máximo 10 palabras; no inventes."},
-        {"role":"user","content":"Resume este título oficial en ≤10 palabras, directo y comprensible. Sin dos puntos, sin comillas, sin punto final.\n\n<<<TÍTULO>>>\n"+(title or "")},
-    ]
-    resp = _chat_completion_with_retry(client, messages=messages, model=_MODEL_TITLE, max_tokens=40, temperature=0.2, deadline_ts=deadline_ts, seed=7)
-    raw = (resp.choices[0].message.content or "").strip()
-    return _grade_title(raw)
-
-def _resumen_from_model(client, content_norm: str, hints: Dict[str, List[str]], deadline_ts: Optional[float]) -> Dict[str, Any]:
-    has_dates = _has_dates(content_norm, hints)
-    resumen_schema = copy.deepcopy(_RESUMEN_JSON_SCHEMA_BASE)
-    resumen_schema["schema"]["properties"]["key_dates_events"]["minItems"] = 1 if has_dates else 0
-
-    resumen_system = (
-        "Eres un asistente legal experto en el BOE (España). "
-        "Responde EXCLUSIVAMENTE en JSON válido conforme al esquema. "
-        "No añadas texto fuera del JSON. No inventes datos. "
-        "Usa SOLO el CONTENIDO como fuente de verdad; PISTAS son orientativas."
-    )
-    user_msg = "\n".join([
-        "Devuelve EXACTAMENTE este objeto conforme al esquema.",
-        "- Español claro y conciso. Frases cortas.",
-        "- Si el texto incluye firma/publicación/entrada en vigor, añádelas en key_dates_events.",
-        "- Si solo hay mes/año (sin día), usa '<mes> de YYYY 00:00: Evento'.",
-        "- Deduplica fechas/horas/lugares.",
-        "- Si es CONVOCATORIA: incluye primera/segunda, horas, lugar y orden del día en key_changes.",
-        "<<<CONTENIDO>>>", content_norm,
-        "<<<PISTAS_DETECTADAS>>>", json.dumps(hints, ensure_ascii=False),
-    ])
-    messages = [{"role":"system","content":resumen_system},{"role":"user","content":user_msg}]
-    obj = _json_schema_completion_with_retry(client, messages=messages, schema=resumen_schema, model=_MODEL_SUMMARY, max_tokens=900, temperature=0.1, deadline_ts=deadline_ts, seed=7)
-    return _ensure_resumen_shape(obj)
-
-def _impacto_from_model(client, content_norm: str, hints: Dict[str, List[str]], deadline_ts: Optional[float]) -> Dict[str, Any]:
-    system = ("Eres un analista legislativo. Responde EXCLUSIVAMENTE en JSON válido conforme al esquema. "
-              "No añadas nada fuera del JSON. No inventes. Usa SOLO el CONTENIDO.")
-    user = "\n".join([
-        "Devuelve EXACTAMENTE este objeto con el esquema.",
-        "Guía:",
-        "- CONVOCATORIA: afectados (miembros/propietarios…), cambios (elección cargos, aprobación cuentas…), riesgos (quórum), recomendaciones (asistir/delegar).",
-        "- LICITACIÓN: plazos, documentación, solvencia/garantías; riesgos de forma/plazos; recomendaciones para no quedar excluido.",
-        "- RESOLUCIÓN/NOMBR.: obligaciones/efectos y recomendaciones de cumplimiento.",
-        "- Listas por importancia. Frases cortas.",
-        "- Si hay FECHAS: incluye acciones con hito en cambios_operativos (p. ej., 'Adaptar sistemas antes de 01/01/2026').",
-        "<<<CONTENIDO>>>", content_norm,
-        "<<<PISTAS_DETECTADAS>>>", json.dumps(hints, ensure_ascii=False),
-    ])
-    messages = [{"role":"system","content":system},{"role":"user","content":user}]
-    obj = _json_schema_completion_with_retry(client, messages=messages, schema=_IMPACTO_JSON_SCHEMA, model=_MODEL_IMPACT, max_tokens=900, temperature=0.1, deadline_ts=deadline_ts, seed=7)
-    return _ensure_impacto_shape(obj)
-
-def _resumen_chunked(client, chunks: List[str], deadline_ts: Optional[float]) -> Dict[str, Any]:
-    """Resumen por trozos + fusión."""
-    partials: List[Dict[str, Any]] = []
-    for idx, ch in enumerate(chunks, 1):
-        hints = _extract_hints(ch)
-        try:
-            part = _resumen_from_model(client, ch, hints, deadline_ts)
-        except Exception as e:
-            logging.warning(f"Resumen chunk {idx}/{len(chunks)} falló: {e}")
-            part = _EMPTY_RESUMEN
-        partials.append(part)
-
-    # Fusión
-    summary = " ".join([p.get("summary","") for p in partials if p.get("summary")]).strip()
-    key_changes = _fuse_lists(*[p.get("key_changes",[]) for p in partials], max_total=12)
-    key_dates_events = _fuse_lists(*[p.get("key_dates_events",[]) for p in partials], max_total=10)
-    conclusion = (partials[-1].get("conclusion","") if partials else "")
-
-    return _ensure_resumen_shape({
-        "summary": summary[:600],
-        "key_changes": key_changes,
-        "key_dates_events": key_dates_events,
-        "conclusion": conclusion[:300],
-    })
-
-def _impacto_chunked(client, chunks: List[str], deadline_ts: Optional[float]) -> Dict[str, Any]:
-    partials: List[Dict[str, Any]] = []
-    for idx, ch in enumerate(chunks, 1):
-        hints = _extract_hints(ch)
-        try:
-            part = _impacto_from_model(client, ch, hints, deadline_ts)
-        except Exception as e:
-            logging.warning(f"Impacto chunk {idx}/{len(chunks)} falló: {e}")
-            part = _EMPTY_IMPACTO
-        partials.append(part)
-
-    def fuse_key(key: str, max_total: int) -> List[str]:
-        return _fuse_lists(*[p.get(key, []) for p in partials], max_total=max_total)
-
-    return _ensure_impacto_shape({
-        "afectados": fuse_key("afectados", 12),
-        "cambios_operativos": fuse_key("cambios_operativos", 12),
-        "riesgos_potenciales": fuse_key("riesgos_potenciales", 12),
-        "beneficios_previstos": fuse_key("beneficios_previstos", 12),
-        "recomendaciones": fuse_key("recomendaciones", 12),
-    })
-
 # ─────────────────────────── API principal ───────────────────────────
 def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
     """
@@ -396,7 +375,7 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
       - titulo_resumen (texto plano)
       - resumen_json (string JSON alineado al schema)
       - impacto_json (string JSON alineado al schema)
-    Nunca lanza excepción por tamaño de contenido: aplica chunking si es necesario.
+    Con chunking automático para textos largos: procesa por trozos y fusiona localmente.
     """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitidas llamadas.")
@@ -410,32 +389,132 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
     deadline_ts = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
 
     content_norm = _normalize_content(content or "")
-    hints_full = _extract_hints(content_norm)
+    hints = _extract_hints(content_norm)
+    has_dates = _has_dates(content_norm, hints)
+    # ───────────────── Título ─────────────────
+    title_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres un asistente que redacta títulos del BOE en español claro. "
+                "SOLO texto plano; sin comillas; sin dos puntos; sin punto final; máximo 10 palabras; no inventes. "
+                "Usa EXCLUSIVAMENTE el TÍTULO OFICIAL que te paso y simplifícalo."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Resume este título oficial en ≤10 palabras, directo y comprensible. "
+                "Evita tecnicismos y siglas poco comunes. Sin dos puntos, sin comillas, sin punto final.\n\n"
+                "<<<TÍTULO>>>\n" + (title or "")
+            ),
+        },
+    ]
+    title_resp = _chat_completion_with_retry(
+        client, messages=title_messages, model=_MODEL_TITLE, max_tokens=40, temperature=0.2, deadline_ts=deadline_ts, seed=7
+    )
+    titulo_resumen_raw = (title_resp.choices[0].message.content or "").strip()
+    titulo_resumen = _grade_title(titulo_resumen_raw)
 
-    # 1) Título
-    try:
-        titulo_resumen = _title_from_model(client, title or "", deadline_ts)
-    except Exception as e:
-        logging.warning(f"Título via modelo falló, uso título original. Motivo: {e}")
-        titulo_resumen = _grade_title(title or "")
+    # ───────────────── Chunking ─────────────────
+    text_for_chunks = content_norm
+    if len(text_for_chunks) <= _OPENAI_CHUNK_SIZE_CHARS:
+        chunks = [text_for_chunks]
+    else:
+        chunks = _split_chunks(text_for_chunks, _OPENAI_CHUNK_SIZE_CHARS, _OPENAI_CHUNK_OVERLAP_CHARS)
+        logging.info(f"✂️ Chunking contenido en {len(chunks)} trozos")
 
-    # 2) Resumen/Impacto (directo o chunked)
-    try:
-        if len(content_norm) <= _CHUNK_MAX_CHARS:
-            resumen_obj = _resumen_from_model(client, content_norm, hints_full, deadline_ts)
-            impacto_obj = _impacto_from_model(client, content_norm, hints_full, deadline_ts)
-        else:
-            chunks = _split_chunks(content_norm, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP, _CHUNK_MAX_COUNT)
-            logging.info(f"✂️  Chunking contenido en {len(chunks)} trozos (≈{_CHUNK_MAX_CHARS} chars).")
-            resumen_obj = _resumen_chunked(client, chunks, deadline_ts)
-            impacto_obj = _impacto_chunked(client, chunks, deadline_ts)
-    except Exception as e:
-        # Fallback total: si algo fue mal, devolvemos estructuras vacías, nunca reventamos el flujo
-        logging.error(f"❌ OpenAI error global (usar vacíos): {e}")
-        resumen_obj, impacto_obj = _EMPTY_RESUMEN, _EMPTY_IMPACTO
+    # ───────────────── Resumen (JSON) ─────────────────
+    resumen_schema = copy.deepcopy(_RESUMEN_JSON_SCHEMA_BASE)
+    resumen_schema["schema"]["properties"]["key_dates_events"]["minItems"] = 1 if has_dates else 0
+
+    resumen_parts: List[Dict[str, Any]] = []
+    for idx, ch in enumerate(chunks, start=1):
+        resumen_user_lines = [
+            f"(Parte {idx}/{len(chunks)}) Devuelve EXACTAMENTE este objeto conforme al esquema.",
+            "- Español claro y conciso. Frases cortas.",
+            "- Si el texto incluye firma/publicación/entrada en vigor, AÑÁDELAS en key_dates_events.",
+            "- Si solo hay mes/año (sin día), usa el formato '<mes> de YYYY 00:00: Evento'.",
+            "- Deduplica fechas/horas/lugares; omite lugar si no aparece.",
+            "- Si es CONVOCATORIA: incluye TODAS las convocatorias (primera/segunda) con hora y lugar si constan, y el orden del día en key_changes.",
+            "- Si falta un dato, usa \"\" o [].",
+            "",
+            "<<<CONTENIDO>>>",
+            ch,
+            "",
+            "<<<PISTAS_DETECTADAS>>>",
+            json.dumps(hints, ensure_ascii=False),
+        ]
+        resumen_messages = [
+            {"role": "system", "content": (
+                "Eres un asistente legal experto en el BOE (España). "
+                "Responde EXCLUSIVAMENTE en JSON válido conforme al esquema. "
+                "No añadas texto fuera del JSON. No inventes datos."
+            )},
+            {"role": "user", "content": "\n".join(resumen_user_lines)},
+        ]
+        try:
+            r_obj = _json_schema_completion_with_retry(
+                client,
+                messages=resumen_messages,
+                schema=resumen_schema,
+                model=_MODEL_SUMMARY,
+                max_tokens=900,
+                temperature=0.1,
+                deadline_ts=deadline_ts,
+                seed=7,
+            )
+            resumen_parts.append(_ensure_resumen_shape(r_obj))
+        except Exception as e:
+            logging.error(f"❌ OpenAI error (resumen chunk {idx}): {e}")
+
+    resumen_final_obj = _merge_resumen_objs(resumen_parts) if resumen_parts else dict(_EMPTY_RESUMEN)
+
+    # ───────────────── Impacto (JSON) ─────────────────
+    impacto_parts: List[Dict[str, Any]] = []
+    for idx, ch in enumerate(chunks, start=1):
+        impacto_user_lines = [
+            f"(Parte {idx}/{len(chunks)}) Devuelve EXACTAMENTE este objeto con el esquema.",
+            "Guía:",
+            "- CONVOCATORIA: afectados (miembros/propietarios/etc.), cambios (elección de cargos, aprobación de cuentas…), riesgos (quórum/inasistencia), recomendaciones (asistir/delegar, puntualidad, revisar documentación).",
+            "- LICITACIÓN: plazos, documentación, solvencia/garantías; riesgos de forma/plazos; recomendaciones para no quedar excluido.",
+            "- RESOLUCIÓN/NOMBR.: obligaciones/efectos y recomendaciones de cumplimiento.",
+            "- Listas ordenadas por importancia. Frases cortas. Sin redundancias.",
+            "- Si falta dato, usa [].",
+            "- Si el texto contiene FECHAS (firma/entrada en vigor/plazos), incluye acciones con hito en cambios_operativos (p. ej., 'Adaptar sistemas antes del 01/01/2026').",
+            "",
+            "<<<CONTENIDO>>>",
+            ch,
+            "",
+            "<<<PISTAS_DETECTADAS>>>",
+            json.dumps(hints, ensure_ascii=False),
+        ]
+        impacto_messages = [
+            {"role": "system", "content": (
+                "Eres un analista legislativo. Responde EXCLUSIVAMENTE en JSON válido conforme al esquema. "
+                "No añadas nada fuera del JSON. No inventes. Usa SOLO el CONTENIDO de esta parte."
+            )},
+            {"role": "user", "content": "\n".join(impacto_user_lines)},
+        ]
+        try:
+            i_obj = _json_schema_completion_with_retry(
+                client,
+                messages=impacto_messages,
+                schema=_IMPACTO_JSON_SCHEMA,
+                model=_MODEL_IMPACT,
+                max_tokens=900,
+                temperature=0.1,
+                deadline_ts=deadline_ts,
+                seed=7,
+            )
+            impacto_parts.append(_ensure_impacto_shape(i_obj))
+        except Exception as e:
+            logging.error(f"❌ OpenAI error (impacto chunk {idx}): {e}")
+
+    impacto_final_obj = _merge_impacto_objs(impacto_parts) if impacto_parts else dict(_EMPTY_IMPACTO)
 
     return (
         titulo_resumen,
-        json.dumps(_ensure_resumen_shape(resumen_obj), ensure_ascii=False),
-        json.dumps(_ensure_impacto_shape(impacto_obj), ensure_ascii=False),
+        json.dumps(resumen_final_obj, ensure_ascii=False),
+        json.dumps(impacto_final_obj, ensure_ascii=False),
     )
