@@ -16,3 +16,4 @@ hypercorn[trio]
 PyJWT[crypto]==2.9.0
 beautifulsoup4
 lxml
+pdfminer.six

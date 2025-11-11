@@ -1,3 +1,4 @@
+# app/services/parser.py
 from __future__ import annotations
 
 import logging
@@ -7,12 +8,12 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 from psycopg2 import sql
 
-import requests
-from bs4 import BeautifulSoup
-
 from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
+
+# NEW: enricher
+from app.services.html_enricher import enrich_boe_text
 
 # ───────────────────── Import robusto del lookup ─────────────────────
 try:
@@ -22,7 +23,6 @@ except Exception:
 
 def _fallback_normalize_code(code: str) -> str:
     s = "" if code is None else str(code).strip()
-    # Quitamos ceros a la izquierda para unificar (0310 -> 310)
     s = re.sub(r"^0+", "", s)
     return s or "0"
 
@@ -73,7 +73,7 @@ def _fallback_generic_cur(cur, table: str, codigo: str, nombre: str) -> str:
         return "update_name"
     return "noop"
 
-# Símbolos a usar en el parser (o fallbacks)
+# Símbolos a usar
 normalize_code = getattr(_lookup_mod, "normalize_code", _fallback_normalize_code)
 
 def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
@@ -121,7 +121,7 @@ def _emptyish(x) -> bool:
         return len(x) == 0
     return False
 
-def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
+def _compose_base_text(item: ET.Element, seccion, dept, epigrafe) -> str:
     candidates = []
     for tag in ("contenido","texto","sumario","extracto","resumen","descripcion","descripción","cuerpo","detalle"):
         val = item.findtext(tag)
@@ -140,44 +140,9 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
 
     return "\n\n".join([c for c in candidates if c]).strip()
 
-# ───────────────────── Enriquecimiento: HTML del BOE ─────────────────────
-_HTML_HEADERS = {
-    "User-Agent": "boe-parser/1.0 (+https://boe.es; github actions)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-def _fetch_html_text(url_html: str, timeout_connect: float = 10.0, timeout_read: float = 20.0) -> str:
-    """Descarga la página HTML del BOE y extrae texto limpio con BeautifulSoup."""
-    if not url_html or not url_html.strip():
-        return ""
-    try:
-        resp = requests.get(url_html.strip(), headers=_HTML_HEADERS, timeout=(timeout_connect, timeout_read))
-        if resp.status_code >= 400:
-            logger.warning(f"⚠️ HTML BOE HTTP {resp.status_code} en {url_html}")
-            return ""
-        html = resp.text or ""
-        if not html.strip():
-            return ""
-        soup = BeautifulSoup(html, "lxml")  # necesita lxml
-        # elimina scripts/styles/nav
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-            tag.decompose()
-        # Algunas páginas del BOE ponen el contenido en #textoxx / .dispo / etc.
-        main = soup.find(id="texto") or soup.find("div", class_="dispo") or soup.body or soup
-        text = main.get_text("\n")
-        # normaliza
-        text = re.sub(r"\r\n", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t\f\v]+", " ", text)
-        return text.strip()
-    except Exception as e:
-        logger.warning(f"⚠️ No se pudo extraer HTML del BOE ({url_html}): {e}")
-        return ""
-
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     identificador = (item.findtext("identificador", "") or "").strip()
     titulo = (item.findtext("titulo", "") or "").strip()
-
     if not identificador or not titulo:
         logger.warning("❗ Ítem omitido por identificador o título vacío.")
         counters["omitidos_vacios"] += 1
@@ -189,7 +154,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         counters["omitidos_existentes"] += 1
         return
 
-    # Normaliza códigos y asegura lookups (inserta/actualiza si no existen)
+    # Normaliza códigos y asegura lookups
     sec_codigo_norm = normalize_code(seccion.get("codigo", "") if seccion else "")
     dep_codigo_norm = normalize_code(dept.get("codigo", "") if dept else "")
 
@@ -205,26 +170,24 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         if act_dep == "insert": counters["lookup_dep_insert"] += 1
         elif act_dep == "update_name": counters["lookup_dep_update"] += 1
 
-    cuerpo = _compose_text(item, seccion, dept, epigrafe)
+    # Texto base + enriquecimiento
+    base_text = _compose_base_text(item, seccion, dept, epigrafe)
 
-    # Si el cuerpo es pobre, intentamos enriquecer con el HTML del BOE
+    url_pdf = (item.findtext("url_pdf", "") or "").strip()
     url_html = (item.findtext("url_html", "") or "").strip()
-    is_poor = _emptyish(cuerpo) or len(cuerpo) < 280  # umbral conservador
-    if is_poor and url_html:
-        html_text = _fetch_html_text(url_html)
-        if html_text and len(html_text) > len(cuerpo):
-            logger.info(f"🧩 Enriquecido con HTML ({identificador}) +{len(html_text) - len(cuerpo)} chars")
-            cuerpo = html_text
+    url_xml = (item.findtext("url_xml", "") or "").strip()
+    # algunos feeds incluyen <url_txt>, si existiera:
+    url_txt = (item.findtext("url_txt", "") or "").strip()
 
-    if _emptyish(cuerpo):
-        # último fallback: título + metadatos
-        meta = " | ".join(filter(None, [
-            seccion.get("nombre", "") if seccion is not None else "",
-            dept.get("nombre", "") if dept is not None else "",
-            epigrafe.get("nombre", "") if epigrafe is not None else "",
-            (item.findtext("control", "") or "").strip(),
-        ]))
-        cuerpo = (titulo + ("\n\n" + meta if meta else "")).strip()
+    enriched_text, enriched = enrich_boe_text(
+        identificador=identificador,
+        url_html=url_html,
+        url_txt_candidate=url_txt or url_html,  # si no hay url_txt probamos a derivarlo del html
+        url_pdf=url_pdf,
+        base_text=base_text,
+        min_gain_chars=800,
+    )
+    cuerpo = enriched_text if not _emptyish(enriched_text) else base_text
 
     try:
         titulo_resumen, resumen_json, impacto_json = get_openai_responses(titulo, cuerpo)
@@ -256,20 +219,24 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             titulo_resumen_final,
             resumen_comp,
             impacto_comp,
-            (item.findtext("url_pdf", "") or "").strip(),
+            url_pdf,
             url_html,
-            (item.findtext("url_xml", "") or "").strip(),
+            url_xml,
             sec_codigo_norm if seccion else "",
             dep_codigo_norm if dept else "",
             (epigrafe.get("nombre", "") if epigrafe else "").strip(),
             (item.findtext("control", "") or "").strip(),
-            fecha_publicacion,  # psycopg2 acepta date o None
+            fecha_publicacion,
             clase_item,
         ),
     )
 
     logger.info(f"✅ Insertado: {identificador}")
+
     counters["insertados"] += 1
+    if enriched:
+        # log informativo (el propio enricher ya escribe el +chars)
+        pass
 
 def parse_and_insert(root: ET.Element) -> int:
     counters = {
