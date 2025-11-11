@@ -1,4 +1,3 @@
-# app/services/openai_service.py
 from __future__ import annotations
 
 import os, json, time, logging, random, re, copy
@@ -32,8 +31,6 @@ _EMPTY_IMPACTO = {
 }
 
 # ─────────────────────────── JSON Schemas base ───────────────────────────
-# Nota: el schema de RESUMEN usa "summary" (alineado con Postman). El normalizador
-# acepta "context" por compatibilidad hacia atrás.
 _RESUMEN_JSON_SCHEMA_BASE: Dict[str, Any] = {
     "name": "boe_resumen",
     "schema": {
@@ -48,7 +45,6 @@ _RESUMEN_JSON_SCHEMA_BASE: Dict[str, Any] = {
             },
             "key_dates_events": {
                 "type": "array",
-                # minItems se ajusta dinámicamente más abajo
                 "maxItems": 10,
                 "items": {"type": "string"},
             },
@@ -64,11 +60,11 @@ _IMPACTO_JSON_SCHEMA: Dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "afectados": {"type": "array", "items": {"type": "string"}},
-            "cambios_operativos": {"type": "array", "items": {"type": "string"}},
-            "riesgos_potenciales": {"type": "array", "items": {"type": "string"}},
-            "beneficios_previstos": {"type": "array", "items": {"type": "string"}},
-            "recomendaciones": {"type": "array", "items": {"type": "string"}},
+                "afectados": {"type": "array", "items": {"type": "string"}},
+                "cambios_operativos": {"type": "array", "items": {"type": "string"}},
+                "riesgos_potenciales": {"type": "array", "items": {"type": "string"}},
+                "beneficios_previstos": {"type": "array", "items": {"type": "string"}},
+                "recomendaciones": {"type": "array", "items": {"type": "string"}},
         },
         "required": [
             "afectados",
@@ -328,7 +324,6 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
     content_norm = _normalize_content(content or "")
     hints = _extract_hints(content_norm)
     has_dates = _has_dates(content_norm, hints)
-    is_convocatoria = bool(re.search(r"\bconvoca|convocatoria|junta|asamblea|orden del d[ií]a\b", content_norm, re.I))
 
     # ───────────────────────── 1) Título (texto) ─────────────────────────
     title_messages = [
@@ -356,7 +351,6 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
     titulo_resumen = _grade_title(titulo_resumen_raw)
 
     # ───────────────────────── 2) Resumen (JSON) ─────────────────────────
-    # Schema dinámico: fuerza al menos un hito si hay fechas en el texto
     resumen_schema = copy.deepcopy(_RESUMEN_JSON_SCHEMA_BASE)
     resumen_schema["schema"]["properties"]["key_dates_events"]["minItems"] = 1 if has_dates else 0
 
@@ -367,7 +361,6 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
         "Usa SOLO el CONTENIDO como fuente de verdad; CONTEXT_DUMP/PISTAS son orientativos."
     )
 
-    # Reglas alineadas con Postman (fechas, convocatorias, mes/año)
     resumen_user_lines = [
         "Devuelve EXACTAMENTE este objeto conforme al esquema.",
         "- Español claro y conciso. Frases cortas.",
@@ -415,9 +408,7 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
         "- Listas ordenadas por importancia. Frases cortas. Sin redundancias.",
         "- Si falta dato, usa [].",
         "",
-        # IMPORTANTÍSIMO: cuando hay fechas, pedimos acciones con hito
-        ("- Si el texto contiene FECHAS (firma/entrada en vigor/plazos), incluye acciones con hito en "
-         "cambios_operativos (p. ej., 'Adaptar sistemas antes del 01/01/2026', 'Presentar en febrero de 2026')."),
+        "- Si el texto contiene FECHAS (firma/entrada en vigor/plazos), incluye acciones con hito en cambios_operativos.",
         "",
         "<<<CONTENIDO>>>",
         content_norm,

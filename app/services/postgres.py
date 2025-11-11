@@ -1,4 +1,3 @@
-# app/services/postgres.py
 from __future__ import annotations
 
 import os
@@ -36,6 +35,8 @@ def _normalize_db_url(url: str) -> str:
     url = _append_param(url, "application_name", app_name)
 
     return url
+
+from contextlib import contextmanager
 
 @contextmanager
 def get_db():

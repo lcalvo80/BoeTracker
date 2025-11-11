@@ -1,4 +1,3 @@
-# app/update_boe.py
 import os
 import sys
 import logging

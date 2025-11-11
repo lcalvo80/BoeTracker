@@ -1,4 +1,3 @@
-# app/services/parser.py
 from __future__ import annotations
 
 import logging
@@ -8,12 +7,14 @@ from typing import Optional
 from xml.etree import ElementTree as ET
 from psycopg2 import sql
 
+import requests
+from bs4 import BeautifulSoup
+
 from app.services.openai_service import get_openai_responses
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
 
 # ───────────────────── Import robusto del lookup ─────────────────────
-# Cargamos el MÓDULO y luego tomamos símbolos con getattr; si faltan, definimos fallbacks.
 try:
     import app.services.lookup as _lookup_mod  # type: ignore
 except Exception:
@@ -139,11 +140,44 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
 
     return "\n\n".join([c for c in candidates if c]).strip()
 
+# ───────────────────── Enriquecimiento: HTML del BOE ─────────────────────
+_HTML_HEADERS = {
+    "User-Agent": "boe-parser/1.0 (+https://boe.es; github actions)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+def _fetch_html_text(url_html: str, timeout_connect: float = 10.0, timeout_read: float = 20.0) -> str:
+    """Descarga la página HTML del BOE y extrae texto limpio con BeautifulSoup."""
+    if not url_html or not url_html.strip():
+        return ""
+    try:
+        resp = requests.get(url_html.strip(), headers=_HTML_HEADERS, timeout=(timeout_connect, timeout_read))
+        if resp.status_code >= 400:
+            logger.warning(f"⚠️ HTML BOE HTTP {resp.status_code} en {url_html}")
+            return ""
+        html = resp.text or ""
+        if not html.strip():
+            return ""
+        soup = BeautifulSoup(html, "lxml")  # necesita lxml
+        # elimina scripts/styles/nav
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+        # Algunas páginas del BOE ponen el contenido en #textoxx / .dispo / etc.
+        main = soup.find(id="texto") or soup.find("div", class_="dispo") or soup.body or soup
+        text = main.get_text("\n")
+        # normaliza
+        text = re.sub(r"\r\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t\f\v]+", " ", text)
+        return text.strip()
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo extraer HTML del BOE ({url_html}): {e}")
+        return ""
+
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     identificador = (item.findtext("identificador", "") or "").strip()
     titulo = (item.findtext("titulo", "") or "").strip()
 
-    # ✅ FIX SyntaxError
     if not identificador or not titulo:
         logger.warning("❗ Ítem omitido por identificador o título vacío.")
         counters["omitidos_vacios"] += 1
@@ -172,7 +206,18 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         elif act_dep == "update_name": counters["lookup_dep_update"] += 1
 
     cuerpo = _compose_text(item, seccion, dept, epigrafe)
+
+    # Si el cuerpo es pobre, intentamos enriquecer con el HTML del BOE
+    url_html = (item.findtext("url_html", "") or "").strip()
+    is_poor = _emptyish(cuerpo) or len(cuerpo) < 280  # umbral conservador
+    if is_poor and url_html:
+        html_text = _fetch_html_text(url_html)
+        if html_text and len(html_text) > len(cuerpo):
+            logger.info(f"🧩 Enriquecido con HTML ({identificador}) +{len(html_text) - len(cuerpo)} chars")
+            cuerpo = html_text
+
     if _emptyish(cuerpo):
+        # último fallback: título + metadatos
         meta = " | ".join(filter(None, [
             seccion.get("nombre", "") if seccion is not None else "",
             dept.get("nombre", "") if dept is not None else "",
@@ -212,7 +257,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             resumen_comp,
             impacto_comp,
             (item.findtext("url_pdf", "") or "").strip(),
-            (item.findtext("url_html", "") or "").strip(),
+            url_html,
             (item.findtext("url_xml", "") or "").strip(),
             sec_codigo_norm if seccion else "",
             dep_codigo_norm if dept else "",
@@ -256,7 +301,6 @@ def parse_and_insert(root: ET.Element) -> int:
                     procesar_item(cur, item, seccion, None, None, clase_item, counters)
                     counters["huerfanos_en_seccion"] += 1
 
-        # Aseguramos persistencia de todo el batch
         conn.commit()
 
     logger.info("📊 RESUMEN FINAL:")
