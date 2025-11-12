@@ -39,7 +39,7 @@ jobs:
           --health-retries=5
 
     env:
-      # ⚠️ En CI usamos el Postgres del servicio (localhost) para no tocar producción
+      # ✅ En prod como el tuyo: usar secrets.DATABASE_URL
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
@@ -49,12 +49,14 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONPATH: .
+      LOG_LEVEL: INFO
 
-      # OpenAI (tuning razonable por defecto)
+      # OpenAI + log explícito de respuestas (título/resumen/impacto)
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
-      # OPENAI_MODEL: "gpt-4o"
+      OPENAI_DEBUG_LOG: "1"
+      # OPENAI_MODEL: "gpt-4o" # (opcional si quieres fijarlo)
 
     steps:
       - name: Checkout repo
@@ -76,29 +78,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Esperar a que PostgreSQL esté listo
+      - name: Esperar a que PostgreSQL del servicio esté listo (solo healthcheck)
         env:
           PGPASSWORD: test_password
         run: |
           for i in {1..30}; do
             if psql -h localhost -U test_user -d test_db -c "select 1" >/dev/null 2>&1; then
-              echo "PostgreSQL listo."
+              echo "PostgreSQL (servicio) listo."
               exit 0
             fi
-            echo "Esperando PostgreSQL ($i/30)..."
+            echo "Esperando PostgreSQL (servicio) ($i/30)..."
             sleep 2
           done
-          echo "PostgreSQL no respondió a tiempo." >&2
+          echo "PostgreSQL (servicio) no respondió a tiempo." >&2
           exit 1
 
-      # (Opcional) Cargar esquema si no usas migraciones automáticas.
-      # - name: Crear esquema mínimo
-      #   run: |
-      #     psql "$DATABASE_URL" <<'SQL'
-      #     -- crea aquí tablas base si no usas migraciones
-      #     SQL
-
-      - name: Ejecutar actualización del BOE (keep-alive + normalización)
+      - name: Ejecutar actualización del BOE (keep-alive + normalización fechas)
         shell: bash
         run: |
           set -euo pipefail
@@ -124,4 +119,5 @@ jobs:
           if [[ -n "${TO_NORM}" ]]; then ARGS+=(--to "$TO_NORM"); fi
 
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
+          # stdbuf para flush inmediato de logs (incluyendo OpenAI_DEBUG_LOG)
           stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"
