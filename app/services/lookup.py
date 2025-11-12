@@ -5,7 +5,7 @@ from typing import List, Dict, Optional, Tuple
 from psycopg2 import sql
 from app.services.postgres import get_db
 
-# ───────────────── Helpers internos ─────────────────
+# ───────────── Helpers ─────────────
 
 def normalize_code(code: Optional[str]) -> str:
     """Quita ceros a la izquierda. Si queda vacío, devuelve '0'."""
@@ -80,7 +80,7 @@ def _upsert_lookup_cur(cur, table: str, codigo: str, nombre: str) -> str:
 
     return "noop"
 
-# ───────────────── ensure_* usados por parser.py ─────────────────
+# ───────────── API pública (para parser / servicios) ─────────────
 
 def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
     """Asegura/actualiza la fila en public.secciones_lookup. Devuelve 'insert'|'update_name'|'noop'."""
@@ -90,9 +90,7 @@ def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
     """Asegura/actualiza la fila en public.departamentos_lookup. Devuelve 'insert'|'update_name'|'noop'."""
     return _upsert_lookup_cur(cur, "public.departamentos_lookup", codigo, nombre)
 
-# ───────────────── list_* usados por items_svc.py ─────────────────
-
-_DEPT_TABLE_CANDIDATES = (
+_DEPT_TABLE_CANDIDATES: Tuple[str, ...] = (
     "departamentos",
     "lookup_departamentos",
     "cat_departamentos",
@@ -100,7 +98,7 @@ _DEPT_TABLE_CANDIDATES = (
     "departamentos_lookup",
 )
 
-_SEC_TABLE_CANDIDATES = (
+_SEC_TABLE_CANDIDATES: Tuple[str, ...] = (
     "secciones",
     "lookup_secciones",
     "cat_secciones",
@@ -120,7 +118,6 @@ def list_departamentos_lookup() -> List[Dict[str, str]]:
         table = _pick_table(conn, _DEPT_TABLE_CANDIDATES)
         if not table:
             return []
-        # Normalizamos en SELECT por si hay históricos con ceros a la izquierda
         cur.execute(
             sql.SQL(
                 """
