@@ -22,7 +22,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # environment: Production  # ← descomenta si guardas secrets en un Environment
+    # environment: production  # ← descomenta si guardas los secrets en un Environment
 
     services:
       postgres:
@@ -37,8 +37,10 @@ jobs:
           --health-interval=10s --health-timeout=5s --health-retries=5
 
     env:
+      # Secrets de prod
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # Si aún tienes el typo OPENAI_APT_KEY en el Environment, este OR lo tolera temporalmente:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY && secrets.OPENAI_API_KEY || secrets.OPENAI_APT_KEY }}
 
       FROM_DATE: ${{ github.event.inputs.from_date }}
       TO_DATE: ${{ github.event.inputs.to_date }}
@@ -48,6 +50,7 @@ jobs:
       PYTHONPATH: .
       LOG_LEVEL: INFO
 
+      # OpenAI (tuning)
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
@@ -80,7 +83,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Fuerza cliente OpenAI 1.x (tu código usa openai.OpenAI(...))
+          # Asegura cliente OpenAI moderno si el requirements es laxo
           pip install --upgrade "openai>=1.44,<2"
 
       - name: Sanity check secrets (fail fast)
@@ -94,7 +97,6 @@ jobs:
             echo "::error::DATABASE_URL no está definido."
             exit 1
           fi
-          # Longitud y patrón de seguridad (sin imprimir la clave)
           LEN=$(echo -n "$OPENAI_API_KEY" | wc -c || true)
           if [ "$LEN" -lt 20 ]; then
             echo "::error::OPENAI_API_KEY demasiado corto ($LEN). ¿Espacios o valor vacío?"
@@ -107,7 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, ssl, sys, urllib.request, json
+          import os, ssl, sys, urllib.request
           k = (os.getenv("OPENAI_API_KEY") or "").strip()
           if not k or not k.startswith("sk-"):
               print("OPENAI_API_KEY ausente o inválido", file=sys.stderr); sys.exit(1)
@@ -115,12 +117,9 @@ jobs:
               "https://api.openai.com/v1/models",
               headers={"Authorization": f"Bearer {k}"}
           )
-          try:
-              with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=15) as r:
-                  print("OpenAI /v1/models status:", r.status)
-                  sys.exit(0 if r.status == 200 else 1)
-          except Exception as e:
-              print("Fallo auth OpenAI:", e, file=sys.stderr); sys.exit(1)
+          with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=15) as r:
+              print("OpenAI /v1/models status:", r.status)
+              sys.exit(0 if r.status == 200 else 1)
           PY
 
       - name: Esperar PostgreSQL (servicio)
@@ -154,3 +153,81 @@ jobs:
 
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
           stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # ▶️  IMPRESIONES DESDE LA DB (lo que hemos guardado)
+      # ─────────────────────────────────────────────────────────────────────
+
+      - name: DB → últimos 8 títulos (rápido)
+        run: |
+          echo "🧾 Últimos 8 títulos guardados:"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+            SELECT identificador,
+                   LEFT(COALESCE(titulo_resumen, titulo), 160) AS titulo,
+                   seccion_codigo AS sec,
+                   departamento_codigo AS dep,
+                   fecha_publicacion
+            FROM items
+            ORDER BY fecha_publicacion DESC NULLS LAST, identificador DESC
+            LIMIT 8;
+          "
+
+      - name: DB → descomprimir y mostrar RESUMEN/IMPACTO (3 últimos con datos)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, json, base64, gzip, io, psycopg2
+
+          def try_decompress(value):
+              if value is None:
+                  return None
+              s = value.strip()
+              # Si ya parece JSON, devuélvelo tal cual
+              if s.startswith("{") or s.startswith("["):
+                  return s
+              # Intento b64+gzip
+              try:
+                  raw = base64.b64decode(s, validate=False)
+                  try:
+                      txt = gzip.decompress(raw).decode("utf-8", "replace")
+                  except OSError:
+                      # A veces viene sin gzip, solo b64
+                      txt = raw.decode("utf-8", "replace")
+                  return txt
+              except Exception:
+                  # Último recurso: devuelve el original
+                  return s
+
+          url = os.getenv("DATABASE_URL")
+          conn = psycopg2.connect(url)
+          cur = conn.cursor()
+          cur.execute("""
+              SELECT identificador, titulo_resumen, resumen, informe_impacto
+              FROM items
+              WHERE resumen IS NOT NULL OR informe_impacto IS NOT NULL
+              ORDER BY fecha_publicacion DESC NULLS LAST, identificador DESC
+              LIMIT 3
+          """)
+          rows = cur.fetchall()
+          if not rows:
+              print("⚠️ No hay filas con resumen/impacto para mostrar.")
+          for i,(ident,tit,res,imp) in enumerate(rows, start=1):
+              print(f"\n━━━━━━━━━━━━━━━━ Item {i} — {ident} ━━━━━━━━━━━━━━━━")
+              print(f"📌 Título: {tit[:200] if tit else ''}")
+              res_txt = try_decompress(res)
+              imp_txt = try_decompress(imp)
+              try:
+                  res_obj = json.loads(res_txt) if res_txt else {}
+              except Exception:
+                  res_obj = {"_raw": (res_txt or "")[:2000]}
+              try:
+                  imp_obj = json.loads(imp_txt) if imp_txt else {}
+              except Exception:
+                  imp_obj = {"_raw": (imp_txt or "")[:2000]}
+              print("🧩 RESUMEN:")
+              print(json.dumps(res_obj, ensure_ascii=False, indent=2)[:6000])
+              print("🧪 IMPACTO:")
+              print(json.dumps(imp_obj, ensure_ascii=False, indent=2)[:6000])
+          cur.close(); conn.close()
+          PY
