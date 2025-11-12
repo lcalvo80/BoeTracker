@@ -22,6 +22,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # environment: Production   # ← si tus secrets están en un Environment
 
     services:
       postgres:
@@ -39,7 +40,6 @@ jobs:
           --health-retries=5
 
     env:
-      # ✅ En prod como el tuyo: usar secrets.DATABASE_URL
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
@@ -51,12 +51,11 @@ jobs:
       PYTHONPATH: .
       LOG_LEVEL: INFO
 
-      # OpenAI + log explícito de respuestas (título/resumen/impacto)
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
       OPENAI_DEBUG_LOG: "1"
-      # OPENAI_MODEL: "gpt-4o" # (opcional si quieres fijarlo)
+      # OPENAI_MODEL: "gpt-4o"
 
     steps:
       - name: Checkout repo
@@ -78,6 +77,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Sanity check secrets (fail fast)
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY no está definido o viene vacío (revisa nombre y ubicación del secret)."
+            exit 1
+          fi
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "::error::DATABASE_URL no está definido."
+            exit 1
+          fi
+          echo "✅ Secrets presentes. OPENAI_API_KEY length: $(echo -n "$OPENAI_API_KEY" | wc -c)"
+
+      - name: OpenAI auth check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, ssl, sys, urllib.request
+          k = os.getenv("OPENAI_API_KEY", "")
+          if not k:
+              print("OPENAI_API_KEY vacío", file=sys.stderr); sys.exit(1)
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/models",
+              headers={"Authorization": f"Bearer {k}"}
+          )
+          try:
+              with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=15) as r:
+                  print("OpenAI /v1/models status:", r.status)
+                  sys.exit(0 if r.status == 200 else 1)
+          except Exception as e:
+              print("Fallo auth OpenAI:", e, file=sys.stderr); sys.exit(1)
+          PY
+
       - name: Esperar a que PostgreSQL del servicio esté listo (solo healthcheck)
         env:
           PGPASSWORD: test_password
@@ -97,12 +129,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep-alive para evitar "no output" >10 min
           ( while true; do echo "💓 runner activo $(date -u +%H:%M:%S)"; sleep 60; done ) &
           KA_PID=$!
           trap "kill $KA_PID" EXIT
 
-          # Normaliza YYYYMMDD -> YYYY-MM-DD
           norm_date() {
             local s="${1:-}"
             if [[ "$s" =~ ^[0-9]{8}$ ]]; then
@@ -119,5 +149,4 @@ jobs:
           if [[ -n "${TO_NORM}" ]]; then ARGS+=(--to "$TO_NORM"); fi
 
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
-          # stdbuf para flush inmediato de logs (incluyendo OpenAI_DEBUG_LOG)
           stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"
