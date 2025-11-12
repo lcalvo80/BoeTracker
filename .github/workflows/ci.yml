@@ -22,22 +22,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # environment: Production   # ← si tus secrets están en un Environment
+    # environment: Production  # ← descomenta si guardas secrets en un Environment
 
     services:
       postgres:
         image: postgres:15
-        ports:
-          - 5432:5432
+        ports: [ "5432:5432" ]
         env:
           POSTGRES_USER: test_user
           POSTGRES_PASSWORD: test_password
           POSTGRES_DB: test_db
         options: >-
           --health-cmd="pg_isready -U test_user -d test_db"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
+          --health-interval=10s --health-timeout=5s --health-retries=5
 
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -55,11 +52,18 @@ jobs:
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
       OPENAI_DEBUG_LOG: "1"
-      # OPENAI_MODEL: "gpt-4o"
+      # OPENAI_MODEL: "gpt-4o"  # opcional
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Context check (repo/ref/actor)
+        run: |
+          echo "Repo: $GITHUB_REPOSITORY"
+          echo "Ref:  $GITHUB_REF"
+          echo "Actor: $GITHUB_ACTOR"
+          echo "Event: $GITHUB_EVENT_NAME"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -76,28 +80,37 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # Fuerza cliente OpenAI 1.x (tu código usa openai.OpenAI(...))
+          pip install --upgrade "openai>=1.44,<2"
 
       - name: Sanity check secrets (fail fast)
         run: |
           if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY no está definido o viene vacío (revisa nombre y ubicación del secret)."
+            echo "::error::OPENAI_API_KEY no está definido o viene vacío."
+            echo "::error::Revisa el nombre EXACTO del secret (OPENAI_API_KEY) y el Environment."
             exit 1
           fi
           if [ -z "${DATABASE_URL:-}" ]; then
             echo "::error::DATABASE_URL no está definido."
             exit 1
           fi
-          echo "✅ Secrets presentes. OPENAI_API_KEY length: $(echo -n "$OPENAI_API_KEY" | wc -c)"
+          # Longitud y patrón de seguridad (sin imprimir la clave)
+          LEN=$(echo -n "$OPENAI_API_KEY" | wc -c || true)
+          if [ "$LEN" -lt 20 ]; then
+            echo "::error::OPENAI_API_KEY demasiado corto ($LEN). ¿Espacios o valor vacío?"
+            exit 1
+          fi
+          echo "✅ OPENAI_API_KEY length: $LEN"
 
       - name: OpenAI auth check
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, ssl, sys, urllib.request
-          k = os.getenv("OPENAI_API_KEY", "")
-          if not k:
-              print("OPENAI_API_KEY vacío", file=sys.stderr); sys.exit(1)
+          import os, ssl, sys, urllib.request, json
+          k = (os.getenv("OPENAI_API_KEY") or "").strip()
+          if not k or not k.startswith("sk-"):
+              print("OPENAI_API_KEY ausente o inválido", file=sys.stderr); sys.exit(1)
           req = urllib.request.Request(
               "https://api.openai.com/v1/models",
               headers={"Authorization": f"Bearer {k}"}
@@ -110,43 +123,34 @@ jobs:
               print("Fallo auth OpenAI:", e, file=sys.stderr); sys.exit(1)
           PY
 
-      - name: Esperar a que PostgreSQL del servicio esté listo (solo healthcheck)
-        env:
-          PGPASSWORD: test_password
+      - name: Esperar PostgreSQL (servicio)
+        env: { PGPASSWORD: test_password }
         run: |
           for i in {1..30}; do
             if psql -h localhost -U test_user -d test_db -c "select 1" >/dev/null 2>&1; then
-              echo "PostgreSQL (servicio) listo."
-              exit 0
+              echo "PostgreSQL ok."; exit 0
             fi
-            echo "Esperando PostgreSQL (servicio) ($i/30)..."
-            sleep 2
+            echo "Esperando PostgreSQL ($i/30)..." ; sleep 2
           done
-          echo "PostgreSQL (servicio) no respondió a tiempo." >&2
-          exit 1
+          echo "PostgreSQL no respondió a tiempo." >&2 ; exit 1
 
       - name: Ejecutar actualización del BOE (keep-alive + normalización fechas)
         shell: bash
         run: |
           set -euo pipefail
-          ( while true; do echo "💓 runner activo $(date -u +%H:%M:%S)"; sleep 60; done ) &
-          KA_PID=$!
+          ( while true; do echo "💓 runner activo $(date -u +%H:%M:%S)"; sleep 60; done ) & KA_PID=$!
           trap "kill $KA_PID" EXIT
 
           norm_date() {
             local s="${1:-}"
-            if [[ "$s" =~ ^[0-9]{8}$ ]]; then
-              echo "${s:0:4}-${s:4:2}-${s:6:2}"
-            else
-              echo "$s"
-            fi
+            if [[ "$s" =~ ^[0-9]{8}$ ]]; then echo "${s:0:4}-${s:4:2}-${s:6:2}"; else echo "$s"; fi
           }
           FROM_NORM="$(norm_date "${FROM_DATE:-}")"
           TO_NORM="$(norm_date "${TO_DATE:-}")"
 
           ARGS=()
-          if [[ -n "${FROM_NORM}" ]]; then ARGS+=(--from "$FROM_NORM"); fi
-          if [[ -n "${TO_NORM}" ]]; then ARGS+=(--to "$TO_NORM"); fi
+          [[ -n "${FROM_NORM}" ]] && ARGS+=(--from "$FROM_NORM")
+          [[ -n "${TO_NORM}" ]] && ARGS+=(--to "$TO_NORM")
 
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
           stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"
