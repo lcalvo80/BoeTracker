@@ -106,8 +106,7 @@ _session = _build_session()
 def fetch_boe_xml(date_obj: Optional[Union[str, date, datetime]] = None) -> Optional[ET.Element]:
     """
     Descarga el sumario del BOE (YYYYMMDD) y devuelve el Element root.
-    - TZ por defecto Europe/Madrid.
-    - 404 se considera 'no hay sumario' → None (el caller decide).
+    404 se considera 'no hay sumario' → None.
     """
     dt = _parse_date_like(date_obj)
     dt_local_midnight = _to_local_midnight(dt)
