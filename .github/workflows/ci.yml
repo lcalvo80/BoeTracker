@@ -1,6 +1,7 @@
-name: CI - Python + PostgreSQL
+name: CI - Python + PostgreSQL (BOE Ingest)
 
 on:
+  # ▶️ Disparo manual con rango de fechas opcional
   workflow_dispatch:
     inputs:
       from_date:
@@ -14,6 +15,10 @@ on:
         type: string
         default: ""
 
+  # ⏰ Disparo diario automático (06:05 UTC ≈ 07:05 en España en invierno)
+  #schedule:
+   # - cron: "5 6 * * *"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -22,8 +27,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # environment: production  # ← descomenta si guardas los secrets en un Environment
+    # environment: production  # ← descomenta si usas un Environment con los secrets
 
+    # 🔹 Servicio Postgres LOCAL (opcional, lo dejamos por si quieres usarlo en el futuro)
+    # Ahora mismo el ingestor usa DATABASE_URL (Railway/prod), pero esto no molesta.
     services:
       postgres:
         image: postgres:15
@@ -37,11 +44,13 @@ jobs:
           --health-interval=10s --health-timeout=5s --health-retries=5
 
     env:
-      # Secrets de prod
+      # ▶️ BD de producción (Railway) — debe apuntar a TU DB real
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      # Si aún tienes el typo OPENAI_APT_KEY en el Environment, este OR lo tolera temporalmente:
+
+      # ▶️ OpenAI — tolera temporalmente el typo OPENAI_APT_KEY si siguiera existiendo
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY && secrets.OPENAI_API_KEY || secrets.OPENAI_APT_KEY }}
 
+      # Rango de fechas para el ingestor (sólo para workflow_dispatch)
       FROM_DATE: ${{ github.event.inputs.from_date }}
       TO_DATE: ${{ github.event.inputs.to_date }}
 
@@ -50,12 +59,25 @@ jobs:
       PYTHONPATH: .
       LOG_LEVEL: INFO
 
-      # OpenAI (tuning)
+      # ⚙️ OpenAI (alineado con openai_service.py / ai_boe.py)
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BACKOFF_BASE: "1.5"
-      OPENAI_DEBUG_LOG: "1"
-      # OPENAI_MODEL: "gpt-4o"  # opcional
+      OPENAI_BUDGET_SECS: "120"
+      OPENAI_CHUNK_SIZE_CHARS: "12000"
+      OPENAI_CHUNK_OVERLAP_CHARS: "500"
+      OPENAI_MAX_CHUNKS: "12"
+      # Modelos (si quieres fijarlos explícitamente; si no, usarán OPENAI_MODEL)
+      OPENAI_MODEL: "gpt-4o"
+      OPENAI_MODEL_TITLE: "gpt-4o"
+      OPENAI_MODEL_SUMMARY: "gpt-4o"
+      OPENAI_MODEL_IMPACT: "gpt-4o"
+
+      # 🕒 Timezone BOE (para fetch_boe_xml)
+      BOE_TZ: "Europe/Madrid"
+
+      # 🧩 Enriquecedor HTML/TXT sólo para campo `contenido` (no afecta a OpenAI)
+      ENRICH_MIN_GAIN_CHARS: "200"
 
     steps:
       - name: Checkout repo
@@ -83,7 +105,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Asegura cliente OpenAI moderno si el requirements es laxo
+          # Asegura cliente OpenAI moderno (alineado con openai_service/openai_client)
           pip install --upgrade "openai>=1.44,<2"
 
       - name: Sanity check secrets (fail fast)
@@ -122,16 +144,17 @@ jobs:
               sys.exit(0 if r.status == 200 else 1)
           PY
 
-      - name: Esperar PostgreSQL (servicio)
+      - name: Esperar PostgreSQL (servicio local)
         env: { PGPASSWORD: test_password }
         run: |
           for i in {1..30}; do
             if psql -h localhost -U test_user -d test_db -c "select 1" >/dev/null 2>&1; then
-              echo "PostgreSQL ok."; exit 0
+              echo "PostgreSQL de servicio OK (aunque la app usa DATABASE_URL de Railway)."; exit 0
             fi
-            echo "Esperando PostgreSQL ($i/30)..." ; sleep 2
+            echo "Esperando PostgreSQL de servicio ($i/30)..." ; sleep 2
           done
-          echo "PostgreSQL no respondió a tiempo." >&2 ; exit 1
+          echo "PostgreSQL (servicio) no respondió a tiempo. Esto NO afecta a la DB de producción, pero falla el job." >&2
+          exit 1
 
       - name: Ejecutar actualización del BOE (keep-alive + normalización fechas)
         shell: bash
@@ -140,6 +163,7 @@ jobs:
           ( while true; do echo "💓 runner activo $(date -u +%H:%M:%S)"; sleep 60; done ) & KA_PID=$!
           trap "kill $KA_PID" EXIT
 
+          # Normaliza fechas YYYYMMDD → YYYY-MM-DD (si vienen en el dispatch)
           norm_date() {
             local s="${1:-}"
             if [[ "$s" =~ ^[0-9]{8}$ ]]; then echo "${s:0:4}-${s:4:2}-${s:6:2}"; else echo "$s"; fi
@@ -152,6 +176,9 @@ jobs:
           [[ -n "${TO_NORM}" ]] && ARGS+=(--to "$TO_NORM")
 
           echo "Invocación: python update_boe.py ${ARGS[*]:-<sin args>}"
+          # 🔥 update_boe.py → fetch_boe_xml + parse_and_insert
+          #    parse_and_insert → parser.py → get_openai_responses
+          #    get_openai_responses → SIEMPRE usa texto del PDF (ya incorporado en backend)
           stdbuf -oL -eL python update_boe.py "${ARGS[@]:-}"
 
       # ─────────────────────────────────────────────────────────────────────
@@ -177,7 +204,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, json, base64, gzip, io, psycopg2
+          import os, json, base64, gzip, psycopg2
 
           def try_decompress(value):
               if value is None:
@@ -213,7 +240,7 @@ jobs:
           if not rows:
               print("⚠️ No hay filas con resumen/impacto para mostrar.")
           for i,(ident,tit,res,imp) in enumerate(rows, start=1):
-              print(f"\n━━━━━━━━━━━━━━━━ Item {i} — {ident} ━━━━━━━━━━━━━━━━")
+              print(f"\\n━━━━━━━━━━━━━━━━ Item {i} — {ident} ━━━━━━━━━━━━━━━━")
               print(f"📌 Título: {tit[:200] if tit else ''}")
               res_txt = try_decompress(res)
               imp_txt = try_decompress(imp)
