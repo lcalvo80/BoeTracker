@@ -5,7 +5,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # 🧠 Asegura que se pueda importar el paquete app/
-# (La carpeta donde está este fichero es el root del proyecto; app/ cuelga de aquí)
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
@@ -64,8 +63,7 @@ if __name__ == "__main__":
 
         # 2️⃣ Parsear el XML e insertar ítems en BD.
         #    Dentro de parse_and_insert es donde se llamará al pipeline de IA
-        #    (título, resumen, impacto) que ahora usa SIEMPRE el PDF del BOE
-        #    a través de tus servicios / APIs internos.
+        #    (título, resumen, impacto) que ahora usa SIEMPRE el PDF del BOE.
         inserted = parse_and_insert(root)
 
         final_count = get_item_count()

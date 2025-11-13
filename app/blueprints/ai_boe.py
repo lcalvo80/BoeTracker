@@ -67,16 +67,6 @@ def _extract_or_400(payload):
 def ai_title():
     """
     Genera un título corto (≤10 palabras) basado en el contenido del PDF del BOE.
-
-    Body esperado:
-    {
-      "identificador": "BOE-B-2025-41539",      # opcional pero recomendado
-      "url_pdf": "https://.../BOE-B-2025-41539.pdf",   # OBLIGATORIO
-      "titulo": "...",                         # opcional (metadato original)
-      "seccion": "...",                        # opcional
-      "departamento": "...",                   # opcional
-      "ctx_dump": ""                           # opcional, no confiable
-    }
     """
     payload = request.get_json(force=True, silent=True) or {}
     extracted, err = _extract_or_400(payload)

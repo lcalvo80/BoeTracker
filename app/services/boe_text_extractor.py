@@ -72,8 +72,12 @@ def _fetch_pdf_bytes(url_pdf: str, timeout: float = 30.0) -> Optional[bytes]:
     resp = s.get(url_pdf, timeout=timeout)
     if resp.ok and resp.content and len(resp.content) > 5000:
         return resp.content
-    _LOG.warning("PDF inválido o demasiado pequeño desde %s (status=%s, len=%s)",
-                 url_pdf, resp.status_code, len(resp.content) if resp.content else 0)
+    _LOG.warning(
+        "PDF inválido o demasiado pequeño desde %s (status=%s, len=%s)",
+        url_pdf,
+        resp.status_code,
+        len(resp.content) if resp.content else 0,
+    )
     return None
 
 
@@ -85,7 +89,9 @@ def extract_boe_text(identificador: str, url_pdf: str) -> str:
     - url_pdf es obligatorio y debe ser la URL directa al PDF del BOE.
     """
     if not url_pdf:
-        _LOG.error("extract_boe_text llamado sin url_pdf (identificador=%s)", identificador)
+        _LOG.error(
+            "extract_boe_text llamado sin url_pdf (identificador=%s)", identificador
+        )
         return ""
 
     try:
@@ -98,8 +104,11 @@ def extract_boe_text(identificador: str, url_pdf: str) -> str:
             text = _extract_pdf_pymupdf(pdf_bytes)
             if len(text) >= 50:
                 return text
-            _LOG.warning("Texto demasiado corto con PyMuPDF para %s (%s chars)",
-                         identificador, len(text))
+            _LOG.warning(
+                "Texto demasiado corto con PyMuPDF para %s (%s chars)",
+                identificador,
+                len(text),
+            )
         except Exception as e:
             _LOG.info("PyMuPDF falló para %s: %s", identificador, e)
 
@@ -108,13 +117,20 @@ def extract_boe_text(identificador: str, url_pdf: str) -> str:
             text = _extract_pdf_pdfminer(pdf_bytes)
             if len(text) >= 50:
                 return text
-            _LOG.warning("Texto demasiado corto con pdfminer para %s (%s chars)",
-                         identificador, len(text))
+            _LOG.warning(
+                "Texto demasiado corto con pdfminer para %s (%s chars)",
+                identificador,
+                len(text),
+            )
         except Exception as e:
             _LOG.warning("pdfminer.six falló para %s: %s", identificador, e)
 
     except Exception as e:
-        _LOG.error("Error general descargando/extrayendo PDF (%s, %s): %s",
-                   identificador, url_pdf, e)
+        _LOG.error(
+            "Error general descargando/extrayendo PDF (%s, %s): %s",
+            identificador,
+            url_pdf,
+            e,
+        )
 
     return ""
