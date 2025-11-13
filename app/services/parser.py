@@ -1,4 +1,3 @@
-# app/services/parser.py
 from __future__ import annotations
 
 import logging
@@ -22,9 +21,11 @@ except Exception:
 try:
     from app.services.html_enricher import enrich_boe_text  # type: ignore
 except Exception:
-    # Fallback inocuo
-    def enrich_boe_text(identificador, url_html, url_txt_candidate, url_pdf, base_text, min_gain_chars=800):
+    def enrich_boe_text(identificador, url_html, url_txt_candidate, url_pdf, base_text, min_gain_chars=200):
         return base_text, False  # type: ignore
+
+import os
+_ENRICH_MIN_GAIN = int(os.getenv("ENRICH_MIN_GAIN_CHARS", "200"))
 
 def _fallback_normalize_code(code: str) -> str:
     s = "" if code is None else str(code).strip()
@@ -88,8 +89,6 @@ def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
     fn = getattr(_lookup_mod, "ensure_departamento_cur", None)
     return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
 
-# ───────────────────── Lógica de parseo ─────────────────────
-
 logger = logging.getLogger(__name__)
 
 def clasificar_item(nombre_seccion: str) -> str:
@@ -119,7 +118,7 @@ def _emptyish(x) -> bool:
     if x is None:
         return True
     if isinstance(x, str):
-        s = x.trim() if hasattr(x, "trim") else x.strip()
+        s = x.strip()
         return len(s) == 0 or s in ("{}", "[]")
     if isinstance(x, (list, dict)):
         return len(x) == 0
@@ -146,7 +145,7 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
 
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     identificador = (item.findtext("identificador", "") or "").strip()
-    titulo = (item.findtext("titulo", "") or "").strip()
+    titulo        = (item.findtext("titulo", "") or "").strip()
 
     if not identificador or not titulo:
         logger.warning("❗ Ítem omitido por identificador o título vacío.")
@@ -175,15 +174,13 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         if act_dep == "insert": counters["lookup_dep_insert"] += 1
         elif act_dep == "update_name": counters["lookup_dep_update"] += 1
 
-    # Texto base
+    # Texto base y URLs
     cuerpo_base = _compose_text(item, seccion, dept, epigrafe)
-
-    # URLs útiles del feed
-    url_pdf = (item.findtext("url_pdf", "") or "").strip()
+    url_pdf  = (item.findtext("url_pdf", "") or "").strip()
     url_html = (item.findtext("url_html", "") or "").strip()
-    url_xml = (item.findtext("url_xml", "") or "").strip()  # por ahora no usado en enriquecido
+    url_xml  = (item.findtext("url_xml", "") or "").strip()
 
-    # Enriquecer si aporta valor
+    # Enriquecer (tolerante a fallos y aceptando textos cortos)
     try:
         cuerpo_final, enriched = enrich_boe_text(
             identificador=identificador,
@@ -191,7 +188,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             url_txt_candidate=url_html or None,
             url_pdf=url_pdf or None,
             base_text=cuerpo_base,
-            min_gain_chars=800,  # configurable
+            min_gain_chars=_ENRICH_MIN_GAIN,
         )
         if enriched:
             logger.info(f"🧩 Enriquecido ({identificador}) usando contenido externo")
@@ -199,7 +196,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         logger.warning(f"⚠️ Enriquecido falló ({identificador}): {e}")
         cuerpo_final = cuerpo_base
 
-    # Fallback si quedó vacío
+    # Fallback si quedó vacío: nunca dejamos sin procesar
     if _emptyish(cuerpo_final):
         meta = " | ".join(filter(None, [
             seccion.get("nombre", "") if seccion is not None else "",
@@ -209,7 +206,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         ]))
         cuerpo_final = (titulo + ("\n\n" + meta if meta else "")).strip()
 
-    # OpenAI (no bloqueante: si falla, seguimos insertando el ítem)
+    # OpenAI (nunca bloquea el insert; si falla, guardamos vacíos válidos)
     try:
         titulo_resumen, resumen_json, impacto_json = get_openai_responses(titulo, cuerpo_final)
     except Exception as e:
@@ -223,15 +220,21 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     fecha_publicacion = safe_date((item.findtext("fecha_publicacion", "") or "").strip())
     titulo_resumen_final = (titulo_resumen or "").strip().rstrip(".") or titulo
 
+    # Migración defensiva + insert con contenido
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS contenido TEXT")
+
     cur.execute(
         """
         INSERT INTO items (
             identificador, titulo, titulo_resumen, resumen, informe_impacto,
-            url_pdf, url_html, url_xml,
+            contenido, url_pdf, url_html, url_xml,
             seccion_codigo, departamento_codigo,
             epigrafe, control, fecha_publicacion, clase_item
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                %s, %s, %s, %s)
         ON CONFLICT (identificador) DO NOTHING
         """,
         (
@@ -240,6 +243,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             titulo_resumen_final,
             resumen_comp,
             impacto_comp,
+            cuerpo_final,
             url_pdf,
             url_html,
             url_xml,
@@ -270,6 +274,7 @@ def parse_and_insert(root: ET.Element) -> int:
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS contenido TEXT")
             for seccion in root.findall(".//seccion"):
                 sec_nombre = (seccion.get("nombre", "") or "").strip()
                 clase_item = clasificar_item(sec_nombre)
