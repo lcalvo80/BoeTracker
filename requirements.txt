@@ -17,3 +17,4 @@ PyJWT[crypto]==2.9.0
 beautifulsoup4
 lxml
 pdfminer.six
+pymupdf>=1.24.9

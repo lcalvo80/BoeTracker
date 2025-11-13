@@ -85,6 +85,9 @@ def create_app() -> Flask:
     from app.blueprints.meta import bp as meta_bp
     from app.blueprints.comments import bp as comments_bp
 
+    # IA BOE: título + resumen + impacto (SIEMPRE PDF)
+    from app.blueprints.ai_boe import bp as ai_boe_bp
+
     # DEV only (_int: endpoints de prueba OpenAI y utilidades)
     from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
 
@@ -95,6 +98,9 @@ def create_app() -> Flask:
     app.register_blueprint(items_bp, url_prefix="/api/items")
     app.register_blueprint(comments_bp, url_prefix="/api/items")  # /api/items/<ident>/comments
     app.register_blueprint(meta_bp, url_prefix="/api/meta")       # /api/meta/filters
+
+    # ✅ Nuevas APIs IA BOE
+    app.register_blueprint(ai_boe_bp, url_prefix="/api/ai")
 
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")
