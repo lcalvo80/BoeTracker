@@ -23,15 +23,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
-    # 🔗 Aquí NO definimos services.postgres → usa la DB real de Railway
     env:
+      # 🔗 IMPORTANTÍSIMO: misma DB que Railway
       DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: gpt-4o
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
-      # OPENAI_DISABLE: "0"  # opcional: flag para apagar IA si lo necesitas
 
     steps:
       - name: Checkout
@@ -57,12 +56,9 @@ jobs:
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
 
-          # El script `update_boe.py`:
-          #  - Descarga el sumario del BOE (XML) para cada fecha
-          #  - Descarga el PDF de cada notificación
-          #  - Extrae texto del PDF
-          #  - Llama a OpenAI (título, resumen, impacto) usando ese texto
-          #  - Inserta/actualiza los registros en la DB apuntada por DATABASE_URL
+          # 🚫 IMPORTANTE:
+          # Ya NO usamos 'python -m app.scripts.update_boe'
+          # ✅ Usamos el script de la RAÍZ: update_boe.py
 
           if [ -n "$FROM_DATE" ] && [ -n "$TO_DATE" ]; then
             python update_boe.py --from-date "$FROM_DATE" --to-date "$TO_DATE"
@@ -72,7 +68,7 @@ jobs:
             python update_boe.py
           fi
 
-      # (Opcional) backfill de items sin IA que hayan podido fallar por timeout
+      # (Opcional) Reprocesar items sin IA
       # - name: Reprocesar items sin IA (backfill IA)
       #   env:
       #     DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
