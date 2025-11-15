@@ -1,4 +1,4 @@
-# app/scripts/update_boe.py
+# update_boe.py
 from __future__ import annotations
 
 import argparse
@@ -10,13 +10,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Determinar la raíz del proyecto (directorio que contiene el paquete `app`)
 # Estructura esperada:
 #   <PROJECT_ROOT>/
+#       update_boe.py
 #       app/
 #         services/
 #         scripts/
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
@@ -24,7 +24,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.services.postgres import get_db
 from app.services.boe_fetcher import fetch_boe_xml
 from app.services.parser import parse_and_insert
-
 
 # 🪵 Logging básico
 logging.basicConfig(
@@ -41,12 +40,10 @@ if os.getenv("GITHUB_ACTIONS") != "true":
     else:
         logging.warning("⚠️ No .env file found.")
 
-
 # 🔐 Verificar API Key (necesaria para las llamadas a OpenAI)
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    logging.error("❌ OPENAI_API_KEY not found. Check .env or GitHub secret.")
-    # Nota: salimos con código 1; en GitHub Actions fallará el job
+    logging.error("❌ OPENAI_API_KEY not found. Check .env o GitHub secret.")
     sys.exit(1)
 
 

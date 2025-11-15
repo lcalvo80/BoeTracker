@@ -31,8 +31,7 @@ jobs:
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
-      # Si usas flags extra en tu código:
-      # OPENAI_DISABLE: "0"
+      # OPENAI_DISABLE: "0"  # si quieres un flag duro para desactivar IA
 
     steps:
       - name: Checkout
@@ -58,7 +57,7 @@ jobs:
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
 
-          # El script `app.scripts.update_boe`:
+          # El script `update_boe.py`:
           #  - Descarga el sumario del BOE (XML) para cada fecha
           #  - Descarga el PDF de cada notificación
           #  - Extrae texto del PDF
@@ -66,15 +65,14 @@ jobs:
           #  - Inserta/actualiza los registros en la DB apuntada por DATABASE_URL
 
           if [ -n "$FROM_DATE" ] && [ -n "$TO_DATE" ]; then
-            python -m app.scripts.update_boe --from-date "$FROM_DATE" --to-date "$TO_DATE"
+            python update_boe.py --from-date "$FROM_DATE" --to-date "$TO_DATE"
           elif [ -n "$FROM_DATE" ]; then
-            python -m app.scripts.update_boe --from-date "$FROM_DATE"
+            python update_boe.py --from-date "$FROM_DATE"
           else
-            # Sin fechas → comportamiento por defecto del script (p.ej. hoy)
-            python -m app.scripts.update_boe
+            python update_boe.py
           fi
 
-      # (Opcional pero recomendable) Reprocesar items sin IA que hayan podido fallar por timeout
+      # (Opcional) backfill de items sin IA que hayan podido fallar por timeout
       # - name: Reprocesar items sin IA (backfill IA)
       #   env:
       #     DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
@@ -84,4 +82,4 @@ jobs:
       #     OPENAI_MAX_RETRIES: "3"
       #     OPENAI_BUDGET_SECS: "120"
       #   run: |
-      #     python -m app.scripts.refetch_missing_ai --limit 200
+      #     python -m app.scripts.refetch_missing_ai
