@@ -1,9 +1,10 @@
+# app/services/boe_fetcher.py
 from __future__ import annotations
 
+import logging
 import os
 import re
-import logging
-from datetime import datetime, date, time as dtime
+from datetime import date, datetime, time as dtime
 from typing import Optional, Union
 
 # Seguridad en parseo XML si está disponible
@@ -36,6 +37,7 @@ _BOE_BACKOFF_FACTOR = float(os.getenv("BOE_BACKOFF_FACTOR", "0.5"))
 _DEFAULT_TZ_NAME = os.getenv("BOE_TZ", "Europe/Madrid")
 try:
     from zoneinfo import ZoneInfo  # Python >= 3.9
+
     _DEFAULT_TZ = ZoneInfo(_DEFAULT_TZ_NAME)
 except Exception:
     _DEFAULT_TZ = None  # naive
@@ -48,6 +50,7 @@ headers = {
 _DATE_ISO = "%Y-%m-%d"
 _DATE_COMPACT = "%Y%m%d"
 
+
 def _to_local_midnight(dt: datetime) -> datetime:
     if _DEFAULT_TZ is None:
         return datetime.combine(dt.date(), dtime.min)
@@ -56,6 +59,7 @@ def _to_local_midnight(dt: datetime) -> datetime:
     else:
         dt = dt.astimezone(_DEFAULT_TZ)
     return datetime.combine(dt.date(), dtime.min, tzinfo=_DEFAULT_TZ)
+
 
 def _parse_date_like(date_like: Optional[Union[str, date, datetime]]) -> datetime:
     if date_like is None:
@@ -83,6 +87,7 @@ def _parse_date_like(date_like: Optional[Union[str, date, datetime]]) -> datetim
 
     raise TypeError(f"Tipo de fecha no soportado: {type(date_like)!r}")
 
+
 def _build_session(
     total_retries: int = _BOE_TOTAL_RETRIES,
     backoff_factor: float = _BOE_BACKOFF_FACTOR,
@@ -101,7 +106,9 @@ def _build_session(
     session.mount("http://", adapter)
     return session
 
+
 _session = _build_session()
+
 
 def fetch_boe_xml(date_obj: Optional[Union[str, date, datetime]] = None) -> Optional[ET.Element]:
     """

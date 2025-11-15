@@ -1,12 +1,12 @@
 # app/services/html_enricher.py
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
-import logging
-from typing import Optional, Tuple, List
-from urllib.parse import urlparse, parse_qs
+from typing import List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -25,15 +25,15 @@ except Exception:
 
 # ───────────────── Config via ENV (solo enriquecimiento) ─────────────────
 _ENRICH_CONNECT_TIMEOUT = float(os.getenv("ENRICH_CONNECT_TIMEOUT", "12"))
-_ENRICH_READ_TIMEOUT    = float(os.getenv("ENRICH_READ_TIMEOUT", "35"))
-_ENRICH_TOTAL_RETRIES   = int(os.getenv("ENRICH_TOTAL_RETRIES", "4"))
-_ENRICH_BACKOFF_FACTOR  = float(os.getenv("ENRICH_BACKOFF_FACTOR", "0.8"))
-_ENRICH_USER_AGENT      = os.getenv("ENRICH_USER_AGENT", "boe-enricher/1.0 (+github actions)")
+_ENRICH_READ_TIMEOUT = float(os.getenv("ENRICH_READ_TIMEOUT", "35"))
+_ENRICH_TOTAL_RETRIES = int(os.getenv("ENRICH_TOTAL_RETRIES", "4"))
+_ENRICH_BACKOFF_FACTOR = float(os.getenv("ENRICH_BACKOFF_FACTOR", "0.8"))
+_ENRICH_USER_AGENT = os.getenv("ENRICH_USER_AGENT", "boe-enricher/1.0 (+github actions)")
 
 # Accept rules (bajadas para no perder “B” cortas)
-_MIN_GAIN_CHARS         = int(os.getenv("ENRICH_MIN_GAIN_CHARS", "200"))
-_MIN_ABS_CHARS          = int(os.getenv("ENRICH_MIN_ABS_CHARS", "600"))
-_MIN_BASE_EMPTY_ACCEPT  = int(os.getenv("ENRICH_MIN_BASE_EMPTY_CHARS", "200"))
+_MIN_GAIN_CHARS = int(os.getenv("ENRICH_MIN_GAIN_CHARS", "200"))
+_MIN_ABS_CHARS = int(os.getenv("ENRICH_MIN_ABS_CHARS", "600"))
+_MIN_BASE_EMPTY_ACCEPT = int(os.getenv("ENRICH_MIN_BASE_EMPTY_CHARS", "200"))
 
 _MIN_SLEEP = float(os.getenv("ENRICH_MIN_SLEEP", "0.10"))
 _MAX_SLEEP = float(os.getenv("ENRICH_MAX_SLEEP", "0.30"))
@@ -46,9 +46,12 @@ _HEADERS = {
 # cache ligera para evitar re-requests
 _CACHE: dict[str, str] = {}
 
+
 def _sleep_jitter():
     import random
+
     time.sleep(random.uniform(_MIN_SLEEP, _MAX_SLEEP))
+
 
 def _build_session() -> requests.Session:
     retry = Retry(
@@ -68,7 +71,9 @@ def _build_session() -> requests.Session:
     s.mount("http://", adapter)
     return s
 
+
 _session = _build_session()
+
 
 def _extract_id_from_url(url: str) -> Optional[str]:
     try:
@@ -79,6 +84,7 @@ def _extract_id_from_url(url: str) -> Optional[str]:
         pass
     return None
 
+
 def _normalize_text(s: str) -> str:
     s = (s or "").replace("\u00A0", " ")
     s = re.sub(r"\r\n", "\n", s)
@@ -86,9 +92,12 @@ def _normalize_text(s: str) -> str:
     s = re.sub(r"[ \t\f\v]+", " ", s)
     return s.strip()
 
+
 def _fetch_text_url(url: str) -> Optional[str]:
     _sleep_jitter()
-    resp = _session.get(url, headers=_HEADERS, timeout=(_ENRICH_CONNECT_TIMEOUT, _ENRICH_READ_TIMEOUT))
+    resp = _session.get(
+        url, headers=_HEADERS, timeout=(_ENRICH_CONNECT_TIMEOUT, _ENRICH_READ_TIMEOUT)
+    )
     if 400 <= resp.status_code < 600:
         logging.info(f"enricher: HTTP {resp.status_code} en {url}")
         return None
@@ -118,22 +127,30 @@ def _fetch_text_url(url: str) -> Optional[str]:
 
     return _normalize_text(text or "")
 
+
 def _pdf_to_text(url_pdf: str) -> Optional[str]:
     if not url_pdf or pdf_extract_text is None:
         return None
     _sleep_jitter()
     try:
-        with _session.get(url_pdf, headers={"User-Agent": _ENRICH_USER_AGENT}, timeout=(_ENRICH_CONNECT_TIMEOUT, _ENRICH_READ_TIMEOUT), stream=True) as r:
+        with _session.get(
+            url_pdf,
+            headers={"User-Agent": _ENRICH_USER_AGENT},
+            timeout=(_ENRICH_CONNECT_TIMEOUT, _ENRICH_READ_TIMEOUT),
+            stream=True,
+        ) as r:
             if 400 <= r.status_code < 600:
                 logging.info(f"enricher: PDF HTTP {r.status_code} en {url_pdf}")
                 return None
             content = r.content
         import io
+
         txt = pdf_extract_text(io.BytesIO(content)) or ""
         return _normalize_text(txt)
     except Exception as e:
         logging.info(f"enricher: fallo extrayendo PDF {url_pdf}: {e}")
         return None
+
 
 def _should_accept(base_len: int, cand_len: int) -> bool:
     gain = cand_len - base_len
@@ -144,6 +161,7 @@ def _should_accept(base_len: int, cand_len: int) -> bool:
     if base_len < 80 and cand_len >= _MIN_BASE_EMPTY_ACCEPT:
         return True
     return False
+
 
 def enrich_boe_text(
     identificador: str,

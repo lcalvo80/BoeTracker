@@ -1,0 +1,87 @@
+name: BOE Ingest + AI (prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: "Fecha inicio (YYYY-MM-DD o YYYYMMDD, vacío = hoy)"
+        required: false
+        type: string
+        default: ""
+      to_date:
+        description: "Fecha fin (YYYY-MM-DD o YYYYMMDD, vacío = from_date)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    # 🔗 Aquí NO definimos services.postgres → usa la DB real de Railway
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-4o
+      OPENAI_TIMEOUT: "45"
+      OPENAI_MAX_RETRIES: "3"
+      OPENAI_BUDGET_SECS: "120"
+      # Si usas flags extra en tu código:
+      # OPENAI_DISABLE: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar ingesta BOE + PDF + IA
+        env:
+          FROM_DATE: ${{ github.event.inputs.from_date }}
+          TO_DATE: ${{ github.event.inputs.to_date }}
+        run: |
+          set -e
+
+          echo "FROM_DATE=${FROM_DATE}"
+          echo "TO_DATE=${TO_DATE}"
+
+          # El script `app.scripts.update_boe`:
+          #  - Descarga el sumario del BOE (XML) para cada fecha
+          #  - Descarga el PDF de cada notificación
+          #  - Extrae texto del PDF
+          #  - Llama a OpenAI (título, resumen, impacto) usando ese texto
+          #  - Inserta/actualiza los registros en la DB apuntada por DATABASE_URL
+
+          if [ -n "$FROM_DATE" ] && [ -n "$TO_DATE" ]; then
+            python -m app.scripts.update_boe --from-date "$FROM_DATE" --to-date "$TO_DATE"
+          elif [ -n "$FROM_DATE" ]; then
+            python -m app.scripts.update_boe --from-date "$FROM_DATE"
+          else
+            # Sin fechas → comportamiento por defecto del script (p.ej. hoy)
+            python -m app.scripts.update_boe
+          fi
+
+      # (Opcional pero recomendable) Reprocesar items sin IA que hayan podido fallar por timeout
+      # - name: Reprocesar items sin IA (backfill IA)
+      #   env:
+      #     DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+      #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      #     OPENAI_MODEL: gpt-4o
+      #     OPENAI_TIMEOUT: "45"
+      #     OPENAI_MAX_RETRIES: "3"
+      #     OPENAI_BUDGET_SECS: "120"
+      #   run: |
+      #     python -m app.scripts.refetch_missing_ai --limit 200

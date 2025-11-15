@@ -1,15 +1,19 @@
+# app/services/postgres.py
 from __future__ import annotations
 
 import os
-import psycopg2
 from contextlib import contextmanager
 from urllib.parse import urlparse
+
+import psycopg2
+
 
 def _append_param(url: str, k: str, v: str) -> str:
     if not v:
         return url
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}{k}={v}"
+
 
 def _normalize_db_url(url: str) -> str:
     # Si ya trae sslmode en la URL, respétalo; si no, decide por host
@@ -36,7 +40,6 @@ def _normalize_db_url(url: str) -> str:
 
     return url
 
-from contextlib import contextmanager
 
 @contextmanager
 def get_db():

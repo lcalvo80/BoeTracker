@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime, date
+from datetime import date, datetime
 from typing import Optional
 from xml.etree import ElementTree as ET
 
@@ -12,7 +12,7 @@ from psycopg2 import sql
 
 from app.services.openai_service import (
     get_openai_responses,
-    get_openai_responses_from_pdf,  # ⬅️ NUEVO
+    get_openai_responses_from_pdf,  # ⬅️ TEXTO PDF
 )
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
