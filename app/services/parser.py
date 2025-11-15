@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from datetime import date, datetime
 from typing import Optional
@@ -16,18 +15,6 @@ from app.services.openai_service import (
 )
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
-
-# ───────────────────── Enriquecedor de contenido ─────────────────────
-try:
-    from app.services.html_enricher import enrich_boe_text  # type: ignore
-except Exception:
-    # Fallback si no está disponible; no bloquea la ingesta.
-    def enrich_boe_text(
-        identificador, url_html, url_txt_candidate, url_pdf, base_text, min_gain_chars=200
-    ):
-        return base_text, False  # type: ignore
-
-_ENRICH_MIN_GAIN = int(os.getenv("ENRICH_MIN_GAIN_CHARS", "200"))
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +150,7 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
     """
     Intenta construir un cuerpo de texto base con los campos XML "normales".
     Se usa para el campo `contenido` y como fallback si todo lo demás falla.
+    (MVP: NO usamos html_enricher; para texto completo el FE enlaza a boe.es)
     """
     candidates = []
     for tag in (
@@ -236,23 +224,11 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     url_html = (item.findtext("url_html", "") or "").strip()
     url_xml = (item.findtext("url_xml", "") or "").strip()
 
-    # Enriquecer contenido para el campo `contenido` (HTML/TXT/PDF), tolerante a fallos
-    try:
-        cuerpo_final, enriched = enrich_boe_text(
-            identificador=identificador,
-            url_html=url_html or None,
-            url_txt_candidate=url_html or None,
-            url_pdf=url_pdf or None,
-            base_text=cuerpo_base,
-            min_gain_chars=_ENRICH_MIN_GAIN,
-        )
-        if enriched:
-            logger.info(f"🧩 Enriquecido ({identificador}) usando contenido externo")
-    except Exception as e:
-        logger.warning(f"⚠️ Enriquecido falló ({identificador}): {e}")
-        cuerpo_final = cuerpo_base
+    # MVP: NO llamamos a html_enricher.
+    # `contenido` será el cuerpo base construido desde el XML (sumario/extracto/etc).
+    cuerpo_final = cuerpo_base
 
-    # Fallback si quedó vacío: nunca dejamos sin contenido
+    # Fallback si quedó vacío: nunca dejamos sin contenido mínimo
     if _emptyish(cuerpo_final):
         meta = " | ".join(
             filter(
@@ -277,9 +253,9 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
                 url_pdf=url_pdf,
             )
         else:
-            # Fallback (raro): usamos el cuerpo enriquecido como antes
+            # Fallback (raro): usamos el cuerpo construido como contenido
             logger.warning(
-                "⚠️ Item %s sin url_pdf. Uso contenido enriquecido para OpenAI.",
+                "⚠️ Item %s sin url_pdf. Uso texto base para OpenAI.",
                 identificador,
             )
             titulo_resumen, resumen_json, impacto_json = get_openai_responses(
