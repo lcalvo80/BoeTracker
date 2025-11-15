@@ -31,7 +31,7 @@ jobs:
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
-      # OPENAI_DISABLE: "0"  # si quieres un flag duro para desactivar IA
+      # OPENAI_DISABLE: "0"  # opcional: flag para apagar IA si lo necesitas
 
     steps:
       - name: Checkout

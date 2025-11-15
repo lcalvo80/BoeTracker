@@ -18,8 +18,7 @@ DB_URL = os.getenv("DATABASE_URL")
 
 def _emptyish(x) -> bool:
     """
-    Copia de la lógica de parser._emptyish:
-    considera vacío None, "", "{}", "[]", listas/dicts vacíos.
+    Considera vacío: None, "", "{}", "[]", listas/dicts vacíos.
     """
     if x is None:
         return True
