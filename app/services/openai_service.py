@@ -1,38 +1,32 @@
 # app/services/openai_service.py
 from __future__ import annotations
 
-import copy
-import json
-import logging
-import os
-import random
-import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
+import os, json, time, logging, random, re, copy
+from typing import Dict, Any, Tuple, List, Optional
 
-from utils.helpers import clean_code_block, extract_section  # noqa: F401
-from app.services.boe_text_extractor import extract_boe_text  # ⬅️ TEXTO PDF
+from app.utils.helpers import clean_code_block, extract_section  # noqa: F401
+from app.services.boe_text_extractor import extract_boe_text  # ⬅️ NUEVO
 
 # ─────────────────────────── Config ───────────────────────────
-_OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "45"))
-_OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
-_OPENAI_BACKOFF_BASE = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
-_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-_OPENAI_BUDGET_SECS = float(os.getenv("OPENAI_BUDGET_SECS", "120"))
-_OPENAI_DISABLE = os.getenv("OPENAI_DISABLE", "0") == "1"
+_OPENAI_TIMEOUT       = int(os.getenv("OPENAI_TIMEOUT", "45"))
+_OPENAI_MAX_RETRIES   = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+_OPENAI_BACKOFF_BASE  = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
+_OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o")
+_OPENAI_BUDGET_SECS   = float(os.getenv("OPENAI_BUDGET_SECS", "120"))
+_OPENAI_DISABLE       = os.getenv("OPENAI_DISABLE", "0") == "1"
 
-_MODEL_TITLE = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
+_MODEL_TITLE   = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
 _MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL)
-_MODEL_IMPACT = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
+_MODEL_IMPACT  = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
 
 # Chunking
-_OPENAI_CHUNK_SIZE_CHARS = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
-_OPENAI_CHUNK_OVERLAP_CHARS = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
-_OPENAI_MAX_CHUNKS = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))
+_OPENAI_CHUNK_SIZE_CHARS     = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
+_OPENAI_CHUNK_OVERLAP_CHARS  = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
+_OPENAI_MAX_CHUNKS           = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))
 
 # Fallbacks en timeout
-_OPENAI_JSON_FALLBACK_FACTOR = float(os.getenv("OPENAI_JSON_FALLBACK_FACTOR", "0.6"))  # reduce tokens al 60%
-_OPENAI_JSON_FALLBACK_MAX_TOKENS = int(os.getenv("OPENAI_JSON_FALLBACK_MAX_TOKENS", "350"))  # límite duro en fallback
+_OPENAI_JSON_FALLBACK_FACTOR      = float(os.getenv("OPENAI_JSON_FALLBACK_FACTOR", "0.6"))  # reduce tokens al 60%
+_OPENAI_JSON_FALLBACK_MAX_TOKENS  = int(os.getenv("OPENAI_JSON_FALLBACK_MAX_TOKENS", "350"))  # límite duro en fallback
 
 # ─────────────────────────── Estructuras vacías ───────────────────────────
 _EMPTY_RESUMEN = {
@@ -125,7 +119,6 @@ _KEYWORDS_DATES = re.compile(
     r"(entra\s+en\s+vigor|vigencia|firma[do]? en|publicaci[oó]n|plazo|presentaci[oó]n)", re.I
 )
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
-
 
 # ─────────────────────────── Utils ───────────────────────────
 def _extract_hints(text: str, max_per_type: int = 6) -> Dict[str, List[str]]:
