@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import date, datetime
 from typing import Optional
@@ -17,6 +18,21 @@ from app.services.postgres import get_db
 from app.utils.compression import compress_json
 
 logger = logging.getLogger(__name__)
+
+# ───────────────────── Límite opcional de items por ejecución ─────────────────────
+_MAX_ITEMS_ENV = (os.getenv("BOE_MAX_ITEMS_PER_RUN") or "").strip()
+try:
+    _MAX_ITEMS_PER_RUN: Optional[int] = (
+        int(_MAX_ITEMS_ENV) if _MAX_ITEMS_ENV else None
+    )
+    if _MAX_ITEMS_PER_RUN is not None and _MAX_ITEMS_PER_RUN <= 0:
+        _MAX_ITEMS_PER_RUN = None
+except ValueError:
+    logger.warning("BOE_MAX_ITEMS_PER_RUN no es un entero válido: %r", _MAX_ITEMS_ENV)
+    _MAX_ITEMS_PER_RUN = None
+
+# Contador global de items insertados en ESTE proceso (para respetar el límite)
+_RUN_INSERTED = 0
 
 # ───────────────────── Import robusto del lookup ─────────────────────
 try:
@@ -183,6 +199,12 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
 
 # ───────────────────── Procesado de cada item ─────────────────────
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
+    global _RUN_INSERTED
+
+    # Límite global por ejecución (para tests desde CI)
+    if _MAX_ITEMS_PER_RUN is not None and _RUN_INSERTED >= _MAX_ITEMS_PER_RUN:
+        return
+
     identificador = (item.findtext("identificador", "") or "").strip()
     titulo = (item.findtext("titulo", "") or "").strip()
 
@@ -246,7 +268,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     # ───────── OpenAI: SIEMPRE que podamos, usamos PDF ─────────
     try:
         if url_pdf:
-            # Flujo principal: PDF → texto → IA
+            # Nuevo flujo: usamos directamente el texto del PDF del BOE
             titulo_resumen, resumen_json, impacto_json = get_openai_responses_from_pdf(
                 identificador=identificador,
                 titulo=titulo,
@@ -262,19 +284,9 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
                 titulo, cuerpo_final
             )
     except Exception as e:
-        logger.error(f"❌ OpenAI/PDF error en '{identificador}': {e}")
+        logger.error(f"❌ OpenAI error en '{identificador}': {e}")
         counters["fallos_openai"] += 1
-        # 🔁 Fallback: usamos cuerpo_final (texto base) para no dejar el ítem sin IA
-        try:
-            logger.info("🔁 Fallback IA texto base para %s", identificador)
-            titulo_resumen, resumen_json, impacto_json = get_openai_responses(
-                titulo, cuerpo_final
-            )
-        except Exception as e2:
-            logger.error(
-                f"❌ Fallback de IA también falló en '{identificador}': {e2}"
-            )
-            titulo_resumen, resumen_json, impacto_json = "", "", ""
+        titulo_resumen, resumen_json, impacto_json = "", "", ""
 
     resumen_comp = None if _emptyish(resumen_json) else compress_json(resumen_json)
     impacto_comp = None if _emptyish(impacto_json) else compress_json(impacto_json)
@@ -324,6 +336,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
 
     logger.info(f"✅ Insertado: {identificador}")
     counters["insertados"] += 1
+    _RUN_INSERTED += 1
 
 
 # ───────────────────── Entry principal ─────────────────────

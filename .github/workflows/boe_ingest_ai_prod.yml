@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ""
+      limit:
+        description: "Máximo de notificaciones a procesar (vacío = sin límite)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,6 +36,8 @@ jobs:
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
+      # 👇 Nuevo: límite de items por ejecución (lo leerá parser.py)
+      BOE_MAX_ITEMS_PER_RUN: ${{ github.event.inputs.limit }}
 
     steps:
       - name: Checkout
@@ -55,6 +62,7 @@ jobs:
 
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
+          echo "BOE_MAX_ITEMS_PER_RUN=${BOE_MAX_ITEMS_PER_RUN}"
 
           # 🚫 IMPORTANTE:
           # Ya NO usamos 'python -m app.scripts.update_boe'
