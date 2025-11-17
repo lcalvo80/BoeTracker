@@ -246,7 +246,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     # ───────── OpenAI: SIEMPRE que podamos, usamos PDF ─────────
     try:
         if url_pdf:
-            # Nuevo flujo: usamos directamente el texto del PDF del BOE
+            # Flujo principal: PDF → texto → IA
             titulo_resumen, resumen_json, impacto_json = get_openai_responses_from_pdf(
                 identificador=identificador,
                 titulo=titulo,
@@ -262,9 +262,19 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
                 titulo, cuerpo_final
             )
     except Exception as e:
-        logger.error(f"❌ OpenAI error en '{identificador}': {e}")
+        logger.error(f"❌ OpenAI/PDF error en '{identificador}': {e}")
         counters["fallos_openai"] += 1
-        titulo_resumen, resumen_json, impacto_json = "", "", ""
+        # 🔁 Fallback: usamos cuerpo_final (texto base) para no dejar el ítem sin IA
+        try:
+            logger.info("🔁 Fallback IA texto base para %s", identificador)
+            titulo_resumen, resumen_json, impacto_json = get_openai_responses(
+                titulo, cuerpo_final
+            )
+        except Exception as e2:
+            logger.error(
+                f"❌ Fallback de IA también falló en '{identificador}': {e2}"
+            )
+            titulo_resumen, resumen_json, impacto_json = "", "", ""
 
     resumen_comp = None if _emptyish(resumen_json) else compress_json(resumen_json)
     impacto_comp = None if _emptyish(impacto_json) else compress_json(impacto_json)

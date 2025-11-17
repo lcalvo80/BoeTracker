@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Optional
 
@@ -11,21 +12,36 @@ from urllib3.util.retry import Retry
 
 _LOG = logging.getLogger(__name__)
 
+# ───────────────── Config por entorno ─────────────────
+# Subimos un poco los timeouts y reintentos, pero los hacemos configurables.
+_PDF_TIMEOUT_SECS = float(os.getenv("BOE_PDF_TIMEOUT_SECS", "90"))  # antes 30
+_PDF_RETRIES_TOTAL = int(os.getenv("BOE_PDF_RETRIES_TOTAL", "5"))   # antes 3
+_PDF_BACKOFF_FACTOR = float(os.getenv("BOE_PDF_BACKOFF_FACTOR", "1.0"))  # antes 0.8
+
+# Si no se especifican connect/read, usamos el mismo valor que total
+_PDF_RETRIES_CONNECT = int(os.getenv("BOE_PDF_RETRIES_CONNECT", str(_PDF_RETRIES_TOTAL)))
+_PDF_RETRIES_READ = int(os.getenv("BOE_PDF_RETRIES_READ", str(_PDF_RETRIES_TOTAL)))
+
 
 def _http_session() -> requests.Session:
     """
     Crea una sesión HTTP con reintentos para descargar PDFs del BOE.
+    Ahora con más reintentos y backoff configurable.
     """
     s = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=0.8,
+        total=_PDF_RETRIES_TOTAL,
+        connect=_PDF_RETRIES_CONNECT,
+        read=_PDF_RETRIES_READ,
+        backoff_factor=_PDF_BACKOFF_FACTOR,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
     )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    s.headers.update({"User-Agent": "boe-text-extractor/1.0"})
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "boe-text-extractor/1.1"})
     return s
 
 
@@ -64,14 +80,30 @@ def _extract_pdf_pdfminer(pdf_bytes: bytes) -> str:
     return _clean_text(text)
 
 
-def _fetch_pdf_bytes(url_pdf: str, timeout: float = 30.0) -> Optional[bytes]:
+def _fetch_pdf_bytes(url_pdf: str, timeout: Optional[float] = None) -> Optional[bytes]:
     """
     Descarga el PDF desde url_pdf y devuelve los bytes si parece válido.
+
+    - Usa sesión con reintentos.
+    - Captura errores de red (Timeout, ConnectionError, etc.) y devuelve None.
     """
+    if not timeout or timeout <= 0:
+        timeout = _PDF_TIMEOUT_SECS
+
     s = _http_session()
-    resp = s.get(url_pdf, timeout=timeout)
+    try:
+        resp = s.get(url_pdf, timeout=timeout)
+    except requests.RequestException as e:
+        _LOG.warning(
+            "Error de red descargando PDF desde %s: %s",
+            url_pdf,
+            e,
+        )
+        return None
+
     if resp.ok and resp.content and len(resp.content) > 5000:
         return resp.content
+
     _LOG.warning(
         "PDF inválido o demasiado pequeño desde %s (status=%s, len=%s)",
         url_pdf,
@@ -87,6 +119,8 @@ def extract_boe_text(identificador: str, url_pdf: str) -> str:
 
     - identificador se usa solo para logs/tracking (BOE-A-..., BOE-B-...).
     - url_pdf es obligatorio y debe ser la URL directa al PDF del BOE.
+    - Si no se consigue texto suficiente, devuelve "" para que la capa superior
+      (openai_service) haga fallback a contenido mínimo (título / cuerpo_base).
     """
     if not url_pdf:
         _LOG.error(
@@ -97,6 +131,7 @@ def extract_boe_text(identificador: str, url_pdf: str) -> str:
     try:
         pdf_bytes = _fetch_pdf_bytes(url_pdf)
         if not pdf_bytes:
+            # Ya se ha logado el motivo en _fetch_pdf_bytes
             return ""
 
         # 1) Intento con PyMuPDF
@@ -133,4 +168,5 @@ def extract_boe_text(identificador: str, url_pdf: str) -> str:
             e,
         )
 
+    # Si llegamos aquí, no hemos conseguido texto útil
     return ""
