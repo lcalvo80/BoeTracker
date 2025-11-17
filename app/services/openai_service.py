@@ -1,41 +1,46 @@
-# app/services/openai_service.py
 from __future__ import annotations
 
-import os, json, time, logging, random, re, copy
+import os
+import json
+import time
+import logging
+import random
+import re
+import copy
 from typing import Dict, Any, Tuple, List, Optional
 
 from app.utils.helpers import clean_code_block, extract_section  # noqa: F401
-from app.services.boe_text_extractor import extract_boe_text  # ⬅️ NUEVO
+from app.services.boe_text_extractor import extract_boe_text  # ⬅️ TEXTO PDF
 
 # ─────────────────────────── Config ───────────────────────────
-_OPENAI_TIMEOUT       = int(os.getenv("OPENAI_TIMEOUT", "45"))
-_OPENAI_MAX_RETRIES   = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
-_OPENAI_BACKOFF_BASE  = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
-_OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-4o")
-_OPENAI_BUDGET_SECS   = float(os.getenv("OPENAI_BUDGET_SECS", "120"))
-_OPENAI_DISABLE       = os.getenv("OPENAI_DISABLE", "0") == "1"
+_OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "45"))
+_OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+_OPENAI_BACKOFF_BASE = float(os.getenv("OPENAI_BACKOFF_BASE", "1.5"))
+_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+_OPENAI_BUDGET_SECS = float(os.getenv("OPENAI_BUDGET_SECS", "120"))
+_OPENAI_DISABLE = os.getenv("OPENAI_DISABLE", "0") == "1"
 
-_MODEL_TITLE   = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
+_MODEL_TITLE = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
 _MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL)
-_MODEL_IMPACT  = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
+_MODEL_IMPACT = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
 
 # Chunking
-_OPENAI_CHUNK_SIZE_CHARS     = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
-_OPENAI_CHUNK_OVERLAP_CHARS  = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
-_OPENAI_MAX_CHUNKS           = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))
+_OPENAI_CHUNK_SIZE_CHARS = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
+_OPENAI_CHUNK_OVERLAP_CHARS = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
+_OPENAI_MAX_CHUNKS = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))
 
 # Fallbacks en timeout
-_OPENAI_JSON_FALLBACK_FACTOR      = float(os.getenv("OPENAI_JSON_FALLBACK_FACTOR", "0.6"))  # reduce tokens al 60%
-_OPENAI_JSON_FALLBACK_MAX_TOKENS  = int(os.getenv("OPENAI_JSON_FALLBACK_MAX_TOKENS", "350"))  # límite duro en fallback
+_OPENAI_JSON_FALLBACK_FACTOR = float(os.getenv("OPENAI_JSON_FALLBACK_FACTOR", "0.6"))  # reduce tokens al 60%
+_OPENAI_JSON_FALLBACK_MAX_TOKENS = int(os.getenv("OPENAI_JSON_FALLBACK_MAX_TOKENS", "350"))  # límite duro en fallback
 
 # ─────────────────────────── Estructuras vacías ───────────────────────────
-_EMPTY_RESUMEN = {
+_EMPTY_RESUMEN: Dict[str, Any] = {
     "summary": "",
     "key_changes": [],
     "key_dates_events": [],
     "conclusion": "",
 }
-_EMPTY_IMPACTO = {
+_EMPTY_IMPACTO: Dict[str, Any] = {
     "afectados": [],
     "cambios_operativos": [],
     "riesgos_potenciales": [],
@@ -112,17 +117,20 @@ _MONTH_YEAR_RX = re.compile(rf"\b{_MONTHS}\s+de\s+\d{{4}}\b", re.I)
 _TIME_PAT = re.compile(r"\b(\d{1,2}:\d{2})\s*(h|horas)?\b", re.I)
 _CONV_PAT = re.compile(r"\b(primera|segunda)\s+convocatoria\b", re.I)
 _LOC_PAT = re.compile(
-    r"\b(calle|avda\.?|avenida|plaza|edificio|local|sede|km\s*\d+|pol[íi]gono)\b.*", re.I | re.M
+    r"\b(calle|avda\.?|avenida|plaza|edificio|local|sede|km\s*\d+|pol[íi]gono)\b.*",
+    re.I | re.M,
 )
 _AGENDA_PAT = re.compile(r"(?im)^(primero|segundo|tercero|cuarto|quinto|sexto|s[eé]ptimo)[\.\-:]\s*(.+)$")
 _KEYWORDS_DATES = re.compile(
-    r"(entra\s+en\s+vigor|vigencia|firma[do]? en|publicaci[oó]n|plazo|presentaci[oó]n)", re.I
+    r"(entra\s+en\s+vigor|vigencia|firma[do]? en|publicaci[oó]n|plazo|presentaci[oó]n|"
+    r"disposici[oó]n|orden\s+[A-ZÁÉÍÓÚ]+/\d{4})",
+    re.I,
 )
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
 
 # ─────────────────────────── Utils ───────────────────────────
 def _extract_hints(text: str, max_per_type: int = 6) -> Dict[str, List[str]]:
-    def _uniq(lst):
+    def _uniq(lst: List[str]) -> List[str]:
         seen, out = set(), []
         for v in lst:
             if v not in seen:
@@ -146,12 +154,17 @@ def _extract_hints(text: str, max_per_type: int = 6) -> Dict[str, List[str]]:
     locs += [m.group(0).strip() for m in _LOC_PAT.finditer(text)]
     agenda += [m.group(0).strip() for m in _AGENDA_PAT.finditer(text)]
 
+    is_convocatoria = bool(
+        re.search(r"convoca|convocatoria|junta|asamblea|orden del d[ií]a", text, re.I)
+    )
+
     return {
         "dates": _uniq(dates),
         "times": _uniq(times),
         "convocatorias": _uniq(convoc),
         "locations": _uniq(locs),
         "agenda": _uniq(agenda),
+        "is_convocatoria": [str(is_convocatoria)],
     }
 
 
@@ -209,11 +222,11 @@ def _make_client():
 def _chat_completion_with_retry(
     client,
     *,
-    messages,
-    model=None,
-    max_tokens=600,
-    temperature=0.2,
-    deadline_ts=None,
+    messages: List[Dict[str, Any]],
+    model: Optional[str] = None,
+    max_tokens: int = 600,
+    temperature: float = 0.2,
+    deadline_ts: Optional[float] = None,
     seed: Optional[int] = 7,
 ):
     use_model = model or _OPENAI_MODEL
@@ -251,11 +264,11 @@ def _chat_completion_with_retry(
 def _json_completion_with_retry(
     client,
     *,
-    messages,
-    model=None,
-    max_tokens=900,
-    temperature=0.2,
-    deadline_ts=None,
+    messages: List[Dict[str, Any]],
+    model: Optional[str] = None,
+    max_tokens: int = 900,
+    temperature: float = 0.2,
+    deadline_ts: Optional[float] = None,
     seed: Optional[int] = 7,
 ) -> Dict[str, Any]:
     use_model = model or _OPENAI_MODEL
@@ -299,12 +312,12 @@ def _json_completion_with_retry(
 def _json_schema_completion_with_retry(
     client,
     *,
-    messages,
+    messages: List[Dict[str, Any]],
     schema: Dict[str, Any],
-    model=None,
-    max_tokens=900,
-    temperature=0.2,
-    deadline_ts=None,
+    model: Optional[str] = None,
+    max_tokens: int = 900,
+    temperature: float = 0.2,
+    deadline_ts: Optional[float] = None,
     seed: Optional[int] = 7,
     fallback_to_json_object_on_timeout: bool = True,
 ) -> Dict[str, Any]:
@@ -600,14 +613,14 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
         )
 
     start_ts = time.time()
-    deadline_ts = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
+    deadline_ts: Optional[float] = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
 
     content_norm = _normalize_content(content or "")
     hints = _extract_hints(content_norm)
     has_dates = _has_dates(content_norm, hints)
 
     # ───────── Título ─────────
-    title_messages = [
+    title_messages: List[Dict[str, Any]] = [
         {
             "role": "system",
             "content": (
@@ -657,34 +670,78 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
 
     resumen_parts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, start=1):
-        resumen_messages = [
+        resumen_prompt = "\n".join(
+            [
+                "=== OBJECTIVE ===",
+                "Devolver un resumen útil y accionable del BOE en JSON estricto (schema abajo).",
+                "",
+                "=== ROLE ===",
+                "Asistente legal experto en normativa y convocatorias del BOE (España).",
+                "",
+                "=== SOURCE OF TRUTH (DURO) ===",
+                "- SOLO usa CONTENIDO como fuente de verdad.",
+                '- Si un dato no aparece en CONTENIDO, NO lo inventes (usa \"\" o []).',
+                "",
+                "=== OUTPUT FORMAT (JSON estricto) ===",
+                "Campos:",
+                "- summary: string (<= 600 chars).",
+                "  Debe explicar SIEMPRE, de forma compacta:",
+                "  - Tipo de acto (resolución, orden, anuncio, licitación…).",
+                "  - Órgano que lo dicta.",
+                "  - Destinatario(s) principal(es): persona, cargo o colectivo afectado.",
+                "  - Efecto principal: nombramiento, adjudicación, aprobación, modificación, convocatoria, etc.",
+                "  - Si constan: plazos y posibilidad de recursos o impugnaciones.",
+                "",
+                "- key_changes: string[] (items <= 200 chars, máx 12).",
+                "  - Cada elemento debe recoger UN cambio o decisión relevante.",
+                "  - Menciona, cuando proceda, artículos, disposiciones o referencias normativas clave.",
+                "",
+                "- key_dates_events: string[] (máx 10).",
+                "  - Cada elemento DEBE contener fecha + breve descripción del evento (nunca solo la fecha).",
+                "  - Formato preferente: \"DD de <mes> de YYYY HH:MM: Evento (Lugar)\"",
+                "    Ejemplos:",
+                "    - \"11 de noviembre de 2025: Resolución de la Subsecretaría de Hacienda.\"",
+                "    - \"17 de noviembre de 2025: Publicación en el BOE.\"",
+                "  - Si el texto solo indica mes/año, usa \"<mes> de YYYY: Evento\".",
+                "  - Incluye fechas de firma, publicación, entrada en vigor, plazos para presentar solicitudes, recursos, etc.",
+                "",
+                "- conclusion: string (<= 300 chars).",
+                "  - Cierre que resuma la consecuencia práctica principal.",
+                "  - Incluye, si procede, una mención resumida a plazos y recursos.",
+                "",
+                "Reglas:",
+                "- Español claro y conciso. Frases cortas y directas.",
+                "- Evita frases genéricas tipo \"Publicación\" sin contexto; explica siempre qué se publica o resuelve.",
+                "- Deduplica fechas/horas/lugares; omite lugar si no aparece en el texto.",
+                '- Si faltan datos, usa \"\" o [].',
+                "- Cero markdown ni texto fuera del JSON.",
+                "",
+                "=== CONVOCATORIA ===",
+                'Si detectas \"convoca/convocatoria/Junta/Asamblea/Orden del día\", trátalo como CONVOCATORIA:',
+                "- key_dates_events debe incluir TODAS las convocatorias (p. ej. primera y segunda) con hora y lugar si constan.",
+                "- key_changes debe listar el orden del día (puntos de la reunión).",
+                "",
+                "=== PISTAS_AUTOMÁTICAS (no son verdad absoluta) ===",
+                "Estas pistas son solo ayuda heurística. Si contradicen CONTENIDO, ignóralas.",
+                json.dumps(hints, ensure_ascii=False),
+                "",
+                f"=== CONTENIDO (FUENTE DE VERDAD) — PARTE {idx}/{len(chunks)} ===",
+                ch,
+            ]
+        )
+
+        resumen_messages: List[Dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
-                    "Eres un asistente legal experto en el BOE (España). "
-                    "Responde EXCLUSIVAMENTE en JSON válido conforme al esquema. "
-                    "No añadas texto fuera del JSON. No inventes datos."
+                    "Eres un asistente legal experto en normativa española y BOE. "
+                    "Responde SOLO con JSON válido conforme al schema. Nada fuera del JSON. "
+                    "Usa SOLO el CONTENIDO como fuente de verdad; no inventes datos."
                 ),
             },
             {
                 "role": "user",
-                "content": "\n".join(
-                    [
-                        f"(Parte {idx}/{len(chunks)}) Devuelve EXACTAMENTE este objeto conforme al esquema.",
-                        "- Español claro y conciso. Frases cortas.",
-                        "- Si el texto incluye firma/publicación/entrada en vigor, AÑÁDELAS en key_dates_events.",
-                        "- Si solo hay mes/año, usa '<mes> de YYYY' como fecha.",
-                        "- Deduplica fechas/horas/lugares; omite lugar si no aparece.",
-                        "- Si es CONVOCATORIA: incluye TODAS las convocatorias (primera/segunda) con hora y lugar si constan, y el orden del día en key_changes.",
-                        '- Si falta un dato, usa "" o [].',
-                        "",
-                        "<<<CONTENIDO>>>",
-                        ch,
-                        "",
-                        "<<<PISTAS_DETECTADAS>>>",
-                        json.dumps(hints, ensure_ascii=False),
-                    ]
-                ),
+                "content": resumen_prompt,
             },
         ]
         try:
@@ -713,7 +770,49 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
     # ───────── Impacto (JSON) ─────────
     impacto_parts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, start=1):
-        impacto_messages = [
+        impacto_prompt = "\n".join(
+            [
+                "=== OBJECTIVE ===",
+                "Analizar el impacto práctico de la disposición del BOE.",
+                "",
+                "=== ROLE ===",
+                "Analista legislativo que traduce normas del BOE a implicaciones operativas.",
+                "",
+                "=== OUTPUT FORMAT (JSON estricto) ===",
+                "Campos:",
+                "- afectados: string[]",
+                "  - Colectivos, perfiles o entidades impactadas (no repitas literalmente el título).",
+                "  - Ejemplos: \"Funcionarios del subgrupo A1 del Ministerio de Hacienda\",",
+                "    \"Contratistas interesados en la licitación\", \"Propietarios de viviendas en la Comunidad X\".",
+                "",
+                "- cambios_operativos: string[]",
+                "  - Qué cambia en la práctica o qué hay que hacer distinto tras la publicación.",
+                "  - Ejemplos: \"Presentar solicitudes a través de la sede electrónica en el plazo indicado\",",
+                "    \"Aplicar el nuevo baremo retributivo\", \"Actualizar procedimientos internos\".",
+                "",
+                "- riesgos_potenciales: string[]",
+                "  - Riesgos si no se cumple o si la norma genera incertidumbre.",
+                "",
+                "- beneficios_previstos: string[]",
+                "  - Mejora de seguridad jurídica, simplificación, financiación, ventajas para determinados colectivos, etc.",
+                "",
+                "- recomendaciones: string[]",
+                "  - Consejos accionables: revisar el texto completo, consultar con asesoría jurídica, preparar documentación, etc.",
+                "",
+                "Reglas:",
+                "- Usa SOLO el contenido de la disposición; no añadas interpretaciones creativas.",
+                "- Listas ordenadas por importancia. Frases cortas. Sin redundancias.",
+                "- Si falta dato para un campo, usa [].",
+                "",
+                "=== PISTAS_AUTOMÁTICAS (no son verdad absoluta) ===",
+                json.dumps(hints, ensure_ascii=False),
+                "",
+                f"=== CONTENIDO (FUENTE DE VERDAD) — PARTE {idx}/{len(chunks)} ===",
+                ch,
+            ]
+        )
+
+        impacto_messages: List[Dict[str, Any]] = [
             {
                 "role": "system",
                 "content": (
@@ -724,21 +823,7 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
             },
             {
                 "role": "user",
-                "content": "\n".join(
-                    [
-                        f"(Parte {idx}/{len(chunks)}) Devuelve EXACTAMENTE este objeto con el esquema.",
-                        "Guía: CONVOCATORIA (afectados, cambios, riesgos, recomendaciones), "
-                        "LICITACIÓN (plazos, solvencia, garantías), RESOLUCIÓN (obligaciones/efectos).",
-                        "- Listas por importancia. Frases cortas. Sin redundancias.",
-                        "- Si falta dato, usa [].",
-                        "",
-                        "<<<CONTENIDO>>>",
-                        ch,
-                        "",
-                        "<<<PISTAS_DETECTADAS>>>",
-                        json.dumps(hints, ensure_ascii=False),
-                    ]
-                ),
+                "content": impacto_prompt,
             },
         ]
         try:
