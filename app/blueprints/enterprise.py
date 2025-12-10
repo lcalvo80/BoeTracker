@@ -111,10 +111,12 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
     uid = m.get("user_id") or pud.get("user_id") or user.get("id")
 
     email = pud.get("email_address") or _extract_email_from_user(user)
-    name = " ".join([
-        (pud.get("first_name") or user.get("first_name") or "") or "",
-        (pud.get("last_name") or user.get("last_name") or "") or "",
-    ]).strip()
+    name = " ".join(
+        [
+            (pud.get("first_name") or user.get("first_name") or "") or "",
+            (pud.get("last_name") or user.get("last_name") or "") or "",
+        ]
+    ).strip()
 
     role = _normalize_role(m.get("role")) or "member"
     return {
@@ -131,7 +133,11 @@ def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
 def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
     """Devuelve membership_id a partir de org_id + user_id."""
     try:
-        res = _req("GET", f"/organizations/{org_id}/memberships", params={"limit": 200, "include_public_user_data": "true"})
+        res = _req(
+            "GET",
+            f"/organizations/{org_id}/memberships",
+            params={"limit": 200, "include_public_user_data": "true"},
+        )
         for m in res.get("data", []):
             if (m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")) == user_id:
                 return m.get("id")
@@ -147,7 +153,11 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
       2) Fallback: /users/:id?expand=organization_memberships y, si hay id, hidrata con expand=user
     """
     try:
-        res = _req("GET", f"/organizations/{org_id}/memberships", params={"limit": 200, "include_public_user_data": "true"})
+        res = _req(
+            "GET",
+            f"/organizations/{org_id}/memberships",
+            params={"limit": 200, "include_public_user_data": "true"},
+        )
         for m in res.get("data", []):
             uid = m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")
             if uid == user_id:
@@ -162,8 +172,11 @@ def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
                 mid = mem.get("id")
                 if mid:
                     try:
-                        return _req("GET", f"/organizations/{org_id}/memberships/{mid}",
-                                    params={"expand": "user", "include_public_user_data": "true"})
+                        return _req(
+                            "GET",
+                            f"/organizations/{org_id}/memberships/{mid}",
+                            params={"expand": "user", "include_public_user_data": "true"},
+                        )
                     except Exception:
                         return mem
                 return mem
@@ -183,8 +196,11 @@ def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None
         if not (it.get("email") and uid):
             mid = it.get("membership_id")
             try:
-                mem = _req("GET", f"/organizations/{org_id}/memberships/{mid}",
-                           params={"expand": "user", "include_public_user_data": "true"})
+                mem = _req(
+                    "GET",
+                    f"/organizations/{org_id}/memberships/{mid}",
+                    params={"expand": "user", "include_public_user_data": "true"},
+                )
                 n = _normalize_member(mem or {})
                 for k in ("user_id", "email", "name"):
                     if not it.get(k) and n.get(k):
@@ -231,12 +247,20 @@ def _org_usage(org_id: str) -> Dict[str, int]:
     members = 0
     pending = 0
     try:
-        mems = _req("GET", f"/organizations/{org_id}/memberships", params={"limit": 200, "include_public_user_data": "true"})
+        mems = _req(
+            "GET",
+            f"/organizations/{org_id}/memberships",
+            params={"limit": 200, "include_public_user_data": "true"},
+        )
         members = len(mems.get("data", []))
     except Exception:
         pass
     try:
-        invs = _req("GET", f"/organizations/{org_id}/invitations", params={"status": "pending", "limit": 200})
+        invs = _req(
+            "GET",
+            f"/organizations/{org_id}/invitations",
+            params={"status": "pending", "limit": 200},
+        )
         arr = invs if isinstance(invs, list) else (invs.get("data") or [])
         pending = len(arr)
     except Exception:
@@ -260,6 +284,45 @@ def _is_last_admin(org_id: str, membership_id: str) -> bool:
     except Exception:
         return False
     return _count_admins(org_id) <= 1
+
+
+# ───────────────── Nuevo endpoint: crear organización ─────────────────
+@bp.route("/create-org", methods=["POST", "OPTIONS"])
+@require_auth
+def create_org():
+    """
+    Crea una organización en Clerk para el usuario autenticado.
+
+    - Inicializa plan "free" y seats=0 en public_metadata.
+    - Guarda un origen en private_metadata para trazabilidad.
+    """
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip() or "Organización BOEtracker"
+
+    try:
+        payload = {
+            "name": name,
+            "public_metadata": {
+                "plan": "free",
+                "seats": 0,
+            },
+            "private_metadata": {
+                "created_from": "billing_pricing_page",
+                "creator_user_id": g.user_id,
+            },
+        }
+        org = _req("POST", "/organizations", json=payload)
+        out = {
+            "id": org.get("id"),
+            "name": org.get("name"),
+            "slug": org.get("slug"),
+        }
+        return _json_ok(out, 200)
+    except ClerkError as ce:
+        # ce.text suele venir en JSON; devolvemos texto plano para no acoplarnos al formato
+        return _json_err(f"Clerk error: {ce.text}", ce.status)
+    except Exception as e:
+        return _json_err(f"Clerk error: {e}", 502)
 
 
 # ───────────────── Endpoints ─────────────────
@@ -298,7 +361,7 @@ def get_org_info():
             "name": org.get("name"),
             "slug": org.get("slug"),
             "seats": seats,
-            "used_seats": used,       # compat
+            "used_seats": used,  # compat
             "pending_invites": usage["pending"],
             "current_user_role": current_role,
             # campos claros
@@ -317,8 +380,11 @@ def list_users():
     if not g.org_id:
         return _json_err("Missing org (X-Org-Id).", 400)
     try:
-        res = _req("GET", f"/organizations/{g.org_id}/memberships",
-                   params={"limit": 200, "include_public_user_data": "true"})
+        res = _req(
+            "GET",
+            f"/organizations/{g.org_id}/memberships",
+            params={"limit": 200, "include_public_user_data": "true"},
+        )
         raw = res.get("data", [])
         items = [_normalize_member(m) for m in raw]
         _hydrate_members_if_needed(g.org_id, items)
@@ -352,15 +418,18 @@ def list_invitations():
     try:
         res = _req("GET", f"/organizations/{g.org_id}/invitations", params=params)
         arr = res if isinstance(res, list) else (res.get("data") or [])
-        items = [{
-            "id": it.get("id"),
-            "email": it.get("email_address"),
-            "status": it.get("status"),
-            "role": CLERK_ROLE_FROM_API.get((it.get("role") or "").lower(), it.get("role")),
-            "created_at": it.get("created_at"),
-            "updated_at": it.get("updated_at"),
-            "expires_at": it.get("expires_at"),
-        } for it in arr]
+        items = [
+            {
+                "id": it.get("id"),
+                "email": it.get("email_address"),
+                "status": it.get("status"),
+                "role": CLERK_ROLE_FROM_API.get((it.get("role") or "").lower(), it.get("role")),
+                "created_at": it.get("created_at"),
+                "updated_at": it.get("updated_at"),
+                "expires_at": it.get("expires_at"),
+            }
+            for it in arr
+        ]
         return _json_ok({"items": items, "total": len(items)})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
@@ -388,7 +457,11 @@ def revoke_invitation():
     try:
         # Si llegan emails, mapear a ids desde pendientes
         if emails and not ids:
-            res = _req("GET", f"/organizations/{g.org_id}/invitations", params={"status": "pending", "limit": 200})
+            res = _req(
+                "GET",
+                f"/organizations/{g.org_id}/invitations",
+                params={"status": "pending", "limit": 200},
+            )
             arr = res if isinstance(res, list) else (res.get("data") or [])
             email_to_id = {it.get("email_address"): it.get("id") for it in arr}
             ids = [email_to_id[e] for e in emails if e in email_to_id]
@@ -467,8 +540,11 @@ def invite_user():
     needed = len(emails)
     if not allow_overbook and needed > free:
         return (
-            {"ok": False, "error": "not_enough_seats",
-             "details": {"seats": seats, "used": used, "free": free, "needed": needed}},
+            {
+                "ok": False,
+                "error": "not_enough_seats",
+                "details": {"seats": seats, "used": used, "free": free, "needed": needed},
+            },
             409,
         )
 
@@ -487,11 +563,13 @@ def invite_user():
 
         try:
             r = _req("POST", f"/organizations/{g.org_id}/invitations", json=payload)
-            results.append({
-                "id": r.get("id"),
-                "email": r.get("email_address"),
-                "status": r.get("status"),
-            })
+            results.append(
+                {
+                    "id": r.get("id"),
+                    "email": r.get("email_address"),
+                    "status": r.get("status"),
+                }
+            )
         except Exception as e:
             errors.append({"email": email, "error": str(e)})
 
@@ -523,7 +601,11 @@ def update_role():
 
     # Intentar el PATCH; si Clerk dice 404, mapeamos a error semántico
     try:
-        res = _req("PATCH", f"/organizations/{g.org_id}/memberships/{membership_id}", json={"role": role_api})
+        res = _req(
+            "PATCH",
+            f"/organizations/{g.org_id}/memberships/{membership_id}",
+            json={"role": role_api},
+        )
         return _json_ok(_normalize_member(res))
     except ClerkError as ce:
         if ce.status == 404:
@@ -572,7 +654,11 @@ def set_seat_limit():
         return _json_err("'seats' debe ser número entero.", 400)
 
     try:
-        org = _req("PATCH", f"/organizations/{g.org_id}", json={"public_metadata": {"seats": seats}})
+        org = _req(
+            "PATCH",
+            f"/organizations/{g.org_id}",
+            json={"public_metadata": {"seats": seats}},
+        )
         return _json_ok({"org_id": org.get("id"), "seats": seats})
     except Exception as e:
         return _json_err(f"Clerk error: {e}", 502)
