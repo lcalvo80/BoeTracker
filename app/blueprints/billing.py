@@ -21,15 +21,24 @@ def _allow_options():
 def _stripe() -> None:
     stripe.api_key = current_app.config.get("STRIPE_SECRET_KEY", "")
 
+
 def _cfg(k: str) -> str:
     return current_app.config.get(k, "")
 
-def _success_cancel(default_path: str = "/billing/return") -> tuple[str, str]:
+
+def _success_cancel(default_path: str = "/settings/billing") -> tuple[str, str]:
+    """
+    Construye success_url y cancel_url para Stripe Checkout / Billing Portal.
+
+    Por defecto, devuelve al usuario a /settings/billing en el frontend,
+    añadiendo ?status=success|cancel.
+    """
     base = current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
     data = request.get_json(silent=True) or {}
     success_url = data.get("success_url") or f"{base}{default_path}?status=success"
     cancel_url = data.get("cancel_url") or f"{base}{default_path}?status=cancel"
     return success_url, cancel_url
+
 
 def _get_or_create_customer(email: Optional[str], metadata: Dict[str, Any]) -> stripe.Customer:
     _stripe()
@@ -42,6 +51,7 @@ def _get_or_create_customer(email: Optional[str], metadata: Dict[str, Any]) -> s
                 stripe.Customer.modify(cust.id, metadata={**(cust.metadata or {}), **to_set})
             return cust
     return stripe.Customer.create(email=email or None, metadata=metadata or None)
+
 
 def _pm_from_customer(customer_id: str) -> Dict[str, Optional[str]]:
     try:
@@ -62,12 +72,14 @@ def _pm_from_customer(customer_id: str) -> Dict[str, Optional[str]]:
         pass
     return {"brand": None, "last4": None}
 
+
 def _sub_summary(sub: Dict[str, Any]) -> Dict[str, Any]:
     status = sub.get("status")
     cpe = sub.get("current_period_end")
     cust_id = sub.get("customer")
     pm = _pm_from_customer(cust_id) if cust_id else {"brand": None, "last4": None}
     return {"status": status, "current_period_end": cpe, "payment_method": pm}
+
 
 def _invoice_dto(inv: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -83,8 +95,10 @@ def _invoice_dto(inv: Dict[str, Any]) -> Dict[str, Any]:
         "customer": inv.get("customer"),
     }
 
+
 def _json_ok(payload: Any, code: int = 200):
     return ({"ok": True, "data": payload}, code)
+
 
 def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
@@ -108,7 +122,15 @@ def billing_summary():
                 base = _sub_summary(sub)
                 base.update({"scope": "org", "org_id": g.org_id, "plan": "ENTERPRISE", "seats": seats})
                 return _json_ok(base)
-            return _json_ok({"scope": "org", "org_id": g.org_id, "plan": "NO_PLAN", "seats": 0, "status": None, "current_period_end": None, "payment_method": {"brand": None, "last4": None}})
+            return _json_ok({
+                "scope": "org",
+                "org_id": g.org_id,
+                "plan": "NO_PLAN",
+                "seats": 0,
+                "status": None,
+                "current_period_end": None,
+                "payment_method": {"brand": None, "last4": None},
+            })
         else:
             cust = _get_or_create_customer(g.email, {"clerk_user_id": g.user_id})
             subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1).data
@@ -117,7 +139,13 @@ def billing_summary():
                 base = _sub_summary(sub)
                 base.update({"scope": "user", "plan": "PRO"})
                 return _json_ok(base)
-            return _json_ok({"scope": "user", "plan": "NO_PLAN", "status": None, "current_period_end": None, "payment_method": {"brand": None, "last4": None}})
+            return _json_ok({
+                "scope": "user",
+                "plan": "NO_PLAN",
+                "status": None,
+                "current_period_end": None,
+                "payment_method": {"brand": None, "last4": None},
+            })
     except Exception as e:
         return _json_err(str(e), 500)
 
@@ -132,7 +160,7 @@ def checkout_pro():
         if not price:
             return _json_err("Falta STRIPE_PRICE_PRO", 500)
 
-        success_url, cancel_url = _success_cancel("/billing/return")
+        success_url, cancel_url = _success_cancel("/settings/billing")
         customer = _get_or_create_customer(g.email, {"clerk_user_id": g.user_id})
 
         session = stripe.checkout.Session.create(
@@ -168,7 +196,7 @@ def checkout_enterprise():
         return _json_err("Falta STRIPE_PRICE_ENTERPRISE", 500)
 
     try:
-        success_url, cancel_url = _success_cancel("/billing/return")
+        success_url, cancel_url = _success_cancel("/settings/billing")
 
         customer = _get_or_create_customer(
             email=g.email,
@@ -181,8 +209,20 @@ def checkout_enterprise():
             line_items=[{"price": price, "quantity": seats}],
             success_url=success_url,
             cancel_url=cancel_url,
-            subscription_data={"metadata": {"scope": "org", "org_id": g.org_id, "buyer_user_id": g.user_id, "seats": str(seats)}},
-            metadata={"scope": "org", "org_id": g.org_id, "buyer_user_id": g.user_id, "seats": str(seats)},
+            subscription_data={
+                "metadata": {
+                    "scope": "org",
+                    "org_id": g.org_id,
+                    "buyer_user_id": g.user_id,
+                    "seats": str(seats),
+                }
+            },
+            metadata={
+                "scope": "org",
+                "org_id": g.org_id,
+                "buyer_user_id": g.user_id,
+                "seats": str(seats),
+            },
             allow_promotion_codes=True,
         )
         return _json_ok({"url": session.url})
@@ -241,12 +281,3 @@ def billing_invoices():
 
     except Exception as e:
         return _json_err(str(e), 500)
-
-
-# ───────────────── (Nota) ─────────────────
-# Se ha eliminado la ruta:
-#   @bp.route("/webhook", methods=["POST"])
-# El webhook de Stripe debe manejarse en el blueprint canónico:
-#   POST /api/stripe  (en webhooks.py)
-# Si quieres, puedo pasarte también el parche para webhooks.py para
-# consolidar la lógica de _apply_subscription_set_semantics allí.
