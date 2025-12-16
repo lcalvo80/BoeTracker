@@ -233,8 +233,7 @@ def is_user_member_of_org(org_id: str, user_id: str) -> bool:
 
 def get_user_primary_email(user_id: str) -> Optional[str]:
     """
-    2.2 (hardening): Obtiene email primario de Clerk (para Stripe customer creation/metadata)
-    sin depender de lo que venga en el token (g.email).
+    Obtiene email primario de Clerk sin depender del token.
     """
     try:
         u = get_user(user_id, expand="email_addresses")
@@ -268,9 +267,6 @@ def update_org_metadata(org_id: str, public: dict | None = None, private: dict |
 
 
 def merge_org_metadata(org_id: str, *, public_updates: dict | None = None, private_updates: dict | None = None) -> dict:
-    """
-    Mergea metadata sin pisar claves existentes (Clerk reemplaza el dict completo).
-    """
     org = get_org(org_id)
     pub = dict((org.get("public_metadata") or {}))
     priv = dict((org.get("private_metadata") or {}))
@@ -284,9 +280,6 @@ def merge_org_metadata(org_id: str, *, public_updates: dict | None = None, priva
 
 
 def merge_user_metadata(user_id: str, *, public_updates: dict | None = None, private_updates: dict | None = None) -> dict:
-    """
-    2.3 (alineación): helper simétrico para usuarios (evita pisar public/private_metadata).
-    """
     u = get_user(user_id)
     pub = dict((u.get("public_metadata") or {}))
     priv = dict((u.get("private_metadata") or {}))
@@ -334,11 +327,6 @@ def update_membership_role(org_id: str, membership_id: str, role: str) -> Dict[s
 
 
 def ensure_membership_admin(org_id: str, user_id: str) -> None:
-    """
-    Asegura que user_id es admin en org_id (idempotente):
-      - Si ya es miembro -> PATCH role a org:admin.
-      - Si no es miembro -> POST membership admin (409 OK) y reintenta promover.
-    """
     if not org_id or not user_id:
         return
 
@@ -367,7 +355,6 @@ def ensure_membership_admin(org_id: str, user_id: str) -> None:
             return
         except ClerkHttpError as e:
             if e.status_code == 409:
-                # Existe: promover por PATCH
                 try:
                     mem2 = get_membership_raw(user_id=user_id, org_id=org_id) or {}
                     mid2 = mem2.get("id")
@@ -401,9 +388,6 @@ def set_user_plan(
     extra_private: dict | None = None,
     extra_public: dict | None = None,
 ) -> dict:
-    """
-    Importante: no pisa metadata existente; mergea.
-    """
     pub_updates: Dict[str, Any] = {"plan": plan}
     if status is not None:
         pub_updates["status"] = status
@@ -705,7 +689,7 @@ def create_pending_enterprise_org_for_user(
 
 
 # ──────────────────────────────────────────────────────────────
-# ✅ ENTERPRISE "Use-cases" (Blueprint 100% orquestación)
+# ✅ ENTERPRISE use-cases
 # ──────────────────────────────────────────────────────────────
 
 def enterprise_create_org_idempotent(*, user_id: str, name: str) -> Dict[str, Any]:
@@ -778,12 +762,7 @@ def enterprise_revoke_invitations(
         except Exception as ex:
             errors.append({"id": inv_id, "error": str(ex)})
 
-    return {
-        "results": revoked,
-        "errors": errors,
-        "revoked": len(revoked),
-        "failed": len(errors),
-    }
+    return {"results": revoked, "errors": errors, "revoked": len(revoked), "failed": len(errors)}
 
 
 def enterprise_invite_users(
@@ -833,7 +812,7 @@ def enterprise_invite_users(
             409,
             "INVITE",
             f"/organizations/{org_id}/invitations",
-            f'not_enough_seats: seats={seats} used={used} free={free} needed={needed}',
+            f"not_enough_seats: seats={seats} used={used} free={free} needed={needed}",
         )
 
     results: List[Dict[str, Any]] = []
@@ -927,13 +906,10 @@ def enterprise_set_seat_limit(*, org_id: str, seats: int) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────
-# ✅ 5) CLEANUP: pending enterprise orgs cuando NO se completa el pago
+# ✅ CLEANUP: pending enterprise orgs cuando NO se completa el pago
 # ──────────────────────────────────────────────────────────────
 
 def enterprise_list_pending_orgs_for_user(user_id: str) -> List[str]:
-    """
-    Devuelve org_ids del usuario con private_metadata.pending_enterprise_checkout == True.
-    """
     org_ids: List[str] = []
     memberships = get_user_memberships(user_id) or []
     for m in memberships:
@@ -955,7 +931,6 @@ def enterprise_list_pending_orgs_for_user(user_id: str) -> List[str]:
         except Exception:
             continue
 
-    # unique (preserva orden)
     seen = set()
     out: List[str] = []
     for oid in pending:
@@ -975,15 +950,6 @@ def enterprise_cleanup_org(
     stripe_customer_id: Optional[str] = None,
     stripe_subscription_id: Optional[str] = None,
 ) -> dict:
-    """
-    Limpia una org colgada en estado pending enterprise checkout:
-      - public_metadata.plan = free
-      - public_metadata.seats = seats (por defecto 0)
-      - private_metadata.pending_enterprise_checkout = False
-      - opcional: private_metadata.pending_canceled_at
-      - opcional: guarda stripe_customer_id / stripe_subscription_id si llegan
-    Idempotente: si ya está limpio, no rompe.
-    """
     if not org_id:
         raise ValueError("org_id required")
 
@@ -1003,10 +969,6 @@ def enterprise_cleanup_org(
 
 
 def enterprise_checkout_cancel_cleanup(user_id: str) -> Dict[str, Any]:
-    """
-    Endpoint MVP: limpia TODAS las orgs del usuario que estén pending_enterprise_checkout=true.
-    Devuelve: { cleaned: N, org_ids: [...], errors:[...] }
-    """
     if not user_id:
         raise ValueError("user_id required")
 

@@ -1,3 +1,4 @@
+# app/services/stripe_svc.py
 from __future__ import annotations
 
 import os
@@ -6,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import stripe
 from flask import current_app
 
-# ───────────────────────── Helpers ENV ─────────────────────────
+
 def _env_flag(name: str, default: bool) -> bool:
     val = os.getenv(name)
     if val is None:
@@ -39,9 +40,7 @@ def _normalize_entity_type(t: Optional[str]) -> Optional[str]:
     return t2 or None
 
 
-# ───────────────────────── Init Stripe ─────────────────────────
 def init_stripe() -> None:
-    """Inicializa la API key de Stripe desde ENV o config de Flask."""
     key = os.getenv("STRIPE_SECRET_KEY") or current_app.config.get("STRIPE_SECRET_KEY")
     if not key:
         raise RuntimeError("STRIPE_SECRET_KEY is empty/missing")
@@ -49,11 +48,7 @@ def init_stripe() -> None:
         stripe.api_key = key
 
 
-# ─────────────────────── Customers (1 por entidad) ───────────────────────
 def _search_customer_by_entity(entity_type: str, entity_id: str) -> Optional[stripe.Customer]:
-    """
-    Busca un customer por metadata exacta de entidad (requiere Stripe Search).
-    """
     init_stripe()
     q = f'metadata["entity_type"]:"{entity_type}" AND metadata["entity_id"]:"{entity_id}"'
     try:
@@ -73,10 +68,6 @@ def get_or_create_customer_for_entity(
     name: Optional[str] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> stripe.Customer:
-    """
-    Devuelve el customer asociado a una entidad (user/org). Si no existe, lo crea.
-    NUNCA reutiliza ni gira un customer de otra entidad.
-    """
     init_stripe()
     etype = _normalize_entity_type(entity_type)
     if etype not in ("user", "org"):
@@ -120,11 +111,6 @@ def ensure_customer_metadata(
     entity_email: Optional[str] = None,
     strict: bool = True,
 ) -> stripe.Customer:
-    """
-    Garantiza (si procede) los metadatos de entidad en el customer.
-    - strict=True: si el customer ya tiene otra entidad, NO sobreescribe (evita “girar”).
-    - strict=False: intentará escribir metadata aunque existan valores previos.
-    """
     init_stripe()
     etype = _normalize_entity_type(entity_type)
     if etype not in ("user", "org"):
@@ -176,9 +162,6 @@ def assert_customer_entity(
     expected_entity_type: str,
     expected_entity_id: str,
 ) -> None:
-    """
-    Lanza ValueError si el customer está ligado a otra entidad diferente de la esperada.
-    """
     init_stripe()
     etype = _normalize_entity_type(expected_entity_type)
     if etype not in ("user", "org"):
@@ -199,7 +182,6 @@ def assert_customer_entity(
         )
 
 
-# ─────────────────────── Checkout (subscription) ───────────────────────
 def create_checkout_session(
     *,
     customer_id: str,
@@ -209,11 +191,6 @@ def create_checkout_session(
     success_url: str,
     cancel_url: str,
 ) -> stripe.checkout.Session:
-    """
-    Crea una Checkout Session de suscripción.
-    - NO modifica metadatos del customer.
-    - Si meta incluye entity_type/entity_id, validamos coherencia con el customer.
-    """
     init_stripe()
 
     if not price_id:
@@ -275,7 +252,6 @@ def create_checkout_session(
     return stripe.checkout.Session.create(**kwargs)
 
 
-# ─────────────────────── Billing Portal ───────────────────────
 def create_billing_portal(customer_id: str, return_url: str) -> stripe.billing_portal.Session:
     init_stripe()
     return stripe.billing_portal.Session.create(
@@ -284,7 +260,6 @@ def create_billing_portal(customer_id: str, return_url: str) -> stripe.billing_p
     )
 
 
-# ─────────────────── Seats (modificar cantidad) ───────────────────
 def set_subscription_quantity(subscription_item_id: str, quantity: int) -> stripe.SubscriptionItem:
     init_stripe()
     return stripe.SubscriptionItem.modify(
@@ -294,7 +269,6 @@ def set_subscription_quantity(subscription_item_id: str, quantity: int) -> strip
     )
 
 
-# ─────────────────── Utilidades varias ───────────────────
 def build_enterprise_meta(
     *,
     org_id: str,
@@ -341,14 +315,7 @@ def build_pro_meta(
     return m
 
 
-# ──────────────────────────────────────────────────────────────
-# ✅ 2.3: Summary / Invoices delegados aquí (Blueprint fino)
-# ──────────────────────────────────────────────────────────────
-
 def _pm_from_customer(customer_id: str) -> Dict[str, Optional[str]]:
-    """
-    Intenta extraer el método de pago principal del customer.
-    """
     init_stripe()
     try:
         cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
@@ -394,9 +361,6 @@ def _invoice_dto(inv: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _find_active_org_subscription(org_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Busca 1 sub activa por org_id en metadata (tu patrón actual).
-    """
     init_stripe()
     try:
         subs = stripe.Subscription.search(
@@ -421,9 +385,6 @@ def _find_any_org_subscription(org_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_billing_summary_for_org(*, org_id: str) -> Dict[str, Any]:
-    """
-    Devuelve summary org-level (Enterprise) basado en sub por metadata org_id.
-    """
     init_stripe()
     sub = _find_active_org_subscription(org_id)
     if sub:
@@ -445,9 +406,6 @@ def get_billing_summary_for_org(*, org_id: str) -> Dict[str, Any]:
 
 
 def get_billing_summary_for_user(*, user_id: str, email: Optional[str]) -> Dict[str, Any]:
-    """
-    Devuelve summary user-level (Pro) usando customer 1:1 del user.
-    """
     init_stripe()
     cust = get_or_create_customer_for_entity(
         entity_type="user",
@@ -473,9 +431,6 @@ def get_billing_summary_for_user(*, user_id: str, email: Optional[str]) -> Dict[
 
 
 def list_invoices_for_org(*, org_id: str, limit: int = 20) -> Dict[str, Any]:
-    """
-    Lista facturas para org (por subscription encontrada vía metadata org_id).
-    """
     init_stripe()
     sub = _find_any_org_subscription(org_id)
     if not sub:
@@ -487,9 +442,6 @@ def list_invoices_for_org(*, org_id: str, limit: int = 20) -> Dict[str, Any]:
 
 
 def list_invoices_for_user(*, user_id: str, email: Optional[str], limit: int = 20) -> Dict[str, Any]:
-    """
-    Lista facturas para user (por customer 1:1 user).
-    """
     init_stripe()
     cust = get_or_create_customer_for_entity(
         entity_type="user",

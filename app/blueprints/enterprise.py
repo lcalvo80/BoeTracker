@@ -8,7 +8,10 @@ from flask import Blueprint, request, g
 from app.auth import require_auth, require_org_admin
 from app.services import clerk_svc
 
-bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
+# ⚠️ IMPORTANTÍSIMO:
+# NO pongas url_prefix aquí si en app/__init__.py ya registras:
+# app.register_blueprint(enterprise_bp, url_prefix="/api/enterprise")
+bp = Blueprint("enterprise", __name__)
 
 
 @bp.before_request
@@ -31,9 +34,7 @@ def _json_err(msg: str, code: int = 400, *, extra: dict | None = None):
 def _status_from_exception(e: Exception) -> tuple[int, str, Optional[dict]]:
     # Semántica especial para ClerkHttpError (incluye 409 seat guard / last admin)
     if isinstance(e, clerk_svc.ClerkHttpError):
-        # seat guard (invite): lo detectamos por body
         if e.status_code == 409 and "not_enough_seats" in (e.body or ""):
-            # Intentar extraer números de forma robusta (best effort)
             details = {"reason": "not_enough_seats", "raw": e.body}
             return 409, "not_enough_seats", details
 
@@ -149,7 +150,6 @@ def revoke_invitation():
             ids=ids,
             emails=emails,
         )
-        # Si hay errores parciales, devolvemos 207
         code = 207 if out.get("failed") and out.get("revoked") else 200 if out.get("revoked") else 502
         return _json_ok(out, code)
     except Exception as e:
@@ -186,14 +186,9 @@ def invite_user():
         code = 207 if out.get("errors") and out.get("results") else 200 if out.get("results") else 502
         return _json_ok(out, code)
     except Exception as e:
-        # seat guard semántico 409
         if isinstance(e, clerk_svc.ClerkHttpError) and e.status_code == 409 and "not_enough_seats" in (e.body or ""):
             return (
-                {
-                    "ok": False,
-                    "error": "not_enough_seats",
-                    "details": {"raw": e.body},
-                },
+                {"ok": False, "error": "not_enough_seats", "details": {"raw": e.body}},
                 409,
             )
         code, msg, details = _status_from_exception(e)

@@ -1,3 +1,4 @@
+# app/blueprints/billing.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -27,14 +28,6 @@ def _frontend_base() -> str:
 
 
 def _success_cancel(default_path: str = "/settings/billing") -> tuple[str, str]:
-    """
-    Construye success_url y cancel_url para Stripe Checkout / Billing Portal.
-
-    Por defecto, devuelve al usuario a /settings/billing en el frontend,
-    añadiendo ?status=success|cancel.
-
-    Si el frontend manda success_url/cancel_url en body, las respeta.
-    """
     base = _frontend_base()
     data = request.get_json(silent=True) or {}
     success_url = data.get("success_url") or f"{base}{default_path}?status=success"
@@ -43,10 +36,6 @@ def _success_cancel(default_path: str = "/settings/billing") -> tuple[str, str]:
 
 
 def _success_cancel_pricing(org_id: str) -> tuple[str, str]:
-    """
-    Forzamos retorno a PricingPage (sin páginas nuevas) para Enterprise,
-    con checkout=success|cancel y org_id para limpieza dirigida.
-    """
     base = _frontend_base()
     success_url = f"{base}/pricing?checkout=success&org_id={org_id}"
     cancel_url = f"{base}/pricing?checkout=cancel&org_id={org_id}"
@@ -62,12 +51,6 @@ def _json_err(msg: str, code: int = 400):
 
 
 def _parse_seats(body: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
-    """
-    Valida seats:
-      - entero
-      - min 1
-      - max razonable (configurable)
-    """
     max_seats = int(current_app.config.get("ENTERPRISE_MAX_SEATS", 200))
     try:
         seats = int(body.get("seats") or 1)
@@ -82,11 +65,6 @@ def _parse_seats(body: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
 
 
 def _is_adminish_in_org(user_id: str, org_id: str) -> bool:
-    """
-    Con tu clerk_svc actual:
-      - comprobamos membership
-      - role raw puede ser admin/org:admin/owner
-    """
     mem = clerk_svc.get_membership_raw(user_id=user_id, org_id=org_id) or {}
     role = (mem.get("role") or "").strip().lower()
     return role in ("admin", "org:admin", "owner")
@@ -97,9 +75,6 @@ def _is_adminish_in_org(user_id: str, org_id: str) -> bool:
 @bp.route("/summary", methods=["GET", "OPTIONS"])
 @require_auth
 def billing_summary():
-    """
-    (2.3) Delegado a stripe_svc.
-    """
     try:
         if g.org_id:
             data = stripe_svc.get_billing_summary_for_org(org_id=g.org_id)
@@ -114,12 +89,6 @@ def billing_summary():
 @bp.route("/checkout/pro", methods=["POST", "OPTIONS"])
 @require_auth
 def checkout_pro():
-    """
-    (2.2) PRO HARDENED:
-      - customer Stripe 1:1 por user (entity_type=user, entity_id=user_id)
-      - no reutilizar customer por email
-      - checkout session vía stripe_svc (consistente)
-    """
     body = request.get_json(silent=True) or {}
 
     price_id = body.get("price") or _cfg("STRIPE_PRICE_PRO")
@@ -129,7 +98,6 @@ def checkout_pro():
     try:
         success_url, cancel_url = _success_cancel("/settings/billing")
 
-        # 🔐 Customer exclusivo del user
         cust = stripe_svc.get_or_create_customer_for_entity(
             entity_type="user",
             entity_id=g.user_id,
@@ -144,7 +112,6 @@ def checkout_pro():
             entity_email=g.email or "",
             entity_name="",
         )
-        # compat legacy (si algún webhook/logic lo usa)
         meta["scope"] = "user"
         meta["clerk_user_id"] = g.user_id
 
@@ -165,18 +132,10 @@ def checkout_pro():
 @bp.route("/checkout/enterprise", methods=["POST", "OPTIONS"])
 @require_auth
 def checkout_enterprise():
-    """
-    Enterprise checkout:
-      - Requiere org_id en g.org_id (X-Org-Id o token)
-      - Valida que el usuario es miembro y adminish antes de crear checkout  ✅ HARDENING 2.1/2.2 coherente
-      - seats validado
-      - customer Stripe 1:1 por org (entity_type=org, entity_id=org_id)
-      - success/cancel vuelven a /pricing?checkout=...&org_id=...
-    """
     if not g.org_id:
         return _json_err("Debes indicar organización (X-Org-Id o en el token).", 400)
 
-    # ✅ Validación crítica: evitar org_id arbitrario
+    # ✅ HARDENING: evitar org_id arbitrario
     if not clerk_svc.is_user_member_of_org(g.org_id, g.user_id):
         return _json_err("No eres miembro de la organización indicada (X-Org-Id).", 403)
     if not _is_adminish_in_org(g.user_id, g.org_id):
@@ -198,7 +157,6 @@ def checkout_enterprise():
     try:
         success_url, cancel_url = _success_cancel_pricing(g.org_id)
 
-        # 🔐 Customer exclusivo de la org
         cust = stripe_svc.get_or_create_customer_for_entity(
             entity_type="org",
             entity_id=g.org_id,
@@ -216,7 +174,6 @@ def checkout_enterprise():
             entity_email="",
             entity_name="",
         )
-        # compat con tu webhook actual
         meta["scope"] = "org"
         meta["org_id"] = g.org_id
         meta["buyer_user_id"] = g.user_id
@@ -239,11 +196,6 @@ def checkout_enterprise():
 @bp.route("/portal", methods=["POST", "OPTIONS"])
 @require_auth
 def billing_portal():
-    """
-    Portal:
-      - si org: portal para customer de la org
-      - si user: portal para customer del user
-    """
     try:
         base = _frontend_base()
         ret_url = f"{base}/settings/billing"
@@ -275,10 +227,6 @@ def billing_portal():
 @bp.route("/invoices", methods=["GET", "OPTIONS"])
 @require_auth
 def billing_invoices():
-    """
-    (2.3) Delegado a stripe_svc.
-    Query: ?limit=20
-    """
     try:
         try:
             limit = max(1, min(100, int(request.args.get("limit", "20"))))
