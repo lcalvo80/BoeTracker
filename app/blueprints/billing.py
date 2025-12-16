@@ -70,6 +70,19 @@ def _is_adminish_in_org(user_id: str, org_id: str) -> bool:
     return role in ("admin", "org:admin", "owner")
 
 
+def _stripe_invalid_request_to_message(e: Exception) -> str:
+    user_msg = getattr(e, "user_message", None)
+    if user_msg:
+        return str(user_msg)
+    return str(e)
+
+
+def _is_stripe_invalid_request(e: Exception) -> bool:
+    name = e.__class__.__name__
+    mod = (e.__class__.__module__ or "").lower()
+    return name == "InvalidRequestError" and "stripe" in mod
+
+
 # ───────────────── Endpoints ─────────────────
 
 @bp.route("/summary", methods=["GET", "OPTIONS"])
@@ -125,6 +138,13 @@ def checkout_pro():
         )
         return _json_ok({"url": session.url})
     except Exception as e:
+        if _is_stripe_invalid_request(e):
+            current_app.logger.warning(
+                "[checkout_pro] stripe invalid request: %s",
+                _stripe_invalid_request_to_message(e),
+            )
+            return _json_err(_stripe_invalid_request_to_message(e), 400)
+
         current_app.logger.exception("[checkout_pro] error")
         return _json_err(str(e), 500)
 
@@ -189,6 +209,13 @@ def checkout_enterprise():
         )
         return _json_ok({"url": session.url})
     except Exception as e:
+        if _is_stripe_invalid_request(e):
+            current_app.logger.warning(
+                "[checkout_enterprise] stripe invalid request: %s",
+                _stripe_invalid_request_to_message(e),
+            )
+            return _json_err(_stripe_invalid_request_to_message(e), 400)
+
         current_app.logger.exception("[checkout_enterprise] error")
         return _json_err(str(e), 500)
 

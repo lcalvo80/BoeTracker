@@ -1,455 +1,339 @@
 # app/services/stripe_svc.py
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List
 
-import stripe
 from flask import current_app
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() in ("1", "true", "yes", "on")
+def _cfg(k: str, default: str = "") -> str:
+    return current_app.config.get(k, default) or default
 
 
-def _env_list(name: str) -> List[str]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return []
-    return [x.strip().upper() for x in raw.split(",") if x.strip()]
+def _bool_cfg(k: str, default: bool = False) -> bool:
+    v = str(current_app.config.get(k, "1" if default else "0")).strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
-def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
-    val = os.getenv(name)
-    if val is None or str(val).strip() == "":
-        return default
-    return str(val).strip()
+def _stripe():
+    """
+    Import diferido para que el módulo cargue aunque Stripe no esté inicializado
+    hasta runtime en Railway.
+    """
+    import stripe  # type: ignore
+
+    api_key = _cfg("STRIPE_SECRET_KEY") or _cfg("STRIPE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Falta STRIPE_SECRET_KEY (o STRIPE_API_KEY) en configuración.")
+    stripe.api_key = api_key
+    return stripe
 
 
-def _normalize_entity_type(t: Optional[str]) -> Optional[str]:
-    if t is None:
+@dataclass(frozen=True)
+class EntityCustomer:
+    id: str
+    email: Optional[str] = None
+    name: Optional[str] = None
+
+
+# ───────────────── Customers ─────────────────
+
+def _customer_search_query(entity_type: str, entity_id: str) -> str:
+    # Stripe Customer Search soporta query sobre metadata:
+    # https://stripe.com/docs/search#query-language
+    # Nota: entity_id se guarda como string.
+    return f"metadata['entity_type']:'{entity_type}' AND metadata['entity_id']:'{entity_id}'"
+
+
+def find_customer_for_entity(entity_type: str, entity_id: str) -> Optional[EntityCustomer]:
+    stripe = _stripe()
+    entity_type = (entity_type or "").strip().lower()
+    entity_id = (entity_id or "").strip()
+
+    if not entity_type or not entity_id:
         return None
-    t2 = str(t).strip().lower()
-    if t2 in ("org", "organization", "organisation"):
-        return "org"
-    if t2 == "user":
-        return "user"
-    return t2 or None
 
-
-def init_stripe() -> None:
-    key = os.getenv("STRIPE_SECRET_KEY") or current_app.config.get("STRIPE_SECRET_KEY")
-    if not key:
-        raise RuntimeError("STRIPE_SECRET_KEY is empty/missing")
-    if stripe.api_key != key:
-        stripe.api_key = key
-
-
-def _search_customer_by_entity(entity_type: str, entity_id: str) -> Optional[stripe.Customer]:
-    init_stripe()
-    q = f'metadata["entity_type"]:"{entity_type}" AND metadata["entity_id"]:"{entity_id}"'
     try:
-        res = stripe.Customer.search(query=q, limit=1)
-        if res and getattr(res, "data", None):
-            return res.data[0]
+        res = stripe.Customer.search(query=_customer_search_query(entity_type, entity_id), limit=1)
+        data = getattr(res, "data", []) or []
+        if not data:
+            return None
+        c = data[0]
+        return EntityCustomer(id=c.id, email=getattr(c, "email", None), name=getattr(c, "name", None))
     except Exception:
-        current_app.logger.exception("[Stripe] Customer.search failed (query=%s)", q)
-    return None
+        # Si el Search no está disponible o falla, fallback a list (menos fiable pero evita bloquear).
+        try:
+            res = stripe.Customer.list(limit=100)
+            for c in getattr(res, "data", []) or []:
+                md = getattr(c, "metadata", None) or {}
+                if (md.get("entity_type") or "").lower() == entity_type and (md.get("entity_id") or "") == entity_id:
+                    return EntityCustomer(id=c.id, email=getattr(c, "email", None), name=getattr(c, "name", None))
+        except Exception:
+            return None
+        return None
 
 
 def get_or_create_customer_for_entity(
-    *,
     entity_type: str,
     entity_id: str,
-    email: Optional[str] = None,
-    name: Optional[str] = None,
-    extra_metadata: Optional[Dict[str, Any]] = None,
-) -> stripe.Customer:
-    init_stripe()
-    etype = _normalize_entity_type(entity_type)
-    if etype not in ("user", "org"):
-        raise ValueError(f"Invalid entity_type '{entity_type}' (expected 'user' or 'org')")
-    eid = str(entity_id).strip()
-    if not eid:
-        raise ValueError("entity_id required")
+    email: Optional[str],
+    name: Optional[str],
+    extra_metadata: Optional[Dict[str, str]] = None,
+):
+    """
+    Customer idempotente por entity_type/entity_id usando metadata.
+    entity_type: 'user' o 'org'
+    entity_id: g.user_id o g.org_id
+    """
+    stripe = _stripe()
+    entity_type = (entity_type or "").strip().lower()
+    entity_id = (entity_id or "").strip()
 
-    found = _search_customer_by_entity(etype, eid)
+    if entity_type not in ("user", "org"):
+        raise ValueError("entity_type debe ser 'user' o 'org'.")
+    if not entity_id:
+        raise ValueError("entity_id requerido.")
+
+    found = find_customer_for_entity(entity_type=entity_type, entity_id=entity_id)
     if found:
-        return found
+        return stripe.Customer.retrieve(found.id)
 
-    md: Dict[str, Any] = {
-        "entity_type": etype,
-        "entity_id": eid,
-        "entity_email": (email or ""),
+    metadata = {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
     }
-    if etype == "user":
-        md["clerk_user_id"] = eid
-    else:
-        md["clerk_org_id"] = eid
-
     if extra_metadata:
         for k, v in extra_metadata.items():
-            if k not in md:
-                md[k] = v
+            if v is None:
+                continue
+            metadata[str(k)] = str(v)
 
-    cust = stripe.Customer.create(
-        email=email or None,
-        name=name or None,
-        metadata=md,
-    )
-    return cust
+    params: Dict[str, Any] = {"metadata": metadata}
+    # Para org solemos no tener email; para user sí.
+    if email:
+        params["email"] = email
+    if name:
+        params["name"] = name
 
-
-def ensure_customer_metadata(
-    *,
-    customer_id: str,
-    entity_type: str,
-    entity_id: str,
-    entity_email: Optional[str] = None,
-    strict: bool = True,
-) -> stripe.Customer:
-    init_stripe()
-    etype = _normalize_entity_type(entity_type)
-    if etype not in ("user", "org"):
-        raise ValueError("entity_type must be 'user' or 'org'")
-    eid = str(entity_id).strip()
-    if not eid:
-        raise ValueError("entity_id required")
-
-    cust = stripe.Customer.retrieve(customer_id)
-    md = (cust.get("metadata") or {}) if isinstance(cust, dict) else {}
-    cur_t = _normalize_entity_type(md.get("entity_type"))
-    cur_id = (md.get("entity_id") or "").strip()
-
-    if cur_t and cur_id:
-        if cur_t == etype and cur_id == eid:
-            return cust
-        if strict:
-            current_app.logger.warning(
-                "[Stripe] customer %s already bound to %s:%s; NOT flipping to %s:%s",
-                customer_id, cur_t, cur_id, etype, eid
-            )
-            return cust
-
-    changed = False
-    if md.get("entity_type") != etype:
-        md["entity_type"] = etype
-        changed = True
-    if md.get("entity_id") != eid:
-        md["entity_id"] = eid
-        changed = True
-    if etype == "user" and md.get("clerk_user_id") != eid:
-        md["clerk_user_id"] = eid
-        changed = True
-    if etype == "org" and md.get("clerk_org_id") != eid:
-        md["clerk_org_id"] = eid
-        changed = True
-    if entity_email is not None and md.get("entity_email") != entity_email:
-        md["entity_email"] = entity_email
-        changed = True
-
-    if changed:
-        cust = stripe.Customer.modify(customer_id, metadata=md)
-    return cust
+    return stripe.Customer.create(**params)
 
 
-def assert_customer_entity(
-    *,
-    customer_id: str,
-    expected_entity_type: str,
-    expected_entity_id: str,
-) -> None:
-    init_stripe()
-    etype = _normalize_entity_type(expected_entity_type)
-    if etype not in ("user", "org"):
-        raise ValueError("expected_entity_type must be 'user' or 'org'")
-    eid = str(expected_entity_id).strip()
-    if not eid:
-        raise ValueError("expected_entity_id required")
+# ───────────────── Metadata builders ─────────────────
 
-    cust = stripe.Customer.retrieve(customer_id)
-    md = (cust.get("metadata") or {}) if isinstance(cust, dict) else {}
-    cur_t = _normalize_entity_type(md.get("entity_type"))
-    cur_id = (md.get("entity_id") or "").strip()
+def build_pro_meta(
+    user_id: str,
+    price_id: str,
+    entity_email: str,
+    entity_name: str,
+) -> Dict[str, str]:
+    return {
+        "plan": "pro",
+        "scope": "user",
+        "user_id": str(user_id or ""),
+        "price_id": str(price_id or ""),
+        "entity_email": str(entity_email or ""),
+        "entity_name": str(entity_name or ""),
+        "created_by": "boetracker",
+    }
 
-    if cur_t and cur_id and (cur_t != etype or cur_id != eid):
-        raise ValueError(
-            f"customer {customer_id} belongs to {cur_t}:{cur_id}, not {etype}:{eid}. "
-            "Refuse to use same customer for different entity."
-        )
 
+def build_enterprise_meta(
+    org_id: str,
+    seats: int,
+    price_id: str,
+    plan: str,
+    plan_scope: str,
+    entity_email: str,
+    entity_name: str,
+) -> Dict[str, str]:
+    return {
+        "plan": str(plan or "enterprise"),
+        "scope": str(plan_scope or "org"),
+        "org_id": str(org_id or ""),
+        "seats": str(int(seats)),
+        "price_id": str(price_id or ""),
+        "entity_email": str(entity_email or ""),
+        "entity_name": str(entity_name or ""),
+        "created_by": "boetracker",
+    }
+
+
+# ───────────────── Checkout / Portal ─────────────────
 
 def create_checkout_session(
-    *,
     customer_id: str,
     price_id: str,
     quantity: int,
     meta: Dict[str, Any],
     success_url: str,
     cancel_url: str,
-) -> stripe.checkout.Session:
-    init_stripe()
+):
+    """
+    Crea Stripe Checkout Session.
+    FIX PERMANENTE: si automatic_tax está activo, obliga a pedir dirección y guardarla en el Customer
+    mediante customer_update[address]='auto'. Sin eso Stripe rechaza la sesión y nunca se abre Checkout.
+    """
+    stripe = _stripe()
 
+    if not customer_id:
+        raise ValueError("customer_id requerido.")
     if not price_id:
-        raise ValueError("Missing price_id")
+        raise ValueError("price_id requerido.")
+    if not isinstance(quantity, int) or quantity < 1:
+        raise ValueError("quantity debe ser entero >= 1.")
     if not success_url or not cancel_url:
-        raise ValueError("Missing success_url/cancel_url")
-    if price_id.startswith("prod_"):
-        raise ValueError("Invalid price_id: received a product id (prod_...). Use a price id (price_...).")
+        raise ValueError("success_url y cancel_url son requeridos.")
 
-    automatic_tax_enabled = _env_flag("STRIPE_AUTOMATIC_TAX", True)
-    require_billing_addr = _env_flag("STRIPE_REQUIRE_BILLING_ADDRESS", True)
-    collect_shipping = _env_flag("STRIPE_COLLECT_SHIPPING", False)
-    shipping_countries = _env_list("STRIPE_SHIPPING_COUNTRIES")
-    auto_save_address = _env_flag("STRIPE_SAVE_ADDRESS_AUTO", True)
-    auto_save_shipping = _env_flag("STRIPE_SAVE_SHIPPING_AUTO", collect_shipping)
-    auto_save_name = _env_flag("STRIPE_SAVE_NAME_AUTO", True)
-    locale = _env_str("STRIPE_CHECKOUT_LOCALE", "auto")
+    automatic_tax_enabled = _bool_cfg("STRIPE_AUTOMATIC_TAX_ENABLED", True)
+    tax_id_collection_enabled = _bool_cfg("STRIPE_TAX_ID_COLLECTION_ENABLED", False)
 
-    _etype = _normalize_entity_type(meta.get("entity_type"))
-    _eid = (meta.get("entity_id") or "").strip()
-    if _etype in ("user", "org") and _eid:
-        assert_customer_entity(customer_id=customer_id, expected_entity_type=_etype, expected_entity_id=_eid)
-
-    kwargs: Dict[str, Any] = {
-        "customer": customer_id,
-        "mode": "subscription",
-        "line_items": [{"price": price_id, "quantity": max(int(quantity), 1)}],
-        "allow_promotion_codes": True,
-        "success_url": success_url,
-        "cancel_url": cancel_url,
-        "subscription_data": {"metadata": meta},
-        "metadata": meta,
-        "tax_id_collection": {"enabled": True},
-        "locale": locale,
-    }
-
-    cu: Dict[str, str] = {}
-    if automatic_tax_enabled:
-        kwargs["automatic_tax"] = {"enabled": True}
-        if require_billing_addr:
-            kwargs["billing_address_collection"] = "required"
-        if auto_save_address:
-            cu["address"] = "auto"
-        if auto_save_name:
-            cu["name"] = "auto"
-
-    if collect_shipping:
-        if auto_save_shipping:
-            cu["shipping"] = "auto"
-        kwargs["shipping_address_collection"] = (
-            {"allowed_countries": shipping_countries}
-            if shipping_countries
-            else {"allowed_countries": ["US", "ES", "PT", "FR", "DE", "IT"]}
-        )
-
-    if cu:
-        kwargs["customer_update"] = cu
-
-    return stripe.checkout.Session.create(**kwargs)
-
-
-def create_billing_portal(customer_id: str, return_url: str) -> stripe.billing_portal.Session:
-    init_stripe()
-    return stripe.billing_portal.Session.create(
+    params: Dict[str, Any] = dict(
+        mode="subscription",
         customer=customer_id,
-        return_url=return_url,
+        success_url=success_url,
+        cancel_url=cancel_url,
+        line_items=[{"price": price_id, "quantity": quantity}],
+        metadata=meta or {},
     )
 
+    if automatic_tax_enabled:
+        params["automatic_tax"] = {"enabled": True}
+        # ✅ CRÍTICO: sin esto Stripe falla con "requires a valid address on the Customer"
+        params["billing_address_collection"] = "required"
+        params["customer_update"] = {"address": "auto", "name": "auto"}
 
-def set_subscription_quantity(subscription_item_id: str, quantity: int) -> stripe.SubscriptionItem:
-    init_stripe()
-    return stripe.SubscriptionItem.modify(
-        subscription_item_id,
-        quantity=max(int(quantity), 1),
-        proration_behavior="always_invoice",
-    )
+    if tax_id_collection_enabled:
+        params["tax_id_collection"] = {"enabled": True}
 
-
-def build_enterprise_meta(
-    *,
-    org_id: str,
-    seats: int,
-    price_id: Optional[str] = None,
-    plan: str = "enterprise",
-    plan_scope: str = "org",
-    entity_email: Optional[str] = "",
-    entity_name: Optional[str] = "",
-) -> Dict[str, Any]:
-    m: Dict[str, Any] = {
-        "entity_type": "org",
-        "entity_id": str(org_id),
-        "plan": plan,
-        "plan_scope": plan_scope,
-        "seats": str(int(seats)),
-        "entity_email": entity_email or "",
-        "entity_name": entity_name or "",
-    }
-    if price_id:
-        m["price_id"] = price_id
-    return m
+    return stripe.checkout.Session.create(**params)
 
 
-def build_pro_meta(
-    *,
-    user_id: str,
-    price_id: Optional[str] = None,
-    plan: str = "pro",
-    plan_scope: str = "user",
-    entity_email: Optional[str] = "",
-    entity_name: Optional[str] = "",
-) -> Dict[str, Any]:
-    m: Dict[str, Any] = {
-        "entity_type": "user",
-        "entity_id": str(user_id),
-        "plan": plan,
-        "plan_scope": plan_scope,
-        "entity_email": entity_email or "",
-        "entity_name": entity_name or "",
-    }
-    if price_id:
-        m["price_id"] = price_id
-    return m
+def create_billing_portal(customer_id: str, return_url: str):
+    stripe = _stripe()
+    if not customer_id:
+        raise ValueError("customer_id requerido.")
+    if not return_url:
+        raise ValueError("return_url requerido.")
+    return stripe.billing_portal.Session.create(customer=customer_id, return_url=return_url)
 
 
-def _pm_from_customer(customer_id: str) -> Dict[str, Optional[str]]:
-    init_stripe()
+# ───────────────── Summary / Invoices ─────────────────
+
+def _customer_for_user(user_id: str, email: Optional[str]) -> Optional[str]:
+    # preferimos buscar por metadata; si no existe, intentamos por email.
+    c = find_customer_for_entity("user", user_id)
+    if c:
+        return c.id
+    if email:
+        stripe = _stripe()
+        # buscar por email (puede devolver varios; cogemos el más reciente)
+        res = stripe.Customer.list(email=email, limit=1)
+        data = getattr(res, "data", []) or []
+        if data:
+            return data[0].id
+    return None
+
+
+def _customer_for_org(org_id: str) -> Optional[str]:
+    c = find_customer_for_entity("org", org_id)
+    return c.id if c else None
+
+
+def _sub_to_dict(sub: Any) -> Dict[str, Any]:
+    items = []
     try:
-        cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
-        pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
-        if pm and pm.get("card"):
-            card = pm["card"]
-            return {"brand": card.get("brand"), "last4": card.get("last4")}
-
-        invs = stripe.Invoice.list(customer=customer_id, limit=1).data
-        if invs:
-            inv = invs[0]
-            ch_id = inv.get("charge")
-            if ch_id:
-                ch = stripe.Charge.retrieve(ch_id)
-                det = (ch.get("payment_method_details") or {}).get("card") or {}
-                return {"brand": det.get("brand"), "last4": det.get("last4")}
+        for it in (sub.get("items", {}) or {}).get("data", []) if isinstance(sub, dict) else getattr(getattr(sub, "items", None), "data", []) or []:
+            price = (it.get("price") if isinstance(it, dict) else getattr(it, "price", None)) or {}
+            items.append(
+                {
+                    "price_id": price.get("id") if isinstance(price, dict) else getattr(price, "id", None),
+                    "quantity": it.get("quantity") if isinstance(it, dict) else getattr(it, "quantity", None),
+                }
+            )
     except Exception:
         pass
-    return {"brand": None, "last4": None}
 
-
-def _sub_summary(sub: Dict[str, Any]) -> Dict[str, Any]:
-    status = sub.get("status")
-    cpe = sub.get("current_period_end")
-    cust_id = sub.get("customer")
-    pm = _pm_from_customer(cust_id) if cust_id else {"brand": None, "last4": None}
-    return {"status": status, "current_period_end": cpe, "payment_method": pm}
-
-
-def _invoice_dto(inv: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "id": inv.get("id"),
-        "number": inv.get("number"),
-        "status": inv.get("status"),
-        "total": inv.get("total"),
-        "currency": inv.get("currency"),
-        "created": inv.get("created"),
-        "hosted_invoice_url": inv.get("hosted_invoice_url"),
-        "invoice_pdf": inv.get("invoice_pdf"),
-        "subscription": inv.get("subscription"),
-        "customer": inv.get("customer"),
+        "id": sub.get("id") if isinstance(sub, dict) else getattr(sub, "id", None),
+        "status": sub.get("status") if isinstance(sub, dict) else getattr(sub, "status", None),
+        "current_period_end": sub.get("current_period_end") if isinstance(sub, dict) else getattr(sub, "current_period_end", None),
+        "cancel_at_period_end": sub.get("cancel_at_period_end") if isinstance(sub, dict) else getattr(sub, "cancel_at_period_end", None),
+        "items": items,
     }
 
 
-def _find_active_org_subscription(org_id: str) -> Optional[Dict[str, Any]]:
-    init_stripe()
-    try:
-        subs = stripe.Subscription.search(
-            query=f'metadata["org_id"]:"{org_id}" AND status:"active"'
-        ).data
-        if subs:
-            return subs[0]
-    except Exception:
-        current_app.logger.exception("[Stripe] Subscription.search failed for org_id=%s", org_id)
-    return None
+def get_billing_summary_for_user(user_id: str, email: Optional[str]) -> Dict[str, Any]:
+    stripe = _stripe()
+    cust_id = _customer_for_user(user_id=user_id, email=email)
+    if not cust_id:
+        return {"scope": "user", "customer_id": None, "subscriptions": [], "active": False}
+
+    subs = stripe.Subscription.list(customer=cust_id, status="all", limit=10)
+    subs_data = [ _sub_to_dict(s) for s in (getattr(subs, "data", []) or []) ]
+
+    active = any((s.get("status") in ("active", "trialing")) for s in subs_data)
+    return {"scope": "user", "customer_id": cust_id, "subscriptions": subs_data, "active": active}
 
 
-def _find_any_org_subscription(org_id: str) -> Optional[Dict[str, Any]]:
-    init_stripe()
-    try:
-        subs = stripe.Subscription.search(query=f'metadata["org_id"]:"{org_id}"').data
-        if subs:
-            return subs[0]
-    except Exception:
-        current_app.logger.exception("[Stripe] Subscription.search failed (any) for org_id=%s", org_id)
-    return None
+def get_billing_summary_for_org(org_id: str) -> Dict[str, Any]:
+    stripe = _stripe()
+    cust_id = _customer_for_org(org_id=org_id)
+    if not cust_id:
+        return {"scope": "org", "org_id": org_id, "customer_id": None, "subscriptions": [], "active": False}
+
+    subs = stripe.Subscription.list(customer=cust_id, status="all", limit=10)
+    subs_data = [ _sub_to_dict(s) for s in (getattr(subs, "data", []) or []) ]
+
+    active = any((s.get("status") in ("active", "trialing")) for s in subs_data)
+    return {"scope": "org", "org_id": org_id, "customer_id": cust_id, "subscriptions": subs_data, "active": active}
 
 
-def get_billing_summary_for_org(*, org_id: str) -> Dict[str, Any]:
-    init_stripe()
-    sub = _find_active_org_subscription(org_id)
-    if sub:
-        item = (sub.get("items") or {}).get("data", [{}])[0]
-        seats = item.get("quantity") or 0
-        base = _sub_summary(sub)
-        base.update({"scope": "org", "org_id": org_id, "plan": "ENTERPRISE", "seats": seats})
-        return base
+def list_invoices_for_user(user_id: str, email: Optional[str], limit: int = 20) -> Dict[str, Any]:
+    stripe = _stripe()
+    cust_id = _customer_for_user(user_id=user_id, email=email)
+    if not cust_id:
+        return {"scope": "user", "customer_id": None, "invoices": []}
 
-    return {
-        "scope": "org",
-        "org_id": org_id,
-        "plan": "NO_PLAN",
-        "seats": 0,
-        "status": None,
-        "current_period_end": None,
-        "payment_method": {"brand": None, "last4": None},
-    }
-
-
-def get_billing_summary_for_user(*, user_id: str, email: Optional[str]) -> Dict[str, Any]:
-    init_stripe()
-    cust = get_or_create_customer_for_entity(
-        entity_type="user",
-        entity_id=user_id,
-        email=email,
-        name=None,
-        extra_metadata={"created_from": "billing_summary"},
-    )
-    subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1).data
-    if subs:
-        sub = subs[0]
-        base = _sub_summary(sub)
-        base.update({"scope": "user", "plan": "PRO"})
-        return base
-
-    return {
-        "scope": "user",
-        "plan": "NO_PLAN",
-        "status": None,
-        "current_period_end": None,
-        "payment_method": {"brand": None, "last4": None},
-    }
+    inv = stripe.Invoice.list(customer=cust_id, limit=max(1, min(100, int(limit))))
+    invoices = []
+    for x in (getattr(inv, "data", []) or []):
+        invoices.append(
+            {
+                "id": getattr(x, "id", None),
+                "status": getattr(x, "status", None),
+                "paid": getattr(x, "paid", None),
+                "currency": getattr(x, "currency", None),
+                "amount_due": getattr(x, "amount_due", None),
+                "amount_paid": getattr(x, "amount_paid", None),
+                "created": getattr(x, "created", None),
+                "hosted_invoice_url": getattr(x, "hosted_invoice_url", None),
+                "invoice_pdf": getattr(x, "invoice_pdf", None),
+            }
+        )
+    return {"scope": "user", "customer_id": cust_id, "invoices": invoices}
 
 
-def list_invoices_for_org(*, org_id: str, limit: int = 20) -> Dict[str, Any]:
-    init_stripe()
-    sub = _find_any_org_subscription(org_id)
-    if not sub:
-        return {"scope": "org", "org_id": org_id, "items": []}
+def list_invoices_for_org(org_id: str, limit: int = 20) -> Dict[str, Any]:
+    stripe = _stripe()
+    cust_id = _customer_for_org(org_id=org_id)
+    if not cust_id:
+        return {"scope": "org", "org_id": org_id, "customer_id": None, "invoices": []}
 
-    invs = stripe.Invoice.list(subscription=sub.get("id"), limit=max(1, min(100, int(limit)))).data
-    items = [_invoice_dto(i) for i in invs]
-    return {"scope": "org", "org_id": org_id, "items": items}
-
-
-def list_invoices_for_user(*, user_id: str, email: Optional[str], limit: int = 20) -> Dict[str, Any]:
-    init_stripe()
-    cust = get_or_create_customer_for_entity(
-        entity_type="user",
-        entity_id=user_id,
-        email=email,
-        name=None,
-        extra_metadata={"created_from": "billing_invoices"},
-    )
-    invs = stripe.Invoice.list(customer=cust.id, limit=max(1, min(100, int(limit)))).data
-    items = [_invoice_dto(i) for i in invs]
-    return {"scope": "user", "items": items}
+    inv = stripe.Invoice.list(customer=cust_id, limit=max(1, min(100, int(limit))))
+    invoices = []
+    for x in (getattr(inv, "data", []) or []):
+        invoices.append(
+            {
+                "id": getattr(x, "id", None),
+                "status": getattr(x, "status", None),
+                "paid": getattr(x, "paid", None),
+                "currency": getattr(x, "currency", None),
+                "amount_due": getattr(x, "amount_due", None),
+                "amount_paid": getattr(x, "amount_paid", None),
+                "created": getattr(x, "created", None),
+                "hosted_invoice_url": getattr(x, "hosted_invoice_url", None),
+                "invoice_pdf": getattr(x, "invoice_pdf", None),
+            }
+        )
+    return {"scope": "org", "org_id": org_id, "customer_id": cust_id, "invoices": invoices}
