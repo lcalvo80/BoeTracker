@@ -1,41 +1,14 @@
 # app/blueprints/enterprise.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from typing import Any, Optional
 
-import requests
-from flask import Blueprint, current_app, request, g
+from flask import Blueprint, request, g
 
 from app.auth import require_auth, require_org_admin
+from app.services import clerk_svc
 
 bp = Blueprint("enterprise", __name__, url_prefix="/api/enterprise")
-
-# ───────────────── Roles (Clerk ↔ API) ─────────────────
-# → Cuando escribimos a Clerk (invites / memberships)
-CLERK_ROLE_TO_API = {
-    "admin": "org:admin",
-    "owner": "org:admin",
-    "org:admin": "org:admin",
-    "member": "org:member",
-    "org:member": "org:member",
-    "basic_member": "org:member",  # compat hacia delante
-}
-# ← Cuando leemos desde Clerk
-CLERK_ROLE_FROM_API = {
-    "admin": "admin",
-    "owner": "admin",
-    "org:admin": "admin",
-    "basic_member": "member",
-    "member": "member",
-    "org:member": "member",
-}
-
-
-def _normalize_role(v: Optional[str]) -> Optional[str]:
-    if not v:
-        return None
-    return CLERK_ROLE_FROM_API.get(str(v).strip().lower(), None)
 
 
 @bp.before_request
@@ -44,405 +17,123 @@ def _allow_options():
         return ("", 204)
 
 
-# ──────────────── Clerk error wrapper ────────────────
-class ClerkError(Exception):
-    def __init__(self, status: int, text: str, method: str, path: str):
-        self.status = status
-        self.text = text
-        self.method = method
-        self.path = path
-        super().__init__(f"Clerk {method} {path} -> {status}: {text}")
-
-
-# ───────────────── Clerk helpers ─────────────────
-def _clerk_headers() -> Dict[str, str]:
-    key = current_app.config.get("CLERK_SECRET_KEY", "")
-    if not key:
-        raise RuntimeError("Falta CLERK_SECRET_KEY")
-    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-
-def _clerk_base() -> str:
-    return (current_app.config.get("CLERK_API_BASE") or "https://api.clerk.com/v1").rstrip("/")
-
-
-def _req(method: str, path: str, **kwargs) -> Any:
-    """
-    Envuelve requests.request; ante error levanta ClerkError con status.
-    kwargs: json, params, etc.
-    """
-    url = f"{_clerk_base()}{path}"
-    r = requests.request(method, url, headers=_clerk_headers(), timeout=20, **kwargs)
-    if r.status_code >= 400:
-        raise ClerkError(r.status_code, r.text, method, path)
-    if not r.text or not r.text.strip():
-        return None
-    try:
-        return r.json()
-    except Exception:
-        return r.text
-
-
-def _extract_email_from_user(user: Dict[str, Any] | None) -> Optional[str]:
-    if not user:
-        return None
-    if user.get("email_address"):
-        return user.get("email_address")
-    primary_id = user.get("primary_email_address_id")
-    emails = user.get("email_addresses") or []
-    if primary_id:
-        for ea in emails:
-            if ea.get("id") == primary_id and ea.get("email_address"):
-                return ea["email_address"]
-    for ea in emails:
-        if ea.get("email_address"):
-            return ea["email_address"]
-    return None
-
-
-def _normalize_member(m: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normaliza un membership de Clerk, aceptando respuestas con:
-    - include_public_user_data=true (public_user_data)
-    - expand=user
-    """
-    pud = (m.get("public_user_data") or {})
-    user = (m.get("user") or {})
-    uid = m.get("user_id") or pud.get("user_id") or user.get("id")
-
-    email = pud.get("email_address") or _extract_email_from_user(user)
-    name = " ".join(
-        [
-            (pud.get("first_name") or user.get("first_name") or "") or "",
-            (pud.get("last_name") or user.get("last_name") or "") or "",
-        ]
-    ).strip()
-
-    role = _normalize_role(m.get("role")) or "member"
-    return {
-        "id": m.get("id"),  # membership_id
-        "membership_id": m.get("id"),
-        "user_id": uid,
-        "email": email,
-        "name": name,
-        "role": role,
-        "organization_id": m.get("organization_id") or (m.get("organization") or {}).get("id"),
-    }
-
-
-def _find_membership_id(org_id: str, user_id: str) -> Optional[str]:
-    """Devuelve membership_id a partir de org_id + user_id."""
-    try:
-        res = _req(
-            "GET",
-            f"/organizations/{org_id}/memberships",
-            params={"limit": 200, "include_public_user_data": "true"},
-        )
-        for m in res.get("data", []):
-            if (m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")) == user_id:
-                return m.get("id")
-    except Exception:
-        pass
-    return None
-
-
-def _find_membership(org_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Devuelve el membership del usuario en la org:
-      1) Busca en /organizations/:id/memberships
-      2) Fallback: /users/:id?expand=organization_memberships y, si hay id, hidrata con expand=user
-    """
-    try:
-        res = _req(
-            "GET",
-            f"/organizations/{org_id}/memberships",
-            params={"limit": 200, "include_public_user_data": "true"},
-        )
-        for m in res.get("data", []):
-            uid = m.get("user_id") or (m.get("public_user_data") or {}).get("user_id")
-            if uid == user_id:
-                return m
-    except Exception:
-        pass
-
-    try:
-        u = _req("GET", f"/users/{user_id}", params={"expand": "organization_memberships"})
-        for mem in (u.get("organization_memberships") or []):
-            if mem.get("organization_id") == org_id or mem.get("organization") == org_id:
-                mid = mem.get("id")
-                if mid:
-                    try:
-                        return _req(
-                            "GET",
-                            f"/organizations/{org_id}/memberships/{mid}",
-                            params={"expand": "user", "include_public_user_data": "true"},
-                        )
-                    except Exception:
-                        return mem
-                return mem
-    except Exception:
-        pass
-    return None
-
-
-def _hydrate_members_if_needed(org_id: str, items: List[Dict[str, Any]]) -> None:
-    """
-    Completa email/nombre/user_id si faltan:
-      - Primero, membership con expand=user
-      - Luego, /users/:id?expand=email_addresses
-    """
-    for it in items:
-        uid = it.get("user_id")
-        if not (it.get("email") and uid):
-            mid = it.get("membership_id")
-            try:
-                mem = _req(
-                    "GET",
-                    f"/organizations/{org_id}/memberships/{mid}",
-                    params={"expand": "user", "include_public_user_data": "true"},
-                )
-                n = _normalize_member(mem or {})
-                for k in ("user_id", "email", "name"):
-                    if not it.get(k) and n.get(k):
-                        it[k] = n[k]
-                uid = it.get("user_id")
-            except Exception:
-                pass
-
-        if uid and (not it.get("email") or not it.get("name")):
-            try:
-                u = _req("GET", f"/users/{uid}", params={"expand": "email_addresses"})
-                it["email"] = it.get("email") or _extract_email_from_user(u or {})
-                fn = (u or {}).get("first_name") or ""
-                ln = (u or {}).get("last_name") or ""
-                full = (fn + " " + ln).strip()
-                if full:
-                    it["name"] = it.get("name") or full
-            except Exception:
-                pass
-
-
 def _json_ok(payload: Any, code: int = 200):
     return ({"ok": True, "data": payload}, code)
 
 
-def _json_err(msg: str, code: int = 400):
-    return ({"ok": False, "error": msg}, code)
+def _json_err(msg: str, code: int = 400, *, extra: dict | None = None):
+    out = {"ok": False, "error": msg}
+    if extra:
+        out["details"] = extra
+    return (out, code)
 
 
-def _frontend_base() -> str:
-    return (current_app.config.get("FRONTEND_BASE_URL") or "http://localhost:3000").rstrip("/")
+def _status_from_exception(e: Exception) -> tuple[int, str, Optional[dict]]:
+    # Semántica especial para ClerkHttpError (incluye 409 seat guard / last admin)
+    if isinstance(e, clerk_svc.ClerkHttpError):
+        # seat guard (invite): lo detectamos por body
+        if e.status_code == 409 and "not_enough_seats" in (e.body or ""):
+            # Intentar extraer números de forma robusta (best effort)
+            details = {"reason": "not_enough_seats", "raw": e.body}
+            return 409, "not_enough_seats", details
+
+        if e.status_code == 409 and "cannot_demote_last_admin" in (e.body or ""):
+            return 409, "cannot_demote_last_admin", None
+        if e.status_code == 409 and "cannot_remove_last_admin" in (e.body or ""):
+            return 409, "cannot_remove_last_admin", None
+        if e.status_code == 404 and "membership_not_found" in (e.body or ""):
+            return 404, "membership_not_found", None
+
+        return 502, f"Clerk error: {e}", None
+
+    if isinstance(e, ValueError):
+        return 400, str(e), None
+
+    return 502, f"Clerk error: {e}", None
 
 
-def _append_query(url: str, extra: Dict[str, str]) -> str:
-    u = urlparse(url)
-    q = dict(parse_qsl(u.query))
-    q.update({k: v for k, v in extra.items() if v is not None})
-    return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
-
-
-# ─────────────── Utilidades de asientos / admins ───────────────
-def _org_usage(org_id: str) -> Dict[str, int]:
-    """Devuelve contadores: members (aceptados), pending (invitaciones), used (members+pending)."""
-    members = 0
-    pending = 0
-    try:
-        mems = _req(
-            "GET",
-            f"/organizations/{org_id}/memberships",
-            params={"limit": 200, "include_public_user_data": "true"},
-        )
-        members = len(mems.get("data", []))
-    except Exception:
-        pass
-    try:
-        invs = _req(
-            "GET",
-            f"/organizations/{org_id}/invitations",
-            params={"status": "pending", "limit": 200},
-        )
-        arr = invs if isinstance(invs, list) else (invs.get("data") or [])
-        pending = len(arr)
-    except Exception:
-        pass
-    return {"members": members, "pending": pending, "used": members + pending}
-
-
-def _count_admins(org_id: str) -> int:
-    try:
-        res = _req("GET", f"/organizations/{org_id}/memberships", params={"limit": 200})
-        return sum(1 for m in res.get("data", []) if _normalize_role(m.get("role")) == "admin")
-    except Exception:
-        return 0
-
-
-def _is_last_admin(org_id: str, membership_id: str) -> bool:
-    try:
-        mem = _req("GET", f"/organizations/{org_id}/memberships/{membership_id}")
-        if _normalize_role(mem.get("role")) != "admin":
-            return False
-    except Exception:
-        return False
-    return _count_admins(org_id) <= 1
-
-
-# ───────────────── Nuevo endpoint: crear organización ─────────────────
+# ───────────────── Nuevo endpoint: crear organización idempotente ─────────────────
 @bp.route("/create-org", methods=["POST", "OPTIONS"])
 @require_auth
 def create_org():
-    """
-    Crea una organización en Clerk para el usuario autenticado.
-
-    - Inicializa plan "free" y seats=0 en public_metadata.
-    - Guarda un origen en private_metadata para trazabilidad.
-    """
     data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip() or "Organización BOEtracker"
-
+    name = (data.get("name") or "").strip()
     try:
-        payload = {
-            "name": name,
-            "public_metadata": {
-                "plan": "free",
-                "seats": 0,
-            },
-            "private_metadata": {
-                "created_from": "billing_pricing_page",
-                "creator_user_id": g.user_id,
-            },
-        }
-        org = _req("POST", "/organizations", json=payload)
-        out = {
-            "id": org.get("id"),
-            "name": org.get("name"),
-            "slug": org.get("slug"),
-        }
+        out = clerk_svc.enterprise_create_org_idempotent(user_id=g.user_id, name=name)
         return _json_ok(out, 200)
-    except ClerkError as ce:
-        # ce.text suele venir en JSON; devolvemos texto plano para no acoplarnos al formato
-        return _json_err(f"Clerk error: {ce.text}", ce.status)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
+
+
+# ───────────────── 5) Cleanup cuando NO se completa el pago ─────────────────
+@bp.route("/checkout/cancel", methods=["POST", "OPTIONS"])
+@require_auth
+def checkout_cancel():
+    """
+    MVP: se llama cuando el FE vuelve con checkout=cancel.
+    Limpia todas las orgs del usuario con private_metadata.pending_enterprise_checkout=true.
+    Devuelve cuántas limpió.
+    """
+    try:
+        out = clerk_svc.enterprise_checkout_cancel_cleanup(user_id=g.user_id)
+        return _json_ok(out, 200)
+    except Exception as e:
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 # ───────────────── Endpoints ─────────────────
 @bp.route("/org", methods=["GET", "OPTIONS"])
 @require_auth
 def get_org_info():
-    if not g.org_id:
-        return _json_err("Debes indicar organización (X-Org-Id o en el token).", 400)
-
     try:
-        org = _req("GET", f"/organizations/{g.org_id}")
-
-        # Rol "estimado" del token…
-        current_role = g.org_role
-
-        # …y rol "real" consultando membership en Clerk
-        try:
-            mem = _find_membership(g.org_id, g.user_id)
-            if mem and mem.get("role"):
-                nr = _normalize_role(mem.get("role"))
-                if nr:
-                    current_role = nr
-        except Exception:
-            pass
-
-        # Seats configurados en public_metadata
-        seats = int((org.get("public_metadata") or {}).get("seats") or 0)
-
-        # Métricas
-        usage = _org_usage(g.org_id)
-        used = usage["used"]
-        free = max(0, seats - used)
-
-        out = {
-            "id": org.get("id"),
-            "name": org.get("name"),
-            "slug": org.get("slug"),
-            "seats": seats,
-            "used_seats": used,  # compat
-            "pending_invites": usage["pending"],
-            "current_user_role": current_role,
-            # campos claros
-            "used": used,
-            "free_seats": free,
-            "free": free,
-        }
-        return _json_ok(out)
+        out = clerk_svc.enterprise_get_org_info(
+            org_id=getattr(g, "org_id", None),
+            user_id=g.user_id,
+            token_role=getattr(g, "org_role", None),
+        )
+        return _json_ok(out, 200)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/users", methods=["GET", "OPTIONS"])
 @require_auth
 def list_users():
-    if not g.org_id:
-        return _json_err("Missing org (X-Org-Id).", 400)
     try:
-        res = _req(
-            "GET",
-            f"/organizations/{g.org_id}/memberships",
-            params={"limit": 200, "include_public_user_data": "true"},
-        )
-        raw = res.get("data", [])
-        items = [_normalize_member(m) for m in raw]
-        _hydrate_members_if_needed(g.org_id, items)
-        return _json_ok({"items": items, "total": len(items)})
+        out = clerk_svc.enterprise_list_users(org_id=getattr(g, "org_id", None))
+        return _json_ok(out, 200)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/invitations", methods=["GET", "OPTIONS"])
 @require_auth
 @require_org_admin
 def list_invitations():
-    """
-    Lista invitaciones. Soporta:
-      - ?status=pending|accepted|revoked|expired|all
-      - ?statuses=pending,accepted  (compat FE)
-    """
-    if not g.org_id:
-        return _json_err("Missing org (X-Org-Id).", 400)
-
-    status = (request.args.get("status") or "").strip().lower()
-    statuses = (request.args.get("statuses") or "").strip().lower()
-    if statuses and not status:
-        # si llegan varias, tomamos la primera por compat
-        status = statuses.split(",")[0].strip()
-
-    params = {"limit": 200}
-    if status and status not in ("all", "*"):
-        params["status"] = status
-
     try:
-        res = _req("GET", f"/organizations/{g.org_id}/invitations", params=params)
-        arr = res if isinstance(res, list) else (res.get("data") or [])
-        items = [
-            {
-                "id": it.get("id"),
-                "email": it.get("email_address"),
-                "status": it.get("status"),
-                "role": CLERK_ROLE_FROM_API.get((it.get("role") or "").lower(), it.get("role")),
-                "created_at": it.get("created_at"),
-                "updated_at": it.get("updated_at"),
-                "expires_at": it.get("expires_at"),
-            }
-            for it in arr
-        ]
-        return _json_ok({"items": items, "total": len(items)})
+        status = (request.args.get("status") or "").strip().lower()
+        statuses = (request.args.get("statuses") or "").strip().lower()
+        if statuses and not status:
+            status = statuses.split(",")[0].strip()
+
+        out = clerk_svc.enterprise_list_invitations(
+            org_id=getattr(g, "org_id", None),
+            status=status or None,
+        )
+        return _json_ok(out, 200)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/invitations/revoke", methods=["POST", "OPTIONS"])
 @require_auth
 @require_org_admin
 def revoke_invitation():
-    """
-    Revoca invitaciones por id (preferido) o por email(s).
-    Usa Clerk: POST /organizations/{org}/invitations/{id}/revoke con requesting_user_id.
-    """
     data = request.get_json(silent=True) or {}
     ids = data.get("ids") or []
     emails = data.get("emails") or []
@@ -451,130 +142,62 @@ def revoke_invitation():
     if isinstance(emails, str):
         emails = [emails]
 
-    revoked: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
-
     try:
-        # Si llegan emails, mapear a ids desde pendientes
-        if emails and not ids:
-            res = _req(
-                "GET",
-                f"/organizations/{g.org_id}/invitations",
-                params={"status": "pending", "limit": 200},
-            )
-            arr = res if isinstance(res, list) else (res.get("data") or [])
-            email_to_id = {it.get("email_address"): it.get("id") for it in arr}
-            ids = [email_to_id[e] for e in emails if e in email_to_id]
-
-        if not ids:
-            return _json_err("Debes indicar 'ids' o 'emails'.", 400)
-
-        for inv_id in ids:
-            try:
-                _req(
-                    "POST",
-                    f"/organizations/{g.org_id}/invitations/{inv_id}/revoke",
-                    json={"requesting_user_id": g.user_id},
-                )
-                revoked.append({"id": inv_id, "revoked": True})
-            except Exception as ex:
-                errors.append({"id": inv_id, "error": str(ex)})
-
-        ok = {"results": revoked, "errors": errors, "revoked": len(revoked), "failed": len(errors)}
-        code = 207 if errors and revoked else 200 if revoked and not errors else 502
-        return _json_ok(ok, code=code)
+        out = clerk_svc.enterprise_revoke_invitations(
+            org_id=getattr(g, "org_id", None),
+            requesting_user_id=g.user_id,
+            ids=ids,
+            emails=emails,
+        )
+        # Si hay errores parciales, devolvemos 207
+        code = 207 if out.get("failed") and out.get("revoked") else 200 if out.get("revoked") else 502
+        return _json_ok(out, code)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/invite", methods=["POST", "OPTIONS"])
 @require_auth
 @require_org_admin
 def invite_user():
-    """
-    Invita N emails haciendo 1 llamada por email al endpoint simple:
-    POST /organizations/{org_id}/invitations
-    Body: { inviter_user_id, email_address, role (org:*), redirect_url, [expires_in_days] }
-    """
     data = request.get_json(silent=True) or {}
 
     emails = data.get("emails")
     if isinstance(emails, str):
         emails = [emails]
-    emails = [e.strip() for e in (emails or []) if e and isinstance(e, str)]
-    if not emails:
-        return _json_err("Debes indicar 'emails'.", 400)
+    emails = emails or []
 
-    role_in = (data.get("role") or "member").strip().lower()
-    role_api = CLERK_ROLE_TO_API.get(role_in)
-    if role_api not in ("org:member", "org:admin"):
-        return _json_err("role debe ser 'admin' o 'member'.", 400)
-
+    role = (data.get("role") or "member").strip().lower()
     allow_overbook = bool(data.get("allow_overbook", False))
-
-    # Redirect seguro a /accept-invitation con org_id como query param
-    frontend = _frontend_base()
-    base_redirect = f"{frontend}/accept-invitation"
-    redirect_url = data.get("redirect_url") or _append_query(base_redirect, {"org_id": g.org_id})
-    if not str(redirect_url).startswith(frontend):
-        redirect_url = _append_query(base_redirect, {"org_id": g.org_id})
-
+    redirect_url = data.get("redirect_url")
     expires_in_days = data.get("expires_in_days")
-    if expires_in_days is not None:
-        try:
-            expires_in_days = int(expires_in_days)
-            if not (1 <= expires_in_days <= 30):
-                return _json_err("'expires_in_days' debe estar entre 1 y 30.", 400)
-        except Exception:
-            return _json_err("'expires_in_days' debe ser entero.", 400)
 
-    # Guard-rail de asientos (members + pending)
     try:
-        org = _req("GET", f"/organizations/{g.org_id}")
-        seats = int((org.get("public_metadata") or {}).get("seats") or 0)
-    except Exception:
-        seats = 0
-    usage = _org_usage(g.org_id)
-    used = usage["used"]
-    free = max(0, seats - used)
-    needed = len(emails)
-    if not allow_overbook and needed > free:
-        return (
-            {
-                "ok": False,
-                "error": "not_enough_seats",
-                "details": {"seats": seats, "used": used, "free": free, "needed": needed},
-            },
-            409,
+        out = clerk_svc.enterprise_invite_users(
+            org_id=getattr(g, "org_id", None),
+            inviter_user_id=g.user_id,
+            emails=emails,
+            role=role,
+            allow_overbook=allow_overbook,
+            redirect_url=redirect_url,
+            expires_in_days=expires_in_days,
         )
-
-    results: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
-
-    for email in emails:
-        payload = {
-            "inviter_user_id": g.user_id,
-            "email_address": email,
-            "role": role_api,
-            "redirect_url": redirect_url,
-        }
-        if expires_in_days is not None:
-            payload["expires_in_days"] = expires_in_days
-
-        try:
-            r = _req("POST", f"/organizations/{g.org_id}/invitations", json=payload)
-            results.append(
+        code = 207 if out.get("errors") and out.get("results") else 200 if out.get("results") else 502
+        return _json_ok(out, code)
+    except Exception as e:
+        # seat guard semántico 409
+        if isinstance(e, clerk_svc.ClerkHttpError) and e.status_code == 409 and "not_enough_seats" in (e.body or ""):
+            return (
                 {
-                    "id": r.get("id"),
-                    "email": r.get("email_address"),
-                    "status": r.get("status"),
-                }
+                    "ok": False,
+                    "error": "not_enough_seats",
+                    "details": {"raw": e.body},
+                },
+                409,
             )
-        except Exception as e:
-            errors.append({"email": email, "error": str(e)})
-
-    code = 207 if errors and results else 200 if results else 502
-    return _json_ok({"results": results, "errors": errors}, code)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/update-role", methods=["POST", "OPTIONS"])
@@ -585,34 +208,18 @@ def update_role():
     membership_id = data.get("membership_id")
     user_id = data.get("user_id")
     role = (data.get("role") or "").lower().strip()
-    role_api = CLERK_ROLE_TO_API.get(role)  # -> org:admin/org:member
-    if role_api not in ("org:admin", "org:member"):
-        return _json_err("role debe ser 'admin' o 'member'.", 400)
 
-    # Descubrir membership_id si solo llega user_id
-    if not membership_id and user_id:
-        membership_id = _find_membership_id(g.org_id, user_id)
-    if not membership_id:
-        return _json_err("membership_id o user_id requeridos.", 400)
-
-    # Guard-rail: no degradar al último admin
-    if role_api != "org:admin" and _is_last_admin(g.org_id, membership_id):
-        return ({"ok": False, "error": "cannot_demote_last_admin"}, 409)
-
-    # Intentar el PATCH; si Clerk dice 404, mapeamos a error semántico
     try:
-        res = _req(
-            "PATCH",
-            f"/organizations/{g.org_id}/memberships/{membership_id}",
-            json={"role": role_api},
+        out = clerk_svc.enterprise_update_role(
+            org_id=getattr(g, "org_id", None),
+            membership_id=membership_id,
+            user_id=user_id,
+            role=role,
         )
-        return _json_ok(_normalize_member(res))
-    except ClerkError as ce:
-        if ce.status == 404:
-            return _json_err("membership_not_found", 404)
-        return _json_err(f"Clerk error: {ce}", 502)
+        return _json_ok(out, 200)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/remove", methods=["POST", "OPTIONS"])
@@ -623,24 +230,16 @@ def remove_user():
     membership_id = data.get("membership_id")
     user_id = data.get("user_id")
 
-    if not membership_id and user_id:
-        membership_id = _find_membership_id(g.org_id, user_id)
-    if not membership_id:
-        return _json_err("membership_id o user_id requeridos.", 400)
-
-    # Guard-rail: no eliminar al último admin
-    if _is_last_admin(g.org_id, membership_id):
-        return ({"ok": False, "error": "cannot_remove_last_admin"}, 409)
-
     try:
-        _req("DELETE", f"/organizations/{g.org_id}/memberships/{membership_id}")
-        return _json_ok({"removed": True, "membership_id": membership_id})
-    except ClerkError as ce:
-        if ce.status == 404:
-            return _json_err("membership_not_found", 404)
-        return _json_err(f"Clerk error: {ce}", 502)
+        out = clerk_svc.enterprise_remove_user(
+            org_id=getattr(g, "org_id", None),
+            membership_id=membership_id,
+            user_id=user_id,
+        )
+        return _json_ok(out, 200)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)
 
 
 @bp.route("/set-seat-limit", methods=["POST", "OPTIONS"])
@@ -649,16 +248,15 @@ def remove_user():
 def set_seat_limit():
     data = request.get_json(silent=True) or {}
     try:
-        seats = max(0, int(data.get("seats")))
+        seats = int(data.get("seats"))
+        if seats < 0:
+            raise ValueError()
     except Exception:
         return _json_err("'seats' debe ser número entero.", 400)
 
     try:
-        org = _req(
-            "PATCH",
-            f"/organizations/{g.org_id}",
-            json={"public_metadata": {"seats": seats}},
-        )
-        return _json_ok({"org_id": org.get("id"), "seats": seats})
+        out = clerk_svc.enterprise_set_seat_limit(org_id=getattr(g, "org_id", None), seats=seats)
+        return _json_ok({"org_id": out["org_id"], "seats": out["seats"]}, 200)
     except Exception as e:
-        return _json_err(f"Clerk error: {e}", 502)
+        code, msg, details = _status_from_exception(e)
+        return _json_err(msg, code, extra=details)

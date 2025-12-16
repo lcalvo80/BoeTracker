@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
-import stripe
-from flask import Blueprint, current_app, request, jsonify, g
+from flask import Blueprint, current_app, request, g
 
 from app.auth import require_auth
+from app.services import clerk_svc, stripe_svc
 
 bp = Blueprint("billing", __name__)
 
@@ -18,12 +18,12 @@ def _allow_options():
 
 # ───────────────── Helpers ─────────────────
 
-def _stripe() -> None:
-    stripe.api_key = current_app.config.get("STRIPE_SECRET_KEY", "")
-
-
 def _cfg(k: str) -> str:
     return current_app.config.get(k, "")
+
+
+def _frontend_base() -> str:
+    return current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
 
 
 def _success_cancel(default_path: str = "/settings/billing") -> tuple[str, str]:
@@ -32,68 +32,25 @@ def _success_cancel(default_path: str = "/settings/billing") -> tuple[str, str]:
 
     Por defecto, devuelve al usuario a /settings/billing en el frontend,
     añadiendo ?status=success|cancel.
+
+    Si el frontend manda success_url/cancel_url en body, las respeta.
     """
-    base = current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+    base = _frontend_base()
     data = request.get_json(silent=True) or {}
     success_url = data.get("success_url") or f"{base}{default_path}?status=success"
     cancel_url = data.get("cancel_url") or f"{base}{default_path}?status=cancel"
     return success_url, cancel_url
 
 
-def _get_or_create_customer(email: Optional[str], metadata: Dict[str, Any]) -> stripe.Customer:
-    _stripe()
-    if email:
-        existing = stripe.Customer.list(email=email, limit=1).data
-        if existing:
-            cust = existing[0]
-            to_set = {k: v for k, v in (metadata or {}).items() if not (cust.metadata or {}).get(k)}
-            if to_set:
-                stripe.Customer.modify(cust.id, metadata={**(cust.metadata or {}), **to_set})
-            return cust
-    return stripe.Customer.create(email=email or None, metadata=metadata or None)
-
-
-def _pm_from_customer(customer_id: str) -> Dict[str, Optional[str]]:
-    try:
-        cust = stripe.Customer.retrieve(customer_id, expand=["invoice_settings.default_payment_method"])
-        pm = (cust.get("invoice_settings") or {}).get("default_payment_method")
-        if pm and pm.get("card"):
-            card = pm["card"]
-            return {"brand": card.get("brand"), "last4": card.get("last4")}
-        invs = stripe.Invoice.list(customer=customer_id, limit=1).data
-        if invs:
-            inv = invs[0]
-            ch_id = inv.get("charge")
-            if ch_id:
-                ch = stripe.Charge.retrieve(ch_id)
-                det = (ch.get("payment_method_details") or {}).get("card") or {}
-                return {"brand": det.get("brand"), "last4": det.get("last4")}
-    except Exception:
-        pass
-    return {"brand": None, "last4": None}
-
-
-def _sub_summary(sub: Dict[str, Any]) -> Dict[str, Any]:
-    status = sub.get("status")
-    cpe = sub.get("current_period_end")
-    cust_id = sub.get("customer")
-    pm = _pm_from_customer(cust_id) if cust_id else {"brand": None, "last4": None}
-    return {"status": status, "current_period_end": cpe, "payment_method": pm}
-
-
-def _invoice_dto(inv: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "id": inv.get("id"),
-        "number": inv.get("number"),
-        "status": inv.get("status"),
-        "total": inv.get("total"),
-        "currency": inv.get("currency"),
-        "created": inv.get("created"),
-        "hosted_invoice_url": inv.get("hosted_invoice_url"),
-        "invoice_pdf": inv.get("invoice_pdf"),
-        "subscription": inv.get("subscription"),
-        "customer": inv.get("customer"),
-    }
+def _success_cancel_pricing(org_id: str) -> tuple[str, str]:
+    """
+    Forzamos retorno a PricingPage (sin páginas nuevas) para Enterprise,
+    con checkout=success|cancel y org_id para limpieza dirigida.
+    """
+    base = _frontend_base()
+    success_url = f"{base}/pricing?checkout=success&org_id={org_id}"
+    cancel_url = f"{base}/pricing?checkout=cancel&org_id={org_id}"
+    return success_url, cancel_url
 
 
 def _json_ok(payload: Any, code: int = 200):
@@ -104,146 +61,214 @@ def _json_err(msg: str, code: int = 400):
     return ({"ok": False, "error": msg}, code)
 
 
+def _parse_seats(body: Dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
+    """
+    Valida seats:
+      - entero
+      - min 1
+      - max razonable (configurable)
+    """
+    max_seats = int(current_app.config.get("ENTERPRISE_MAX_SEATS", 200))
+    try:
+        seats = int(body.get("seats") or 1)
+    except Exception:
+        return None, "'seats' debe ser número entero."
+
+    if seats < 1:
+        return None, "'seats' debe ser >= 1."
+    if seats > max_seats:
+        return None, f"'seats' supera el máximo permitido ({max_seats})."
+    return seats, None
+
+
+def _is_adminish_in_org(user_id: str, org_id: str) -> bool:
+    """
+    Con tu clerk_svc actual:
+      - comprobamos membership
+      - role raw puede ser admin/org:admin/owner
+    """
+    mem = clerk_svc.get_membership_raw(user_id=user_id, org_id=org_id) or {}
+    role = (mem.get("role") or "").strip().lower()
+    return role in ("admin", "org:admin", "owner")
+
+
 # ───────────────── Endpoints ─────────────────
 
 @bp.route("/summary", methods=["GET", "OPTIONS"])
 @require_auth
 def billing_summary():
-    _stripe()
+    """
+    (2.3) Delegado a stripe_svc.
+    """
     try:
         if g.org_id:
-            subs = stripe.Subscription.search(
-                query=f'metadata["org_id"]:"{g.org_id}" AND status:"active"'
-            ).data
-            if subs:
-                sub = subs[0]
-                item = (sub.get("items") or {}).get("data", [{}])[0]
-                seats = item.get("quantity") or 0
-                base = _sub_summary(sub)
-                base.update({"scope": "org", "org_id": g.org_id, "plan": "ENTERPRISE", "seats": seats})
-                return _json_ok(base)
-            return _json_ok({
-                "scope": "org",
-                "org_id": g.org_id,
-                "plan": "NO_PLAN",
-                "seats": 0,
-                "status": None,
-                "current_period_end": None,
-                "payment_method": {"brand": None, "last4": None},
-            })
+            data = stripe_svc.get_billing_summary_for_org(org_id=g.org_id)
         else:
-            cust = _get_or_create_customer(g.email, {"clerk_user_id": g.user_id})
-            subs = stripe.Subscription.list(customer=cust.id, status="active", limit=1).data
-            if subs:
-                sub = subs[0]
-                base = _sub_summary(sub)
-                base.update({"scope": "user", "plan": "PRO"})
-                return _json_ok(base)
-            return _json_ok({
-                "scope": "user",
-                "plan": "NO_PLAN",
-                "status": None,
-                "current_period_end": None,
-                "payment_method": {"brand": None, "last4": None},
-            })
+            data = stripe_svc.get_billing_summary_for_user(user_id=g.user_id, email=g.email)
+        return _json_ok(data)
     except Exception as e:
+        current_app.logger.exception("[billing_summary] error")
         return _json_err(str(e), 500)
 
 
 @bp.route("/checkout/pro", methods=["POST", "OPTIONS"])
 @require_auth
 def checkout_pro():
-    _stripe()
+    """
+    (2.2) PRO HARDENED:
+      - customer Stripe 1:1 por user (entity_type=user, entity_id=user_id)
+      - no reutilizar customer por email
+      - checkout session vía stripe_svc (consistente)
+    """
+    body = request.get_json(silent=True) or {}
+
+    price_id = body.get("price") or _cfg("STRIPE_PRICE_PRO")
+    if not price_id:
+        return _json_err("Falta STRIPE_PRICE_PRO", 500)
+
     try:
-        body = request.get_json(silent=True) or {}
-        price = body.get("price") or _cfg("STRIPE_PRICE_PRO")
-        if not price:
-            return _json_err("Falta STRIPE_PRICE_PRO", 500)
-
         success_url, cancel_url = _success_cancel("/settings/billing")
-        customer = _get_or_create_customer(g.email, {"clerk_user_id": g.user_id})
 
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            customer=customer.id,
-            line_items=[{"price": price, "quantity": 1}],
+        # 🔐 Customer exclusivo del user
+        cust = stripe_svc.get_or_create_customer_for_entity(
+            entity_type="user",
+            entity_id=g.user_id,
+            email=g.email,
+            name=None,
+            extra_metadata={"created_from": "checkout_pro"},
+        )
+
+        meta = stripe_svc.build_pro_meta(
+            user_id=g.user_id,
+            price_id=price_id,
+            entity_email=g.email or "",
+            entity_name="",
+        )
+        # compat legacy (si algún webhook/logic lo usa)
+        meta["scope"] = "user"
+        meta["clerk_user_id"] = g.user_id
+
+        session = stripe_svc.create_checkout_session(
+            customer_id=cust.id,
+            price_id=price_id,
+            quantity=1,
+            meta=meta,
             success_url=success_url,
             cancel_url=cancel_url,
-            subscription_data={"metadata": {"scope": "user", "clerk_user_id": g.user_id}},
-            metadata={"scope": "user", "clerk_user_id": g.user_id},
-            allow_promotion_codes=True,
         )
         return _json_ok({"url": session.url})
     except Exception as e:
+        current_app.logger.exception("[checkout_pro] error")
         return _json_err(str(e), 500)
 
 
 @bp.route("/checkout/enterprise", methods=["POST", "OPTIONS"])
 @require_auth
 def checkout_enterprise():
+    """
+    Enterprise checkout:
+      - Requiere org_id en g.org_id (X-Org-Id o token)
+      - Valida que el usuario es miembro y adminish antes de crear checkout  ✅ HARDENING 2.1/2.2 coherente
+      - seats validado
+      - customer Stripe 1:1 por org (entity_type=org, entity_id=org_id)
+      - success/cancel vuelven a /pricing?checkout=...&org_id=...
+    """
     if not g.org_id:
         return _json_err("Debes indicar organización (X-Org-Id o en el token).", 400)
 
-    _stripe()
-    body = request.get_json(silent=True) or {}
-    try:
-        seats = max(1, int(body.get("seats") or 1))
-    except Exception:
-        return _json_err("'seats' debe ser número entero.", 400)
+    # ✅ Validación crítica: evitar org_id arbitrario
+    if not clerk_svc.is_user_member_of_org(g.org_id, g.user_id):
+        return _json_err("No eres miembro de la organización indicada (X-Org-Id).", 403)
+    if not _is_adminish_in_org(g.user_id, g.org_id):
+        return _json_err(
+            "No tienes permisos suficientes: debes ser admin de la organización para contratar Enterprise.",
+            403,
+        )
 
-    price = body.get("price") or _cfg("STRIPE_PRICE_ENTERPRISE")
-    if not price:
+    body = request.get_json(silent=True) or {}
+
+    seats, seats_err = _parse_seats(body)
+    if seats_err:
+        return _json_err(seats_err, 400)
+
+    price_id = body.get("price") or _cfg("STRIPE_PRICE_ENTERPRISE")
+    if not price_id:
         return _json_err("Falta STRIPE_PRICE_ENTERPRISE", 500)
 
     try:
-        success_url, cancel_url = _success_cancel("/settings/billing")
+        success_url, cancel_url = _success_cancel_pricing(g.org_id)
 
-        customer = _get_or_create_customer(
-            email=g.email,
-            metadata={"clerk_user_id": g.user_id, "org_id": g.org_id},
+        # 🔐 Customer exclusivo de la org
+        cust = stripe_svc.get_or_create_customer_for_entity(
+            entity_type="org",
+            entity_id=g.org_id,
+            email=None,
+            name=None,
+            extra_metadata={"created_from": "checkout_enterprise"},
         )
 
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            customer=customer.id,
-            line_items=[{"price": price, "quantity": seats}],
+        meta = stripe_svc.build_enterprise_meta(
+            org_id=g.org_id,
+            seats=seats,
+            price_id=price_id,
+            plan="enterprise",
+            plan_scope="org",
+            entity_email="",
+            entity_name="",
+        )
+        # compat con tu webhook actual
+        meta["scope"] = "org"
+        meta["org_id"] = g.org_id
+        meta["buyer_user_id"] = g.user_id
+        meta["seats"] = str(seats)
+
+        session = stripe_svc.create_checkout_session(
+            customer_id=cust.id,
+            price_id=price_id,
+            quantity=seats,
+            meta=meta,
             success_url=success_url,
             cancel_url=cancel_url,
-            subscription_data={
-                "metadata": {
-                    "scope": "org",
-                    "org_id": g.org_id,
-                    "buyer_user_id": g.user_id,
-                    "seats": str(seats),
-                }
-            },
-            metadata={
-                "scope": "org",
-                "org_id": g.org_id,
-                "buyer_user_id": g.user_id,
-                "seats": str(seats),
-            },
-            allow_promotion_codes=True,
         )
         return _json_ok({"url": session.url})
     except Exception as e:
+        current_app.logger.exception("[checkout_enterprise] error")
         return _json_err(str(e), 500)
 
 
 @bp.route("/portal", methods=["POST", "OPTIONS"])
 @require_auth
 def billing_portal():
-    _stripe()
+    """
+    Portal:
+      - si org: portal para customer de la org
+      - si user: portal para customer del user
+    """
     try:
-        customer = _get_or_create_customer(
-            email=g.email,
-            metadata={"clerk_user_id": g.user_id, "org_id": g.org_id or ""},
-        )
-        base = current_app.config.get("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+        base = _frontend_base()
         ret_url = f"{base}/settings/billing"
-        portal = stripe.billing_portal.Session.create(customer=customer.id, return_url=ret_url)
+
+        if g.org_id:
+            cust = stripe_svc.get_or_create_customer_for_entity(
+                entity_type="org",
+                entity_id=g.org_id,
+                email=None,
+                name=None,
+                extra_metadata={"created_from": "portal"},
+            )
+        else:
+            cust = stripe_svc.get_or_create_customer_for_entity(
+                entity_type="user",
+                entity_id=g.user_id,
+                email=g.email,
+                name=None,
+                extra_metadata={"created_from": "portal"},
+            )
+
+        portal = stripe_svc.create_billing_portal(customer_id=cust.id, return_url=ret_url)
         return _json_ok({"url": portal.url})
     except Exception as e:
+        current_app.logger.exception("[billing_portal] error")
         return _json_err(str(e), 500)
 
 
@@ -251,33 +276,21 @@ def billing_portal():
 @require_auth
 def billing_invoices():
     """
-    Lista facturas:
-      - Scope org (si hay X-Org-Id/g.org_id): busca subs por metadata.org_id y lista sus invoices.
-      - Scope user: lista por customer del usuario.
-    Query: ?limit=20 (opcional)
+    (2.3) Delegado a stripe_svc.
+    Query: ?limit=20
     """
-    _stripe()
     try:
-        limit = max(1, min(100, int(request.args.get("limit", "20"))))
-    except Exception:
-        limit = 20
+        try:
+            limit = max(1, min(100, int(request.args.get("limit", "20"))))
+        except Exception:
+            limit = 20
 
-    try:
         if g.org_id:
-            # Preferimos todas las subs (cualquier status) para mostrar histórico
-            subs = stripe.Subscription.search(query=f'metadata["org_id"]:"{g.org_id}"').data
-            if not subs:
-                return _json_ok({"scope": "org", "org_id": g.org_id, "items": []})
-            sub = subs[0]
-            invs = stripe.Invoice.list(subscription=sub.id, limit=limit).data
-            items = [_invoice_dto(i) for i in invs]
-            return _json_ok({"scope": "org", "org_id": g.org_id, "items": items})
+            data = stripe_svc.list_invoices_for_org(org_id=g.org_id, limit=limit)
+        else:
+            data = stripe_svc.list_invoices_for_user(user_id=g.user_id, email=g.email, limit=limit)
 
-        # user scope
-        cust = _get_or_create_customer(g.email, {"clerk_user_id": g.user_id})
-        invs = stripe.Invoice.list(customer=cust.id, limit=limit).data
-        items = [_invoice_dto(i) for i in invs]
-        return _json_ok({"scope": "user", "items": items})
-
+        return _json_ok(data)
     except Exception as e:
+        current_app.logger.exception("[billing_invoices] error")
         return _json_err(str(e), 500)
