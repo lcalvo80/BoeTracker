@@ -88,11 +88,14 @@ def _is_stripe_invalid_request(e: Exception) -> bool:
 @bp.route("/summary", methods=["GET", "OPTIONS"])
 @require_auth
 def billing_summary():
+    """
+    Contrato estable (v1) para que el frontend no tenga que inferir desde Stripe.
+    """
     try:
         if g.org_id:
-            data = stripe_svc.get_billing_summary_for_org(org_id=g.org_id)
+            data = stripe_svc.get_billing_summary_v1_for_org(org_id=g.org_id)
         else:
-            data = stripe_svc.get_billing_summary_for_user(user_id=g.user_id, email=g.email)
+            data = stripe_svc.get_billing_summary_v1_for_user(user_id=g.user_id, email=g.email)
         return _json_ok(data)
     except Exception as e:
         current_app.logger.exception("[billing_summary] error")
@@ -155,7 +158,6 @@ def checkout_enterprise():
     if not g.org_id:
         return _json_err("Debes indicar organización (X-Org-Id o en el token).", 400)
 
-    # ✅ HARDENING: evitar org_id arbitrario
     if not clerk_svc.is_user_member_of_org(g.org_id, g.user_id):
         return _json_err("No eres miembro de la organización indicada (X-Org-Id).", 403)
     if not _is_adminish_in_org(g.user_id, g.org_id):
