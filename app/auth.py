@@ -1,3 +1,4 @@
+# app/auth.py
 from __future__ import annotations
 
 from functools import wraps
@@ -18,12 +19,26 @@ _PLACEHOLDER_STRINGS = {
     "user.primary_email_address",
 }
 
-def _is_placeholder(v: str) -> bool:
+def _is_placeholder(v: Any) -> bool:
     if not isinstance(v, str):
         return False
     s = v.strip()
     s_low = s.lower()
     return (s_low.startswith("{{") and s_low.endswith("}}")) or (s_low in _PLACEHOLDER_STRINGS)
+
+
+def _safe_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        if _is_placeholder(s):
+            return None
+        return s
+    except Exception:
+        return None
 
 
 # ───────────────── JWT / Clerk ─────────────────
@@ -52,15 +67,13 @@ def _aud_list_from_env(v: Optional[str]) -> List[str]:
 
 def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     """
-    Verifica el JWT emitido por Clerk:
+    Verifica el JWT emitido por Clerk.
 
     - Si CLERK_JWKS_URL NO está definido:
-        * En DEBUG: acepta token sin firma (solo para desarrollo local).
-        * En no-DEBUG: lanza error de configuración.
-    - Si CLERK_AUDIENCE está configurado (uno o varios, coma-sep), se verifica 'aud'.
-      Si NO está configurado, la verificación de audience se desactiva.
-    - Si CLERK_ISSUER está configurado, se verifica 'iss'.
-    - Se usa RS256 y un pequeño 'leeway' para tolerar leves desincronizaciones de reloj.
+        * En DEBUG: acepta token sin firma (solo desarrollo local).
+        * En no-DEBUG: error de configuración.
+    - Si CLERK_AUDIENCE está configurado, verifica 'aud'.
+    - Si CLERK_ISSUER está configurado, verifica 'iss'.
     """
     jwks_url = (current_app.config.get("CLERK_JWKS_URL") or "").strip()
     issuer   = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
@@ -69,16 +82,12 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
 
     if not jwks_url:
         if current_app.config.get("DEBUG"):
-            # Modo permisivo SOLO en debug
             return jwt.decode(token, options={"verify_signature": False})
         raise RuntimeError("CLERK_JWKS_URL no configurado")
 
-    # Clave de firma (cacheada por PyJWKClient)
     signing_key = _get_jwk_client(jwks_url).get_signing_key_from_jwt(token).key
 
-    # Verificaciones
     options = {
-        # Solo verificamos 'aud' si hay uno o más audiences definidos:
         "verify_aud": bool(audiences),
     }
 
@@ -86,7 +95,6 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
         "key": signing_key,
         "algorithms": ["RS256"],
         "options": options,
-        # tolerancia leve por posibles desajustes de reloj (segundos)
         "leeway": 10,
     }
     if issuer:
@@ -94,52 +102,91 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     if audiences:
         kwargs["audience"] = audiences if len(audiences) > 1 else audiences[0]
 
-    # PyJWT valida por defecto exp/nbf/iat
     claims = jwt.decode(token, **kwargs)
     return claims
 
 
+def _extract_org_from_claims(claims: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """
+    Extrae org_id/org_role/org_slug soportando:
+    - Clerk session claims v2: claims["o"] = { id, rol, slg }
+    - Claims planos legacy: org_id, org_role, org_slug
+    - Estructuras anidadas viejas: organization.id, organization_membership.role
+    """
+    o = claims.get("o") if isinstance(claims.get("o"), dict) else {}
+
+    org_id = (
+        _safe_str(o.get("id"))
+        or _safe_str(claims.get("org_id"))
+        or _safe_str((claims.get("organization") or {}).get("id"))
+        or _safe_str(claims.get("organization_id"))
+    )
+
+    org_role = (
+        _safe_str(o.get("rol"))
+        or _safe_str(claims.get("org_role"))
+        or _safe_str((claims.get("organization_membership") or {}).get("role"))
+        or _safe_str(claims.get("organization_role"))
+    )
+
+    org_slug = (
+        _safe_str(o.get("slg"))
+        or _safe_str(claims.get("org_slug"))
+        or _safe_str((claims.get("organization") or {}).get("slug"))
+    )
+
+    # Normaliza rol a admin/member
+    raw_role = (org_role or "").strip().lower()
+    if raw_role in {"admin", "org:admin", "owner"}:
+        norm_role = "admin"
+    elif raw_role in {"basic_member", "member", "org:member"}:
+        norm_role = "member"
+    else:
+        norm_role = None
+
+    return {"org_id": org_id, "org_role": norm_role, "org_slug": org_slug}
+
+
 def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
     """
-    Rellena flask.g con info normalizada y segura a partir de los claims.
-    - Soporta plantillas de Clerk con claims planos o anidados.
-    - X-Org-Id en cabecera prevalece sobre el token.
-    - Filtra placeholders de Clerk ({{ ... }}).
+    Rellena flask.g con info normalizada y segura.
+    Regla de seguridad MVP:
+      - Si llega X-Org-Id y NO coincide con la org del token, 403 (org_mismatch).
+      - Si el token no trae org, permitimos header (para flows puntuales),
+        pero require_org se encargará de exigir org cuando aplique.
     """
     g.clerk_claims = claims or {}
 
-    g.user_id = claims.get("sub") or claims.get("user_id")
-    g.email = claims.get("email") or (claims.get("user") or {}).get("email_address")
+    g.user_id = _safe_str(claims.get("sub")) or _safe_str(claims.get("user_id"))
+    g.email = _safe_str(claims.get("email")) or _safe_str((claims.get("user") or {}).get("email_address"))
     g.name = (
-        claims.get("name")
-        or (claims.get("user") or {}).get("full_name")
+        _safe_str(claims.get("name"))
+        or _safe_str((claims.get("user") or {}).get("full_name"))
         or ""
     )
 
-    # Header tiene prioridad (útil cuando el token no incluye org)
-    org_from_hdr = request.headers.get("X-Org-Id") or request.headers.get("x-org-id")
+    extracted = _extract_org_from_claims(claims)
+    token_org_id = extracted["org_id"]
+    token_org_role = extracted["org_role"]
+    token_org_slug = extracted["org_slug"]
 
-    claim_org_id = (
-        claims.get("org_id")
-        or (claims.get("organization") or {}).get("id")
-        or claims.get("organization_id")
-    )
-    claim_org_role = (
-        claims.get("org_role")
-        or (claims.get("organization_membership") or {}).get("role")
-        or claims.get("organization_role")
-    )
+    # Header org (hint del FE)
+    org_from_hdr = _safe_str(request.headers.get("X-Org-Id") or request.headers.get("x-org-id"))
 
-    g.org_id = org_from_hdr or (None if _is_placeholder(str(claim_org_id)) else claim_org_id)
+    # Seguridad: si token trae org y header trae otra, es mismatch
+    if token_org_id and org_from_hdr and org_from_hdr != token_org_id:
+        # Guardamos para debugging interno si lo necesitas
+        g.org_id = token_org_id
+        g.org_role = token_org_role
+        g.org_slug = token_org_slug
+        g._org_mismatch = {"token_org_id": token_org_id, "header_org_id": org_from_hdr}
+        # No lanzamos aquí excepción; el decorator responderá.
+        return
 
-    raw_role = ("" if _is_placeholder(str(claim_org_role)) else str(claim_org_role)).strip().lower()
-    # equivalencias comunes de Clerk
-    if raw_role in {"admin", "org:admin", "owner"}:
-        g.org_role = "admin"
-    elif raw_role in {"basic_member", "member", "org:member"}:
-        g.org_role = "member"
-    else:
-        g.org_role = None
+    # Si no hay mismatch: org_id efectiva = token_org_id o header (si token no trae)
+    g.org_id = token_org_id or org_from_hdr
+    g.org_role = token_org_role
+    g.org_slug = token_org_slug
 
 
 # ───────────────── Fallback server-to-server con Clerk ─────────────────
@@ -188,8 +235,14 @@ def require_auth(fn: Callable) -> Callable:
             return jsonify({"ok": False, "error": "Invalid token"}), 401
 
         _normalize_g_from_claims(claims)
-        if not g.user_id:
+        if not getattr(g, "user_id", None):
             return jsonify({"ok": False, "error": "Invalid claims"}), 401
+
+        # Si hubo mismatch, bloqueamos aquí (regla MVP)
+        mismatch = getattr(g, "_org_mismatch", None)
+        if mismatch:
+            return jsonify({"ok": False, "error": "org_mismatch", **mismatch}), 403
+
         return fn(*args, **kwargs)
     return _wrap
 
@@ -197,7 +250,6 @@ def require_auth(fn: Callable) -> Callable:
 def require_org(fn: Callable) -> Callable:
     """
     Exige contexto de organización (pero no rol admin).
-    Útil para endpoints como GET /enterprise/org o /enterprise/users.
     """
     @wraps(fn)
     def _wrap(*args, **kwargs):
@@ -211,7 +263,7 @@ def require_org_admin(fn: Callable) -> Callable:
     """
     Requiere rol admin en la organización:
     - Si el token trae org_role=admin, OK.
-    - Si no, se hace fallback consultando a Clerk (server-to-server).
+    - Si no, fallback consultando a Clerk (server-to-server).
     """
     @wraps(fn)
     def _wrap(*args, **kwargs):
@@ -219,14 +271,12 @@ def require_org_admin(fn: Callable) -> Callable:
         if not org_id:
             return jsonify({"ok": False, "error": "Missing X-Org-Id or org in token"}), 400
 
-        # Si el token ya indica admin, adelante
         if getattr(g, "org_role", None) == "admin":
             return fn(*args, **kwargs)
 
-        # Fallback robusto: consulta Clerk con la clave server-to-server
         user_id = getattr(g, "user_id", None)
         if user_id and _clerk_is_org_admin(org_id, user_id):
-            g.org_role = "admin"  # cacheamos para el handler actual
+            g.org_role = "admin"
             return fn(*args, **kwargs)
 
         return jsonify({"ok": False, "error": "Admin role required"}), 403
@@ -234,7 +284,6 @@ def require_org_admin(fn: Callable) -> Callable:
 
 
 # ───────────────── Blueprint INT (solo DEBUG) ─────────────────
-# Se registra desde app/__init__.py en /api/_int si app.config["DEBUG"] es True.
 int_bp = Blueprint("int", __name__)
 
 @int_bp.before_request
@@ -246,7 +295,7 @@ def _allow_options():
 @require_auth
 def debug_claims():
     """
-    Endpoint de diagnóstico (solo DEBUG). Devuelve los claims y la vista normalizada en g.
+    Endpoint de diagnóstico (solo DEBUG).
     """
     return jsonify(
         {
@@ -258,6 +307,7 @@ def debug_claims():
                 "name": getattr(g, "name", None),
                 "org_id": getattr(g, "org_id", None),
                 "org_role": getattr(g, "org_role", None),
+                "org_slug": getattr(g, "org_slug", None),
             },
             "claims": getattr(g, "clerk_claims", {}),
         }
