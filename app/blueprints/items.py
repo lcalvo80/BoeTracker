@@ -3,9 +3,9 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request, current_app, make_response, g
 from datetime import datetime
 
-from app.auth import require_auth
+from app.auth import require_auth, require_active_subscription
 from app.services import items_svc
-from app.services import reactions_svc
+from app.services.reactions_svc import set_reaction
 
 bp = Blueprint("items", __name__)
 
@@ -79,6 +79,8 @@ ALLOWED_SORT_BY = {
     "relevancia": "relevancia",
     "relevance": "relevancia",
     "titulo": "titulo",
+    "likes": "likes",
+    "dislikes": "dislikes",
 }
 ALLOWED_SORT_DIR = {"asc", "desc"}
 
@@ -146,10 +148,11 @@ def _allow_options():
 
 @bp.get("")
 @require_auth
+@require_active_subscription
 def list_items():
     try:
         parsed = _parse_query_args(request.args)
-        result = items_svc.search_items(parsed)
+        result = items_svc.search_items(parsed, user_id=getattr(g, "user_id", None))
 
         if isinstance(result, dict):
             total = result.get("total", 0) or 0
@@ -193,58 +196,61 @@ def list_items():
 
 @bp.get("/<identificador>")
 @require_auth
+@require_active_subscription
 def get_item(identificador):
-    data = items_svc.get_item_by_id(identificador)
+    data = items_svc.get_item_by_id(identificador, user_id=getattr(g, "user_id", None))
     if not data:
         return jsonify({"detail": "Not found"}), 404
     return jsonify(data), 200
 
 @bp.get("/<identificador>/resumen")
 @require_auth
+@require_active_subscription
 def get_resumen(identificador):
     return jsonify(items_svc.get_item_resumen(identificador)), 200
 
 @bp.get("/<identificador>/impacto")
 @require_auth
+@require_active_subscription
 def get_impacto(identificador):
     return jsonify(items_svc.get_item_impacto(identificador)), 200
 
 @bp.post("/<identificador>/like")
 @require_auth
+@require_active_subscription
 def like(identificador):
+    # 1 like por usuario por item (toggle off si repite)
     user_id = getattr(g, "user_id", None)
-    res = reactions_svc.set_reaction(identificador, user_id=user_id, reaction=reactions_svc.LIKE)
-    # Opcional si tienes columnas cacheadas en items:
-    # reactions_svc.sync_items_counters_if_present(identificador)
-    return jsonify({
-        "ok": True,
-        "item_id": res.item_id,
-        "user_id": res.user_id,
-        "previous": res.previous,
-        "current": res.current,
-        "changed": res.changed,
-        "counts": res.counts,
-    }), 200
+    if not user_id:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        out = set_reaction(item_id=identificador, user_id=user_id, reaction=1)
+        return jsonify(out), 200
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        current_app.logger.exception("like failed")
+        return jsonify({"ok": False, "error": "like_failed"}), 500
 
 @bp.post("/<identificador>/dislike")
 @require_auth
+@require_active_subscription
 def dislike(identificador):
     user_id = getattr(g, "user_id", None)
-    res = reactions_svc.set_reaction(identificador, user_id=user_id, reaction=reactions_svc.DISLIKE)
-    # Opcional si tienes columnas cacheadas en items:
-    # reactions_svc.sync_items_counters_if_present(identificador)
-    return jsonify({
-        "ok": True,
-        "item_id": res.item_id,
-        "user_id": res.user_id,
-        "previous": res.previous,
-        "current": res.current,
-        "changed": res.changed,
-        "counts": res.counts,
-    }), 200
+    if not user_id:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    try:
+        out = set_reaction(item_id=identificador, user_id=user_id, reaction=-1)
+        return jsonify(out), 200
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception:
+        current_app.logger.exception("dislike failed")
+        return jsonify({"ok": False, "error": "dislike_failed"}), 500
 
 @bp.get("/departamentos")
 @require_auth
+@require_active_subscription
 def departamentos():
     try:
         data = items_svc.list_departamentos()
@@ -255,6 +261,7 @@ def departamentos():
 
 @bp.get("/secciones")
 @require_auth
+@require_active_subscription
 def secciones():
     try:
         data = items_svc.list_secciones()
@@ -265,6 +272,7 @@ def secciones():
 
 @bp.get("/epigrafes")
 @require_auth
+@require_active_subscription
 def epigrafes():
     try:
         data = items_svc.list_epigrafes()
@@ -275,6 +283,7 @@ def epigrafes():
 
 @bp.get("/_debug/echo")
 @require_auth
+@require_active_subscription
 def echo():
     if not current_app.config.get("DEBUG_FILTERS_ENABLED", False):
         return jsonify({"detail": "Debug endpoint disabled"}), 404

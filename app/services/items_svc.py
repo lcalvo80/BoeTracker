@@ -128,9 +128,41 @@ def _parse_json_maybe(text: Optional[str]) -> Any:
             return text
     return text
 
+# ---- Reactions helpers (1 tabla por item y user) -------------------------
+
+def _reactions_table_exists(conn) -> bool:
+    return _table_exists(conn, "item_reactions")
+
+def _reactions_agg_join_sql() -> sql.SQL:
+    # Agregamos por item_id
+    return sql.SQL(
+        """
+        LEFT JOIN (
+          SELECT
+            item_id,
+            COALESCE(SUM(CASE WHEN reaction = 1 THEN 1 ELSE 0 END), 0)::int  AS likes_calc,
+            COALESCE(SUM(CASE WHEN reaction = -1 THEN 1 ELSE 0 END), 0)::int AS dislikes_calc
+          FROM item_reactions
+          GROUP BY item_id
+        ) r ON r.item_id = i.identificador
+        """
+    )
+
+def _my_reaction_scalar_sql() -> sql.SQL:
+    # my_reaction (por usuario) en detalle
+    return sql.SQL(
+        """
+        (
+          SELECT COALESCE(MAX(reaction), 0)::int
+          FROM item_reactions
+          WHERE item_id = i.identificador AND user_id = %s
+        ) AS my_reaction
+        """
+    )
+
 # ====================== Búsqueda / listado ======================
 
-def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
+def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
     # paginación
     try:
         page = max(int(params.get("page", 1)), 1)
@@ -147,6 +179,7 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
     # ordenación
     sort_by = (params.get("sort_by", "created_at") or "").lower()
     sort_dir = (params.get("sort_dir", "desc") or "").lower()
+    # Nota: likes/dislikes ahora pueden venir de reactions; mantenemos keys para FE
     if sort_by not in {"created_at", "titulo", "id", "likes", "dislikes", "relevancia"}:
         sort_by = "created_at"
     if sort_dir not in {"asc", "desc"}:
@@ -177,11 +210,13 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         has_contenido        = _col_exists(conn, "items", "contenido")
         has_resumen          = _col_exists(conn, "items", "resumen")
         has_titulo           = _col_exists(conn, "items", "titulo")
-        has_likes            = _col_exists(conn, "items", "likes")
-        has_dislikes         = _col_exists(conn, "items", "dislikes")
+        has_likes_legacy     = _col_exists(conn, "items", "likes")
+        has_dislikes_legacy  = _col_exists(conn, "items", "dislikes")
         has_informe_imp      = _col_exists(conn, "items", "informe_impacto")
         has_impacto          = _col_exists(conn, "items", "impacto")
         has_id               = _col_exists(conn, "items", "id")
+
+        use_reactions = _reactions_table_exists(conn)
 
         # WHERE
         where_sql_parts: List[sql.SQL] = []
@@ -197,14 +232,12 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             created_expr = sql.SQL("i.created_at_date AS created_at")
             created_order_col = sql.SQL("i.created_at_date")
         elif has_fecha_public:
-            # ⬅️ Fallback seguro usado por el FE
             date_expr = sql.SQL("DATE(i.fecha_publicacion)")
             created_expr = sql.SQL("i.fecha_publicacion AS created_at")
             created_order_col = sql.SQL("i.fecha_publicacion")
         else:
             date_expr = None
             created_expr = sql.SQL("NULL AS created_at")
-            # último fallback: usar identificador si no hay id
             created_order_col = sql.SQL("i.id") if has_id else sql.SQL("i.identificador")
 
         if date_expr is not None:
@@ -219,7 +252,6 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
         def _in_clause(col_name: str, values: Sequence[str]) -> Optional[Tuple[sql.SQL, List[str]]]:
             if not values:
                 return None
-            # FIX: construir una lista de placeholders iterable
             placeholders = sql.SQL(", ").join([sql.Placeholder()] * len(values))
             return sql.SQL("{} IN ({})").format(sql.SQL(col_name), placeholders), list(values)
 
@@ -288,16 +320,14 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
             sql.SQL("i.departamento_codigo"),
             sql.SQL("i.seccion_codigo"),
             sql.SQL("i.epigrafe"),
-            # ⬇️ exponemos fecha_publicacion si existe para el FE
             (sql.SQL("i.fecha_publicacion") if has_fecha_public else sql.SQL("NULL AS fecha_publicacion")),
             created_expr,
-            sql.SQL("i.likes") if has_likes else sql.SQL("NULL AS likes"),
-            sql.SQL("i.dislikes") if has_dislikes else sql.SQL("NULL AS dislikes"),
             sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
         ]
 
         joins: List[sql.SQL] = []
 
+        # Lookups nombres
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
             if _table_exists(conn, t):
@@ -309,31 +339,45 @@ def search_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
         if dep_table:
             select_cols.append(sql.SQL("d.nombre AS departamento_nombre"))
-            joins.append(sql.SQL('LEFT JOIN {} d ON d.codigo = i.departamento_codigo').format(sql.Identifier(dep_table)))
+            joins.append(sql.SQL("LEFT JOIN {} d ON d.codigo = i.departamento_codigo").format(sql.Identifier(dep_table)))
         else:
             select_cols.append(sql.SQL("NULL AS departamento_nombre"))
 
         if sec_table:
             select_cols.append(sql.SQL("s.nombre AS seccion_nombre"))
-            joins.append(sql.SQL('LEFT JOIN {} s ON s.codigo = i.seccion_codigo').format(sql.Identifier(sec_table)))
+            joins.append(sql.SQL("LEFT JOIN {} s ON s.codigo = i.seccion_codigo").format(sql.Identifier(sec_table)))
         else:
             select_cols.append(sql.SQL("NULL AS seccion_nombre"))
 
+        # Reactions (preferente) vs legacy columns
+        if use_reactions:
+            joins.append(_reactions_agg_join_sql())
+            select_cols.append(sql.SQL("COALESCE(r.likes_calc, 0) AS likes"))
+            select_cols.append(sql.SQL("COALESCE(r.dislikes_calc, 0) AS dislikes"))
+        else:
+            select_cols.append(sql.SQL("COALESCE(i.likes, 0) AS likes") if has_likes_legacy else sql.SQL("0 AS likes"))
+            select_cols.append(sql.SQL("COALESCE(i.dislikes, 0) AS dislikes") if has_dislikes_legacy else sql.SQL("0 AS dislikes"))
+
         # ORDER BY
+        order_params: List[Any] = []
         if sort_by == "relevancia" and _use_fts_rank:
             order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s)) ")
-            order_params: List[Any] = [_ts_lang(conn), q_adv]
+            order_params = [_ts_lang(conn), q_adv]
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
             order_clause = order_by_sql + sort_dir_sql
         else:
             if sort_by == "created_at":
                 sort_by_sql = created_order_col
+            elif sort_by == "likes":
+                sort_by_sql = sql.SQL("likes")  # alias en SELECT
+            elif sort_by == "dislikes":
+                sort_by_sql = sql.SQL("dislikes")  # alias en SELECT
             else:
-                # solo ordenamos por columnas existentes; si no, caemos al fallback seguro
                 cand = sql.SQL(f"i.{sort_by}")
-                if (sort_by == "id" and not has_id) or (sort_by == "titulo" and not has_titulo) or (sort_by == "likes" and not has_likes) or (sort_by == "dislikes" and not has_dislikes):
+                if (sort_by == "id" and not has_id) or (sort_by == "titulo" and not has_titulo):
                     cand = created_order_col
                 sort_by_sql = cand
+
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
             order_clause = sort_by_sql + sql.SQL(" ") + sort_dir_sql
             order_params = []
@@ -376,7 +420,11 @@ def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
 
 # ====================== Detalle & derivados ======================
 
-def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
+def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    identificador = (identificador or "").strip()
+    if not identificador:
+        return None
+
     with get_db() as conn, conn.cursor() as cur:
         base_cols = [
             "identificador",
@@ -405,12 +453,17 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
 
         fecha_pub_expr = "i.fecha_publicacion AS fecha_publicacion" if _col_exists_inner("fecha_publicacion") else "NULL AS fecha_publicacion"
 
+        use_reactions = _reactions_table_exists(conn)
+        has_likes_legacy = _col_exists_inner("likes")
+        has_dislikes_legacy = _col_exists_inner("dislikes")
+
         sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
         sel_parts.append(fecha_pub_expr)
         if impacto_expr:    sel_parts.append(impacto_expr)
         if url_pdf_expr:    sel_parts.append(url_pdf_expr)
         if source_url_expr: sel_parts.append(source_url_expr)
 
+        # Nombres lookups
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
             if _table_exists(conn, t):
@@ -421,18 +474,53 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
                 sec_table = t; break
 
         if dep_table: sel_parts.append("d.nombre AS departamento_nombre")
+        else:         sel_parts.append("NULL AS departamento_nombre")
         if sec_table: sel_parts.append("s.nombre AS seccion_nombre")
+        else:         sel_parts.append("NULL AS seccion_nombre")
+
+        # Likes/dislikes + my_reaction (si reactions existe)
+        params: List[Any] = [identificador]
+        joins_sql: List[str] = []
+
+        if dep_table:
+            joins_sql.append(f'LEFT JOIN {dep_table} d ON d.codigo = i.departamento_codigo')
+        if sec_table:
+            joins_sql.append(f'LEFT JOIN {sec_table} s ON s.codigo = i.seccion_codigo')
+
+        if use_reactions:
+            joins_sql.append(
+                """
+                LEFT JOIN (
+                  SELECT
+                    item_id,
+                    COALESCE(SUM(CASE WHEN reaction = 1 THEN 1 ELSE 0 END), 0)::int  AS likes_calc,
+                    COALESCE(SUM(CASE WHEN reaction = -1 THEN 1 ELSE 0 END), 0)::int AS dislikes_calc
+                  FROM item_reactions
+                  GROUP BY item_id
+                ) r ON r.item_id = i.identificador
+                """
+            )
+            sel_parts.append("COALESCE(r.likes_calc, 0) AS likes")
+            sel_parts.append("COALESCE(r.dislikes_calc, 0) AS dislikes")
+            if user_id:
+                sel_parts.append(
+                    "(SELECT COALESCE(MAX(reaction),0)::int FROM item_reactions WHERE item_id=i.identificador AND user_id=%s) AS my_reaction"
+                )
+                params.append(user_id)
+            else:
+                sel_parts.append("0 AS my_reaction")
+        else:
+            sel_parts.append("COALESCE(i.likes,0) AS likes" if has_likes_legacy else "0 AS likes")
+            sel_parts.append("COALESCE(i.dislikes,0) AS dislikes" if has_dislikes_legacy else "0 AS dislikes")
+            sel_parts.append("0 AS my_reaction")
 
         sel = ", ".join(sel_parts) or "i.identificador"
+        joins = " ".join(joins_sql)
 
-        join_sql: List[str] = []
-        if dep_table:
-            join_sql.append(f'LEFT JOIN {dep_table} d ON d.codigo = i.departamento_codigo')
-        if sec_table:
-            join_sql.append(f'LEFT JOIN {sec_table} s ON s.codigo = i.seccion_codigo')
-        joins = " ".join(join_sql)
-
-        cur.execute(f"SELECT {sel} FROM items i {joins} WHERE i.identificador = %s LIMIT 1", (identificador,))
+        cur.execute(
+            f"SELECT {sel} FROM items i {joins} WHERE i.identificador = %s LIMIT 1",
+            tuple(params),
+        )
         row = cur.fetchone()
         if not row:
             return None
@@ -440,10 +528,13 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         data = dict(zip(names, row))
 
     # Inflados / normalizaciones
-    for k in ("titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
-              "contenido", "resumen", "impacto", "likes", "dislikes", "control",
-              "departamento_codigo", "seccion_codigo", "epigrafe",
-              "fecha_publicacion", "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"):
+    for k in (
+        "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
+        "contenido", "resumen", "impacto",
+        "likes", "dislikes", "my_reaction",
+        "control", "departamento_codigo", "seccion_codigo", "epigrafe",
+        "fecha_publicacion", "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"
+    ):
         data.setdefault(k, None)
 
     if data.get("resumen") is not None:
@@ -454,6 +545,12 @@ def get_item_by_id(identificador: str) -> Optional[Dict[str, Any]]:
         imp_text = _inflate_b64_gzip_maybe(data["impacto"])
         parsed = _parse_json_maybe(imp_text)
         data["impacto"] = parsed
+
+    # Normaliza my_reaction a int seguro
+    try:
+        data["my_reaction"] = int(data.get("my_reaction") or 0)
+    except Exception:
+        data["my_reaction"] = 0
 
     return data
 
@@ -488,27 +585,13 @@ def get_item_impacto(identificador: str) -> Dict[str, Any]:
         parsed = None
     return {"identificador": identificador, "impacto": parsed}
 
+# Importante: like_item/dislike_item legacy quedan como compatibilidad,
+# pero a partir de ahora el blueprint debe usar reactions_svc.set_reaction
 def like_item(identificador: str) -> Dict[str, Any]:
-    with get_db() as conn, conn.cursor() as cur:
-        if not _col_exists(conn, "items", "likes"):
-            return {"identificador": identificador, "likes": None}
-        cur.execute(
-            "UPDATE items SET likes = COALESCE(likes,0) + 1 WHERE identificador = %s RETURNING likes",
-            (identificador,))
-        row = cur.fetchone()
-        conn.commit()
-    return {"identificador": identificador, "likes": row[0] if row else 0}
+    return {"identificador": identificador, "detail": "Use reactions_svc via blueprint", "ok": False}
 
 def dislike_item(identificador: str) -> Dict[str, Any]:
-    with get_db() as conn, conn.cursor() as cur:
-        if not _col_exists(conn, "items", "dislikes"):
-            return {"identificador": identificador, "dislikes": None}
-        cur.execute(
-            "UPDATE items SET dislikes = COALESCE(dislikes,0) + 1 WHERE identificador = %s RETURNING dislikes",
-            (identificador,))
-        row = cur.fetchone()
-        conn.commit()
-    return {"identificador": identificador, "dislikes": row[0] if row else 0}
+    return {"identificador": identificador, "detail": "Use reactions_svc via blueprint", "ok": False}
 
 # ====================== Catálogos ======================
 

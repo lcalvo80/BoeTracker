@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 from flask import Blueprint, jsonify, request, current_app
 
+from app.auth import require_auth, require_active_subscription
 from app.services import comments_svc
 
 bp = Blueprint("comments", __name__)
@@ -38,6 +39,8 @@ def _allow_options():
 
 # GET /api/items/:ident/comments
 @bp.get("/<ident>/comments")
+@require_auth
+@require_active_subscription
 def list_comments(ident: str):
     ident = (ident or "").strip()
     if not ident:
@@ -52,6 +55,8 @@ def list_comments(ident: str):
 
 # POST /api/items/:ident/comments
 @bp.post("/<ident>/comments")
+@require_auth
+@require_active_subscription
 def add_comment(ident: str):
     ident = (ident or "").strip()
     if not ident:
