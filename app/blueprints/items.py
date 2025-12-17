@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from flask import Blueprint, jsonify, request, current_app, make_response
+from flask import Blueprint, jsonify, request, current_app, make_response, g
 
 from app.auth import require_auth, require_active_subscription
 from app.services import items_svc
@@ -14,10 +14,8 @@ bp = Blueprint("items", __name__)
 def _safe_int(v, d, mi=1, ma=100):
     try:
         n = int(v)
-        if n < mi:
-            n = mi
-        if n > ma:
-            n = ma
+        if n < mi: n = mi
+        if n > ma: n = ma
         return n
     except Exception:
         return d
@@ -28,10 +26,8 @@ def _safe_bool(v, default=None):
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
-        return False
+    if s in {"1", "true", "t", "yes", "y", "on"}:  return True
+    if s in {"0", "false", "f", "no", "n", "off"}: return False
     return default
 
 def _safe_date(v, default=None):
@@ -123,22 +119,18 @@ def _parse_query_args(args):
         data["fecha_hasta"] = fecha_exacta
         data.pop("fecha", None)
     else:
-        if fecha_desde:
-            data["fecha_desde"] = fecha_desde
-        else:
-            data.pop("fecha_desde", None)
-        if fecha_hasta:
-            data["fecha_hasta"] = fecha_hasta
-        else:
-            data.pop("fecha_hasta", None)
+        if fecha_desde: data["fecha_desde"] = fecha_desde
+        else:           data.pop("fecha_desde", None)
+        if fecha_hasta: data["fecha_hasta"] = fecha_hasta
+        else:           data.pop("fecha_hasta", None)
         data.pop("fecha", None)
 
-    data["page"] = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
+    data["page"]  = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
     data["limit"] = _safe_int(data.get("limit", 12), 12, 1, 100)
 
-    raw_sort_by = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
+    raw_sort_by  = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
     raw_sort_dir = str(data.get("sort_dir", "desc") or "desc").strip().lower()
-    data["sort_by"] = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
+    data["sort_by"]  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
     data["sort_dir"] = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
     return data
 
@@ -186,11 +178,11 @@ def list_items():
 
     except Exception:
         current_app.logger.exception("items list failed")
-        page = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
+        page  = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
         limit = _safe_int(request.args.get("limit", 12), 12, 1, 100)
-        raw_sort_by = (request.args.get("sort_by") or "created_at").strip().lower()
+        raw_sort_by  = (request.args.get("sort_by") or "created_at").strip().lower()
         raw_sort_dir = (request.args.get("sort_dir") or "desc").strip().lower()
-        sort_by = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
+        sort_by  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
         sort_dir = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
 
         return jsonify({
@@ -228,8 +220,7 @@ def get_impacto(identificador):
 @require_auth
 @require_active_subscription
 def like(identificador):
-    user_id = getattr(current_app, "_dummy", None)  # placeholder para linters
-    user_id = getattr(__import__("flask").g, "user_id", None)
+    user_id = getattr(g, "user_id", None)
     if not user_id:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     try:
@@ -245,7 +236,7 @@ def like(identificador):
 @require_auth
 @require_active_subscription
 def dislike(identificador):
-    user_id = getattr(__import__("flask").g, "user_id", None)
+    user_id = getattr(g, "user_id", None)
     if not user_id:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
     try:
