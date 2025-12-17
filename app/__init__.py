@@ -123,7 +123,6 @@ def create_app() -> Flask:
 
     # ───────────────── Salud y errores ─────────────────
     @app.route("/health")
-    @app.route("/healthz")
     def health():
         return {"ok": True, "status": "healthy"}
 

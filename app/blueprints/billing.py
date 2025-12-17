@@ -70,6 +70,31 @@ def _is_adminish_in_org(user_id: str, org_id: str) -> bool:
     return role in ("admin", "org:admin", "owner")
 
 
+def _require_org_member() -> Optional[tuple[dict, int]]:
+    """
+    Si hay g.org_id, exige que el usuario pertenezca a la org.
+    """
+    if not g.org_id:
+        return None
+    if not clerk_svc.is_user_member_of_org(g.org_id, g.user_id):
+        return _json_err("No eres miembro de la organización indicada (X-Org-Id).", 403)
+    return None
+
+
+def _require_org_admin() -> Optional[tuple[dict, int]]:
+    """
+    Si hay g.org_id, exige admin. Para MVP: la facturación de org es admin-only.
+    """
+    if not g.org_id:
+        return None
+    member_check = _require_org_member()
+    if member_check:
+        return member_check
+    if not _is_adminish_in_org(g.user_id, g.org_id):
+        return _json_err("Admin role required", 403)
+    return None
+
+
 def _stripe_invalid_request_to_message(e: Exception) -> str:
     user_msg = getattr(e, "user_message", None)
     if user_msg:
@@ -90,9 +115,16 @@ def _is_stripe_invalid_request(e: Exception) -> bool:
 def billing_summary():
     """
     Contrato estable (v1) para que el frontend no tenga que inferir desde Stripe.
+
+    Regla MVP:
+    - Si hay org_id → SOLO admins pueden ver facturación de org.
+    - Si no hay org_id → facturación del usuario (Pro).
     """
     try:
         if g.org_id:
+            guard = _require_org_admin()
+            if guard:
+                return guard
             data = stripe_svc.get_billing_summary_v1_for_org(org_id=g.org_id)
         else:
             data = stripe_svc.get_billing_summary_v1_for_user(user_id=g.user_id, email=g.email)
@@ -158,8 +190,10 @@ def checkout_enterprise():
     if not g.org_id:
         return _json_err("Debes indicar organización (X-Org-Id o en el token).", 400)
 
-    if not clerk_svc.is_user_member_of_org(g.org_id, g.user_id):
-        return _json_err("No eres miembro de la organización indicada (X-Org-Id).", 403)
+    # Member + Admin required
+    member_check = _require_org_member()
+    if member_check:
+        return member_check
     if not _is_adminish_in_org(g.user_id, g.org_id):
         return _json_err(
             "No tienes permisos suficientes: debes ser admin de la organización para contratar Enterprise.",
@@ -225,11 +259,18 @@ def checkout_enterprise():
 @bp.route("/portal", methods=["POST", "OPTIONS"])
 @require_auth
 def billing_portal():
+    """
+    Para org: admin-only (portal de Stripe expone métodos de pago, facturas, etc.)
+    """
     try:
         base = _frontend_base()
         ret_url = f"{base}/settings/billing"
 
         if g.org_id:
+            guard = _require_org_admin()
+            if guard:
+                return guard
+
             cust = stripe_svc.get_or_create_customer_for_entity(
                 entity_type="org",
                 entity_id=g.org_id,
@@ -256,6 +297,9 @@ def billing_portal():
 @bp.route("/invoices", methods=["GET", "OPTIONS"])
 @require_auth
 def billing_invoices():
+    """
+    Para org: admin-only (facturas y detalles de pago).
+    """
     try:
         try:
             limit = max(1, min(100, int(request.args.get("limit", "20"))))
@@ -263,6 +307,9 @@ def billing_invoices():
             limit = 20
 
         if g.org_id:
+            guard = _require_org_admin()
+            if guard:
+                return guard
             data = stripe_svc.list_invoices_for_org(org_id=g.org_id, limit=limit)
         else:
             data = stripe_svc.list_invoices_for_user(user_id=g.user_id, email=g.email, limit=limit)
