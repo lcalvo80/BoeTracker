@@ -1,5 +1,4 @@
-#app\__init__.py
-
+# app/__init__.py
 from __future__ import annotations
 
 import os
@@ -20,6 +19,9 @@ def _build_cors_origins(app: Flask):
         if not o:
             continue
         v = str(o).strip()
+        # Normaliza para evitar mismatches por slash final (muy común en envs)
+        if v != "*":
+            v = v.rstrip("/")
         if v and v not in seen:
             seen.add(v)
             out.append(v)
@@ -47,6 +49,18 @@ def create_app() -> Flask:
 
         # Feature flags (dev)
         DEBUG_FILTERS_ENABLED=os.getenv("DEBUG_FILTERS_ENABLED", "0") == "1",
+
+        # ✅ Subscriptions cache (Stripe live)
+        # Recomendación: DEV 10–30, PROD 60–120
+        SUB_CACHE_TTL_S=int(os.getenv("SUB_CACHE_TTL_S", "60")),
+
+        # ✅ Feature flag: enforcement de suscripción
+        # MVP (sin paywall): 0 (default)
+        # Para reactivar el gating por suscripción en el futuro: 1
+        REQUIRE_ACTIVE_SUBSCRIPTION=os.getenv("REQUIRE_ACTIVE_SUBSCRIPTION", "0") == "1",
+
+        # (Opcional) exponer motivos de denegación en 403 cuando DEBUG=1
+        DEBUG_SUBSCRIPTION=os.getenv("DEBUG_SUBSCRIPTION", "0") == "1",
 
         # Stripe
         STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),

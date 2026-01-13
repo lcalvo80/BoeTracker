@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import wraps
 from typing import Callable, Dict, Any, Optional, List, Tuple
 import time
+import threading
 
 import requests
 import jwt
@@ -75,10 +76,7 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
 
     signing_key = _get_jwk_client(jwks_url).get_signing_key_from_jwt(token).key
 
-    options = {
-        "verify_aud": bool(audiences),
-    }
-
+    options = {"verify_aud": bool(audiences)}
     kwargs: Dict[str, Any] = {
         "key": signing_key,
         "algorithms": ["RS256"],
@@ -90,8 +88,7 @@ def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
     if audiences:
         kwargs["audience"] = audiences if len(audiences) > 1 else audiences[0]
 
-    claims = jwt.decode(token, **kwargs)
-    return claims
+    return jwt.decode(token, **kwargs)
 
 
 def _extract_org_from_claims(claims: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -133,11 +130,7 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
 
     g.user_id = _safe_str(claims.get("sub")) or _safe_str(claims.get("user_id"))
     g.email = _safe_str(claims.get("email")) or _safe_str((claims.get("user") or {}).get("email_address"))
-    g.name = (
-        _safe_str(claims.get("name"))
-        or _safe_str((claims.get("user") or {}).get("full_name"))
-        or ""
-    )
+    g.name = _safe_str(claims.get("name")) or _safe_str((claims.get("user") or {}).get("full_name")) or ""
 
     extracted = _extract_org_from_claims(claims)
     token_org_id = extracted["org_id"]
@@ -146,6 +139,7 @@ def _normalize_g_from_claims(claims: Dict[str, Any]) -> None:
 
     org_from_hdr = _safe_str(request.headers.get("X-Org-Id") or request.headers.get("x-org-id"))
 
+    # Seguridad MVP: si token trae org y el header trae otra -> mismatch
     if token_org_id and org_from_hdr and org_from_hdr != token_org_id:
         g.org_id = token_org_id
         g.org_role = token_org_role
@@ -186,15 +180,21 @@ def _clerk_is_org_admin(org_id: str, user_id: str) -> bool:
 
 
 # ───────────────── Suscripción activa (Stripe live) ─────────────────
-_SUB_CACHE_TTL_S = 60
+def _sub_cache_ttl_s() -> int:
+    try:
+        return max(5, int(current_app.config.get("SUB_CACHE_TTL_S", 60)))
+    except Exception:
+        return 60
+
 _sub_cache: Dict[str, Tuple[float, bool, Dict[str, Any]]] = {}
+_sub_locks: Dict[str, threading.Lock] = {}
 
 def _sub_cache_get(key: str) -> Optional[Tuple[bool, Dict[str, Any]]]:
     hit = _sub_cache.get(key)
     if not hit:
         return None
     ts, ok, meta = hit
-    if (time.time() - ts) > _SUB_CACHE_TTL_S:
+    if (time.time() - ts) > _sub_cache_ttl_s():
         _sub_cache.pop(key, None)
         return None
     return ok, meta
@@ -202,45 +202,41 @@ def _sub_cache_get(key: str) -> Optional[Tuple[bool, Dict[str, Any]]]:
 def _sub_cache_set(key: str, ok: bool, meta: Dict[str, Any]) -> None:
     _sub_cache[key] = (time.time(), bool(ok), meta or {})
 
+def _lock_for(key: str) -> threading.Lock:
+    lk = _sub_locks.get(key)
+    if lk is None:
+        lk = threading.Lock()
+        _sub_locks[key] = lk
+    return lk
+
 def _is_active_from_summary(summary: Any) -> Tuple[bool, Dict[str, Any]]:
     """
-    Interpreta de forma defensiva el payload de stripe_svc.get_billing_summary_v1_*().
-    Considera activo si:
-      - status in {active, trialing}
-      - y plan no es free/none
-    También soporta flags tipo is_active/active.
+    Interpreta defensivamente el payload de stripe_svc.get_billing_summary_v1_*().
+
+    Acepta activo si:
+      - is_active==True OR active==True
+      - o status in {active, trialing} y plan/tier != free/none/basic/""
+    Nunca aceptamos "plan_only" sin status/flag.
     """
-    meta: Dict[str, Any] = {}
     if summary is None:
         return False, {"reason": "no_summary"}
 
-    if isinstance(summary, dict):
-        meta = {"raw_keys": sorted(summary.keys())}
+    if not isinstance(summary, dict):
+        return False, {"reason": "unknown_format", "type": str(type(summary))}
 
-        status = (summary.get("status") or summary.get("subscription_status") or "").strip().lower()
-        plan = (summary.get("plan") or summary.get("tier") or summary.get("entitlement") or "").strip().lower()
+    status = (summary.get("status") or summary.get("subscription_status") or "").strip().lower()
+    plan = (summary.get("plan") or summary.get("tier") or summary.get("entitlement") or "").strip().lower()
 
-        if isinstance(summary.get("is_active"), bool):
-            if summary.get("is_active") is True:
-                return True, {"reason": "is_active_true", "status": status, "plan": plan}
-            return False, {"reason": "is_active_false", "status": status, "plan": plan}
+    if isinstance(summary.get("is_active"), bool):
+        return (summary["is_active"] is True), {"reason": "is_active_flag", "status": status, "plan": plan}
 
-        if isinstance(summary.get("active"), bool):
-            if summary.get("active") is True:
-                return True, {"reason": "active_true", "status": status, "plan": plan}
-            return False, {"reason": "active_false", "status": status, "plan": plan}
+    if isinstance(summary.get("active"), bool):
+        return (summary["active"] is True), {"reason": "active_flag", "status": status, "plan": plan}
 
-        if status in {"active", "trialing"} and plan not in {"", "free", "none", "basic"}:
-            return True, {"reason": "status_plan", "status": status, "plan": plan}
+    if status in {"active", "trialing"} and plan not in {"", "free", "none", "basic"}:
+        return True, {"reason": "status_plan", "status": status, "plan": plan}
 
-        # Heurística: si plan explícito “pro/enterprise” aunque status no venga
-        if plan in {"pro", "enterprise"}:
-            return True, {"reason": "plan_only", "status": status, "plan": plan}
-
-        return False, {"reason": "not_active", "status": status, "plan": plan}
-
-    # Si viene otro formato
-    return False, {"reason": "unknown_format", "type": str(type(summary))}
+    return False, {"reason": "not_active", "status": status, "plan": plan}
 
 def _check_user_subscription_live(user_id: str, email: Optional[str]) -> Tuple[bool, Dict[str, Any]]:
     cache_key = f"user:{user_id}"
@@ -249,16 +245,23 @@ def _check_user_subscription_live(user_id: str, email: Optional[str]) -> Tuple[b
         ok, meta = cached
         return ok, {**meta, "cached": True}
 
-    try:
-        from app.services import stripe_svc  # import local para evitar ciclos
-        summary = stripe_svc.get_billing_summary_v1_for_user(user_id=user_id, email=email)
-        ok, meta = _is_active_from_summary(summary)
-        _sub_cache_set(cache_key, ok, meta)
-        return ok, meta
-    except Exception as e:
-        current_app.logger.warning("[auth] user subscription check failed: %s", e)
-        _sub_cache_set(cache_key, False, {"reason": "exception"})
-        return False, {"reason": "exception"}
+    lk = _lock_for(cache_key)
+    with lk:
+        cached2 = _sub_cache_get(cache_key)
+        if cached2:
+            ok, meta = cached2
+            return ok, {**meta, "cached": True}
+
+        try:
+            from app.services import stripe_svc
+            summary = stripe_svc.get_billing_summary_v1_for_user(user_id=user_id, email=email)
+            ok, meta = _is_active_from_summary(summary)
+            _sub_cache_set(cache_key, ok, meta)
+            return ok, meta
+        except Exception as e:
+            current_app.logger.warning("[auth] user subscription check failed: %s", e)
+            _sub_cache_set(cache_key, False, {"reason": "exception"})
+            return False, {"reason": "exception"}
 
 def _check_org_subscription_live(org_id: str) -> Tuple[bool, Dict[str, Any]]:
     cache_key = f"org:{org_id}"
@@ -267,16 +270,23 @@ def _check_org_subscription_live(org_id: str) -> Tuple[bool, Dict[str, Any]]:
         ok, meta = cached
         return ok, {**meta, "cached": True}
 
-    try:
-        from app.services import stripe_svc  # import local para evitar ciclos
-        summary = stripe_svc.get_billing_summary_v1_for_org(org_id=org_id)
-        ok, meta = _is_active_from_summary(summary)
-        _sub_cache_set(cache_key, ok, meta)
-        return ok, meta
-    except Exception as e:
-        current_app.logger.warning("[auth] org subscription check failed: %s", e)
-        _sub_cache_set(cache_key, False, {"reason": "exception"})
-        return False, {"reason": "exception"}
+    lk = _lock_for(cache_key)
+    with lk:
+        cached2 = _sub_cache_get(cache_key)
+        if cached2:
+            ok, meta = cached2
+            return ok, {**meta, "cached": True}
+
+        try:
+            from app.services import stripe_svc
+            summary = stripe_svc.get_billing_summary_v1_for_org(org_id=org_id)
+            ok, meta = _is_active_from_summary(summary)
+            _sub_cache_set(cache_key, ok, meta)
+            return ok, meta
+        except Exception as e:
+            current_app.logger.warning("[auth] org subscription check failed: %s", e)
+            _sub_cache_set(cache_key, False, {"reason": "exception"})
+            return False, {"reason": "exception"}
 
 
 # ───────────────── Decoradores ─────────────────
@@ -335,36 +345,61 @@ def require_active_subscription(fn: Callable) -> Callable:
     Exige suscripción activa (Stripe live).
 
     Regla:
-      - Si hay g.org_id: acepta acceso si la org tiene Enterprise activo.
-      - Si no hay g.org_id: exige Pro activo para el usuario.
+      - Si hay g.org_id: acceso si org tiene Enterprise activo.
+      - Si no hay g.org_id: acceso si user tiene Pro activo.
 
-    Nota:
-      - Esto es seguridad backend real para contenido (items/publicaciones).
-      - Cache TTL corto para evitar llamar a Stripe en cada request.
+    Cache:
+      - TTL configurable via SUB_CACHE_TTL_S (default 60s)
+      - Lock por key para evitar thundering herd
     """
     @wraps(fn)
     def _wrap(*args, **kwargs):
+        # ──────────────────────────────────────────────────────────────
+        # MVP sin paywall:
+        # Por decisión de producto, el acceso a "Publicaciones" y lectura
+        # de contenido NO debe depender de una suscripción activa.
+        #
+        # Este decorator se mantiene para no romper imports/rutas y para
+        # poder reactivar el gating en el futuro con una simple flag:
+        #   REQUIRE_ACTIVE_SUBSCRIPTION=1
+        #
+        # Default (si no se define): NO se exige suscripción.
+        # ──────────────────────────────────────────────────────────────
+        if not bool(current_app.config.get("REQUIRE_ACTIVE_SUBSCRIPTION", False)):
+            # Dejamos una marca útil para diagnóstico (no afecta funcionalidad)
+            g.subscription = {
+                "scope": "none",
+                "bypass": True,
+                "reason": "subscriptions_disabled",
+            }
+            return fn(*args, **kwargs)
+
         user_id = getattr(g, "user_id", None)
         if not user_id:
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
         org_id = getattr(g, "org_id", None)
 
-        # Si hay org, validamos Enterprise por org (típico en planes por asientos)
         if org_id:
             ok, meta = _check_org_subscription_live(org_id)
             if ok:
                 g.subscription = {"scope": "org", "org_id": org_id, **meta}
                 return fn(*args, **kwargs)
-            return jsonify({"ok": False, "error": "subscription_required", "scope": "org", "org_id": org_id}), 403
 
-        # Si no hay org, validamos Pro por usuario
+            payload = {"ok": False, "error": "subscription_required", "scope": "org", "org_id": org_id}
+            if current_app.config.get("DEBUG") or current_app.config.get("DEBUG_SUBSCRIPTION"):
+                payload["debug"] = meta
+            return jsonify(payload), 403
+
         ok, meta = _check_user_subscription_live(user_id, getattr(g, "email", None))
         if ok:
             g.subscription = {"scope": "user", "user_id": user_id, **meta}
             return fn(*args, **kwargs)
 
-        return jsonify({"ok": False, "error": "subscription_required", "scope": "user"}), 403
+        payload = {"ok": False, "error": "subscription_required", "scope": "user"}
+        if current_app.config.get("DEBUG") or current_app.config.get("DEBUG_SUBSCRIPTION"):
+            payload["debug"] = meta
+        return jsonify(payload), 403
     return _wrap
 
 

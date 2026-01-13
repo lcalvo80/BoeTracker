@@ -1,6 +1,9 @@
+# app/blueprints/meta.py
 from __future__ import annotations
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
+
+from app.auth import require_auth, require_active_subscription
 from app.services import items_svc
 from app.services.lookup import (
     list_secciones_lookup,
@@ -9,12 +12,16 @@ from app.services.lookup import (
 
 bp = Blueprint("meta", __name__)
 
+
 @bp.before_request
 def _allow_options():
     if request.method == "OPTIONS":
         return ("", 204)
 
+
 @bp.get("/filters")
+@require_auth
+@require_active_subscription
 def filters():
     """
     Respuesta estable:
@@ -32,9 +39,9 @@ def filters():
     }
     """
     try:
-        sections = items_svc.list_secciones()         # [{codigo, nombre}]
-        departments = items_svc.list_departamentos()  # [{codigo, nombre}]
-        epigraphs = items_svc.list_epigrafes()        # [str]
+        sections = items_svc.list_secciones()
+        departments = items_svc.list_departamentos()
+        epigraphs = items_svc.list_epigrafes()
 
         data = {
             "sections": sections,
@@ -47,13 +54,16 @@ def filters():
         }
         return jsonify({"ok": True, "data": data}), 200
     except Exception as e:
+        current_app.logger.exception("meta.filters failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @bp.get("/lookups")
+@require_auth
+@require_active_subscription
 def lookups():
     """
-    Devuelve los *diccionarios canónicos* desde tablas lookup para que el FE
-    pueda resolver códigos -> nombres con fiabilidad. Incluye arrays y mapas.
+    Devuelve diccionarios canónicos desde tablas lookup.
 
     Respuesta:
     {
@@ -67,7 +77,7 @@ def lookups():
     }
     """
     try:
-        secciones = list_secciones_lookup()       # [{codigo,nombre}]
+        secciones = list_secciones_lookup()
         departamentos = list_departamentos_lookup()
 
         secDict = {row["codigo"]: row["nombre"] for row in secciones if row.get("codigo")}
@@ -81,4 +91,5 @@ def lookups():
         }
         return jsonify({"ok": True, "data": data}), 200
     except Exception as e:
+        current_app.logger.exception("meta.lookups failed")
         return jsonify({"ok": False, "error": str(e)}), 500
