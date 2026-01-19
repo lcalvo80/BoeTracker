@@ -8,7 +8,6 @@ import threading
 
 import requests
 import jwt
-from jwt import PyJWKClient
 from flask import Blueprint, current_app, request, jsonify, g
 
 # ───────────────── Placeholders de Clerk (evitar falsos positivos) ─────────────────
@@ -42,8 +41,30 @@ def _safe_str(v: Any) -> Optional[str]:
         return None
 
 
-# ───────────────── JWT / Clerk ─────────────────
-_jwk_client_cache: Dict[str, PyJWKClient] = {}
+# ───────────────── JWT / Clerk (JWKS cache robusto) ─────────────────
+
+class _JwksCache:
+    def __init__(self) -> None:
+        self._jwks: Optional[Dict[str, Any]] = None
+        self._exp: float = 0.0
+        self._lock = threading.Lock()
+
+    def get(self) -> Optional[Dict[str, Any]]:
+        if self._jwks and time.time() < self._exp:
+            return self._jwks
+        return None
+
+    def set(self, jwks: Dict[str, Any], ttl: int) -> None:
+        self._jwks = jwks
+        self._exp = time.time() + max(5, int(ttl))
+
+    def clear(self) -> None:
+        self._jwks = None
+        self._exp = 0.0
+
+
+_jwks_cache = _JwksCache()
+
 
 def _get_bearer_token() -> Optional[str]:
     auth = request.headers.get("Authorization", "")
@@ -51,34 +72,106 @@ def _get_bearer_token() -> Optional[str]:
         return None
     return auth.split(" ", 1)[1].strip() or None
 
-def _get_jwk_client(jwks_url: str) -> PyJWKClient:
-    client = _jwk_client_cache.get(jwks_url)
-    if client is None:
-        client = PyJWKClient(jwks_url)
-        _jwk_client_cache[jwks_url] = client
-    return client
 
 def _aud_list_from_env(v: Optional[str]) -> List[str]:
     if not v:
         return []
     return [x.strip() for x in str(v).split(",") if x and x.strip()]
 
-def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
+
+def _jwks_ttl_s() -> int:
+    # TTL corto para producción durante estabilización (puedes subirlo luego)
+    try:
+        return int(current_app.config.get("CLERK_JWKS_CACHE_TTL_SECONDS", 300))
+    except Exception:
+        return 300
+
+
+def _get_issuer_and_jwks_url() -> Tuple[str, str]:
+    issuer = (current_app.config.get("CLERK_ISSUER") or "").strip().rstrip("/")
     jwks_url = (current_app.config.get("CLERK_JWKS_URL") or "").strip()
-    issuer   = (current_app.config.get("CLERK_ISSUER") or "").rstrip("/")
+
+    if not issuer and not jwks_url:
+        if current_app.config.get("DEBUG"):
+            return "", ""
+        raise RuntimeError("CLERK_ISSUER/CLERK_JWKS_URL no configurados")
+
+    if not jwks_url:
+        # Derivar JWKS del issuer
+        jwks_url = f"{issuer}/.well-known/jwks.json"
+
+    return issuer, jwks_url
+
+
+def _fetch_jwks(jwks_url: str) -> Dict[str, Any]:
+    r = requests.get(jwks_url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict) or "keys" not in data:
+        raise RuntimeError("Invalid JWKS payload")
+    return data
+
+
+def _get_jwks(*, force_refresh: bool = False) -> Dict[str, Any]:
+    with _jwks_cache._lock:
+        if force_refresh:
+            _jwks_cache.clear()
+        cached = _jwks_cache.get()
+        if cached:
+            return cached
+
+        _, jwks_url = _get_issuer_and_jwks_url()
+        jwks = _fetch_jwks(jwks_url)
+        _jwks_cache.set(jwks, _jwks_ttl_s())
+        return jwks
+
+
+def _select_jwk(jwks: Dict[str, Any], kid: str) -> Optional[Dict[str, Any]]:
+    for k in jwks.get("keys", []):
+        if k.get("kid") == kid:
+            return k
+    return None
+
+
+def decode_and_verify_clerk_jwt(token: str) -> Dict[str, Any]:
+    issuer, jwks_url = _get_issuer_and_jwks_url()
     audience_env = current_app.config.get("CLERK_AUDIENCE")
     audiences = _aud_list_from_env(audience_env)
 
-    if not jwks_url:
-        if current_app.config.get("DEBUG"):
-            return jwt.decode(token, options={"verify_signature": False})
-        raise RuntimeError("CLERK_JWKS_URL no configurado")
+    # En DEBUG permitimos inspección sin firma si NO hay jwks_url, pero en prod no.
+    if current_app.config.get("DEBUG") and not jwks_url:
+        return jwt.decode(token, options={"verify_signature": False})
 
-    signing_key = _get_jwk_client(jwks_url).get_signing_key_from_jwt(token).key
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        raise RuntimeError("malformed_header")
+
+    kid = header.get("kid")
+    if not kid:
+        raise RuntimeError("missing_kid")
+
+    # 1) Intento con cache
+    jwks = _get_jwks(force_refresh=False)
+    jwk = _select_jwk(jwks, kid)
+
+    # 2) Si no está el kid, refrescamos y reintentamos 1 vez
+    if not jwk:
+        current_app.logger.warning("[auth] kid not in cached JWKS; refreshing. kid=%s jwks_url=%s", kid, jwks_url)
+        jwks = _get_jwks(force_refresh=True)
+        jwk = _select_jwk(jwks, kid)
+
+    if not jwk:
+        raise RuntimeError(f'Unable to find a signing key that matches: "{kid}"')
+
+    try:
+        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
+    except Exception:
+        raise RuntimeError("cannot_build_public_key")
 
     options = {"verify_aud": bool(audiences)}
     kwargs: Dict[str, Any] = {
-        "key": signing_key,
+        "key": public_key,
         "algorithms": ["RS256"],
         "options": options,
         "leeway": 10,
@@ -210,17 +303,8 @@ def _lock_for(key: str) -> threading.Lock:
     return lk
 
 def _is_active_from_summary(summary: Any) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Interpreta defensivamente el payload de stripe_svc.get_billing_summary_v1_*().
-
-    Acepta activo si:
-      - is_active==True OR active==True
-      - o status in {active, trialing} y plan/tier != free/none/basic/""
-    Nunca aceptamos "plan_only" sin status/flag.
-    """
     if summary is None:
         return False, {"reason": "no_summary"}
-
     if not isinstance(summary, dict):
         return False, {"reason": "unknown_format", "type": str(type(summary))}
 
@@ -299,8 +383,11 @@ def require_auth(fn: Callable) -> Callable:
         try:
             claims = decode_and_verify_clerk_jwt(token)
         except Exception as e:
-            if current_app.config.get("DEBUG"):
-                return jsonify({"ok": False, "error": f"Invalid token: {e}"}), 401
+            # En prod, devuelve motivo acotado pero útil
+            msg = str(e)
+            current_app.logger.warning("[auth] invalid token: %s", msg)
+            if current_app.config.get("DEBUG") or current_app.config.get("AUTH_DEBUG"):
+                return jsonify({"ok": False, "error": f"Invalid token: {msg}"}), 401
             return jsonify({"ok": False, "error": "Invalid token"}), 401
 
         _normalize_g_from_claims(claims)
@@ -341,37 +428,10 @@ def require_org_admin(fn: Callable) -> Callable:
     return _wrap
 
 def require_active_subscription(fn: Callable) -> Callable:
-    """
-    Exige suscripción activa (Stripe live).
-
-    Regla:
-      - Si hay g.org_id: acceso si org tiene Enterprise activo.
-      - Si no hay g.org_id: acceso si user tiene Pro activo.
-
-    Cache:
-      - TTL configurable via SUB_CACHE_TTL_S (default 60s)
-      - Lock por key para evitar thundering herd
-    """
     @wraps(fn)
     def _wrap(*args, **kwargs):
-        # ──────────────────────────────────────────────────────────────
-        # MVP sin paywall:
-        # Por decisión de producto, el acceso a "Publicaciones" y lectura
-        # de contenido NO debe depender de una suscripción activa.
-        #
-        # Este decorator se mantiene para no romper imports/rutas y para
-        # poder reactivar el gating en el futuro con una simple flag:
-        #   REQUIRE_ACTIVE_SUBSCRIPTION=1
-        #
-        # Default (si no se define): NO se exige suscripción.
-        # ──────────────────────────────────────────────────────────────
         if not bool(current_app.config.get("REQUIRE_ACTIVE_SUBSCRIPTION", False)):
-            # Dejamos una marca útil para diagnóstico (no afecta funcionalidad)
-            g.subscription = {
-                "scope": "none",
-                "bypass": True,
-                "reason": "subscriptions_disabled",
-            }
+            g.subscription = {"scope": "none", "bypass": True, "reason": "subscriptions_disabled"}
             return fn(*args, **kwargs)
 
         user_id = getattr(g, "user_id", None)
