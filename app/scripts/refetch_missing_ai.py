@@ -10,13 +10,11 @@ from typing import Tuple
 from app.services.postgres import get_db
 from app.services.openai_service import get_openai_responses_from_pdf
 
-# ─────────────────────────────────────────────────────────────
-# Logging (Actions-friendly)
-# ─────────────────────────────────────────────────────────────
+
 def _configure_logging() -> None:
     """
-    En GitHub Actions el nivel por defecto puede ocultar INFO.
-    Aquí forzamos un formato y nivel controlable por env LOG_LEVEL.
+    GitHub Actions a menudo no muestra INFO si no configuras logging explícitamente.
+    Además, PYTHONUNBUFFERED=1 ayuda a que no haya buffering en CI.
     """
     level_name = (os.getenv("LOG_LEVEL") or "INFO").upper().strip()
     level = getattr(logging, level_name, logging.INFO)
@@ -42,7 +40,9 @@ def run() -> int:
     _configure_logging()
 
     today, yesterday = _today_yesterday()
-    logger.info("Arrancando refetch_missing_ai. Ventana principal=%s,%s", today, yesterday)
+
+    logger.info("Arrancando refetch_missing_ai")
+    logger.info("Ventana principal: %s y %s", today, yesterday)
     logger.info("MAX_ATTEMPTS=%s RECOVERY_LIMIT=%s", MAX_ATTEMPTS, RECOVERY_LIMIT)
 
     processed = 0
@@ -52,7 +52,7 @@ def run() -> int:
     with get_db() as conn:
         with conn.cursor() as cur:
             # ─────────────────────────────────────────────
-            # 1️⃣ Ventana principal: HOY + AYER
+            # 1) Ventana principal: HOY + AYER
             # ─────────────────────────────────────────────
             cur.execute(
                 """
@@ -61,7 +61,7 @@ def run() -> int:
                 WHERE
                   COALESCE(fecha_publicacion, created_at::date) IN (%s, %s)
                   AND ai_status IN ('pending', 'failed')
-                  AND ai_attempts < %s
+                  AND COALESCE(ai_attempts, 0) < %s
                 ORDER BY id
                 """,
                 (today, yesterday, MAX_ATTEMPTS),
@@ -78,7 +78,7 @@ def run() -> int:
                     failed += 1
 
             # ─────────────────────────────────────────────
-            # 2️⃣ Recuperación controlada
+            # 2) Recuperación controlada (antiguos)
             # ─────────────────────────────────────────────
             cur.execute(
                 """
@@ -86,7 +86,7 @@ def run() -> int:
                 FROM items
                 WHERE
                   ai_status IN ('pending', 'failed')
-                  AND ai_attempts < %s
+                  AND COALESCE(ai_attempts, 0) < %s
                   AND (
                     ai_last_attempt_at IS NULL
                     OR ai_last_attempt_at < NOW() - INTERVAL '6 hours'
@@ -109,18 +109,12 @@ def run() -> int:
 
         conn.commit()
 
-    logger.info(
-        "Fin refetch_missing_ai. processed=%s done=%s failed=%s",
-        processed,
-        done,
-        failed,
-    )
+    logger.info("Fin refetch_missing_ai: processed=%s done=%s failed=%s", processed, done, failed)
 
-    # Importante: si quieres que el workflow “falle” cuando haya errores, devuelve 1.
-    # Para MVP, recomiendo NO tumbarlo y solo observar; pero dejarlo listo.
+    # Si quieres que el workflow sea rojo cuando haya fallos: FAIL_ON_ERRORS=1
     fail_on_errors = (os.getenv("FAIL_ON_ERRORS") or "0").strip() == "1"
     if fail_on_errors and failed > 0:
-        logger.error("FAIL_ON_ERRORS=1 y hubo fallos. Marcando exit code 1.")
+        logger.error("FAIL_ON_ERRORS=1 y hubo fallos. Saliendo con código 1.")
         return 1
 
     return 0
@@ -129,7 +123,6 @@ def run() -> int:
 def _process_item(cur, row) -> bool:
     item_id, identificador, titulo, url_pdf = row
 
-    # Defensa mínima: si falta url_pdf, marcamos failed con error claro.
     if not url_pdf:
         msg = "url_pdf vacío o NULL"
         logger.error("IA falló %s: %s", identificador, msg)
@@ -149,6 +142,7 @@ def _process_item(cur, row) -> bool:
     logger.info("Procesando IA %s", identificador)
 
     try:
+        # Marca como processing + incrementa intentos
         cur.execute(
             """
             UPDATE items
@@ -162,12 +156,14 @@ def _process_item(cur, row) -> bool:
             (item_id,),
         )
 
+        # Pipeline PDF-first (tu service se encarga de descargar/parsear PDF y pedir a OpenAI)
         titulo_r, resumen_json, impacto_json = get_openai_responses_from_pdf(
             identificador=identificador,
             titulo=titulo,
             url_pdf=url_pdf,
         )
 
+        # Persiste resultados
         cur.execute(
             """
             UPDATE items

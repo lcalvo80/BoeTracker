@@ -15,7 +15,7 @@ on:
         default: ""
 
   schedule:
-    - cron: "0 5 * * *"   # ⏰ 05:00 AM todos los días (UTC)
+    - cron: "0 5 * * *"   # 05:00 UTC diario
 
 concurrency:
   group: boe-prod
@@ -33,6 +33,11 @@ jobs:
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
+
+      # Logging CI
+      PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: "INFO"
+      # FAIL_ON_ERRORS: "1"
 
     steps:
       - name: Checkout
@@ -63,9 +68,3 @@ jobs:
 
       - name: Reprocesar IA pendientes
         run: python -m app.scripts.refetch_missing_ai
-        env:
-          PYTHONUNBUFFERED: "1"
-          LOG_LEVEL: "INFO"
-          # FAIL_ON_ERRORS: "1"
-          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
