@@ -4,50 +4,35 @@ on:
   workflow_dispatch:
     inputs:
       from_date:
-        description: "Fecha inicio (YYYY-MM-DD o YYYYMMDD, vacío = hoy)"
+        description: "Fecha inicio (YYYY-MM-DD o YYYYMMDD)"
         required: false
         type: string
         default: ""
       to_date:
-        description: "Fecha fin (YYYY-MM-DD o YYYYMMDD, vacío = from_date)"
+        description: "Fecha fin (YYYY-MM-DD o YYYYMMDD)"
         required: false
         type: string
         default: ""
 
-  # GitHub cron es UTC.
-  # 04:00 UTC = 05:00 CET (invierno). En verano será 06:00 CEST.
   schedule:
-    - cron: "0 4 * * *"
+    - cron: "0 5 * * *"   # ⏰ 05:00 AM todos los días (UTC)
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: boe-prod
   cancel-in-progress: false
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
       OPENAI_MODEL: gpt-4o
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
-
-      # PDF extraction hardening (evita el connect_timeout=90 inesperado)
-      BOE_PDF_CONNECT_TIMEOUT: "10"
-      BOE_PDF_READ_TIMEOUT: "120"
-      BOE_PDF_TOTAL_BUDGET_SECS: "60"
-      BOE_PDF_RETRIES_TOTAL: "3"
-      BOE_PDF_ENABLE_HOST_FALLBACK: "1"
-
-      # Backfill IA
-      AI_MAX_ATTEMPTS: "3"
-      AI_RECOVERY_LIMIT: "200"
-      AI_RECOVERY_COOLDOWN_HOURS: "6"
 
     steps:
       - name: Checkout
@@ -63,16 +48,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ejecutar ingesta BOE (sumario) + insert DB
+      - name: Ingesta BOE
         env:
           FROM_DATE: ${{ github.event.inputs.from_date }}
           TO_DATE: ${{ github.event.inputs.to_date }}
         run: |
-          set -e
-
-          echo "FROM_DATE=${FROM_DATE}"
-          echo "TO_DATE=${TO_DATE}"
-
           if [ -n "$FROM_DATE" ] && [ -n "$TO_DATE" ]; then
             python update_boe.py --from-date "$FROM_DATE" --to-date "$TO_DATE"
           elif [ -n "$FROM_DATE" ]; then
@@ -81,7 +61,6 @@ jobs:
             python update_boe.py
           fi
 
-      - name: Backfill IA (hoy/ayer + recovery, PDF-first)
+      - name: Reprocesar IA pendientes
         run: |
-          set -e
           python -m app.scripts.refetch_missing_ai
