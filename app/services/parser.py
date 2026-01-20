@@ -81,22 +81,15 @@ normalize_code = getattr(_lookup_mod, "normalize_code", _fallback_normalize_code
 
 def ensure_seccion_cur(cur, codigo: str, nombre: str) -> str:
     fn = getattr(_lookup_mod, "ensure_seccion_cur", None)
-    return (
-        fn(cur, codigo, nombre)
-        if callable(fn)
-        else _fallback_generic_cur(cur, "public.secciones_lookup", codigo, nombre)
-    )
+    return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.secciones_lookup", codigo, nombre)
 
 
 def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
     fn = getattr(_lookup_mod, "ensure_departamento_cur", None)
-    return (
-        fn(cur, codigo, nombre)
-        if callable(fn)
-        else _fallback_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
-    )
+    return fn(cur, codigo, nombre) if callable(fn) else _fallback_generic_cur(cur, "public.departamentos_lookup", codigo, nombre)
 
 
+# ───────────────────── Helpers ─────────────────────
 def clasificar_item(nombre_seccion: str) -> str:
     nombre = (nombre_seccion or "").lower()
     if "anuncio" in nombre:
@@ -134,17 +127,7 @@ def _emptyish(x) -> bool:
 
 def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
     candidates = []
-    for tag in (
-        "contenido",
-        "texto",
-        "sumario",
-        "extracto",
-        "resumen",
-        "descripcion",
-        "descripción",
-        "cuerpo",
-        "detalle",
-    ):
+    for tag in ("contenido", "texto", "sumario", "extracto", "resumen", "descripcion", "descripción", "cuerpo", "detalle"):
         val = item.findtext(tag)
         if val and val.strip():
             candidates.append(val.strip())
@@ -162,26 +145,17 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
     return "\n\n".join([c for c in candidates if c]).strip()
 
 
-def _ensure_status_columns(cur) -> None:
-    """
-    Migración defensiva (idempotente). Aun así, mantenemos un script formal de migración.
-    """
+def _ensure_ai_columns(cur) -> None:
     cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS contenido TEXT")
-
     cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_status TEXT")
     cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_attempts INTEGER")
     cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_last_error TEXT")
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_last_attempt_at TIMESTAMP")
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_completed_at TIMESTAMP")
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_source TEXT")
-
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_status TEXT")
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_attempts INTEGER")
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_last_error TEXT")
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_last_attempt_at TIMESTAMP")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_last_attempt_at TIMESTAMP WITHOUT TIME ZONE")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_done_at TIMESTAMP WITHOUT TIME ZONE")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_updated_at TIMESTAMP WITHOUT TIME ZONE")
 
 
-def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
+def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters, run_date: date):
     identificador = (item.findtext("identificador", "") or "").strip()
     titulo = (item.findtext("titulo", "") or "").strip()
 
@@ -192,7 +166,6 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
 
     cur.execute("SELECT 1 FROM items WHERE identificador = %s", (identificador,))
     if cur.fetchone():
-        logger.info("⏭️  Ya existe: %s", identificador)
         counters["omitidos_existentes"] += 1
         return
 
@@ -236,13 +209,10 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         cuerpo_final = (titulo + ("\n\n" + meta if meta else "")).strip()
 
     fecha_publicacion = safe_date((item.findtext("fecha_publicacion", "") or "").strip())
+    # Regla: nunca NULL. Si XML no trae, usamos el día del BOE (run_date).
+    fecha_publicacion_final = fecha_publicacion or run_date
 
-    # Importante: En ingesta NO generamos IA.
-    titulo_resumen_final = titulo
-    resumen_comp = None
-    impacto_comp = None
-
-    _ensure_status_columns(cur)
+    _ensure_ai_columns(cur)
 
     cur.execute(
         """
@@ -251,25 +221,23 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             contenido, url_pdf, url_html, url_xml,
             seccion_codigo, departamento_codigo,
             epigrafe, control, fecha_publicacion, clase_item,
-            ai_status, ai_attempts, ai_last_error, ai_last_attempt_at, ai_completed_at, ai_source,
-            pdf_status, pdf_attempts, pdf_last_error, pdf_last_attempt_at
+            ai_status, ai_attempts, ai_updated_at
         )
         VALUES (
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s,
             %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s
+            %s, %s, now()
         )
         ON CONFLICT (identificador) DO NOTHING
         """,
         (
             identificador,
             titulo,
-            titulo_resumen_final,
-            resumen_comp,
-            impacto_comp,
+            titulo,           # titulo_resumen inicial = titulo (sin IA aún)
+            None,             # resumen: lo rellenará el worker
+            None,             # informe_impacto: lo rellenará el worker
             cuerpo_final,
             url_pdf,
             url_html,
@@ -278,20 +246,10 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             dep_codigo_norm if dept else "",
             (epigrafe.get("nombre", "") if epigrafe else "").strip(),
             (item.findtext("control", "") or "").strip(),
-            fecha_publicacion,
+            fecha_publicacion_final,
             clase_item,
-            # estados IA
-            "pending",  # ai_status
-            0,          # ai_attempts
-            None,       # ai_last_error
-            None,       # ai_last_attempt_at
-            None,       # ai_completed_at
-            None,       # ai_source
-            # estados PDF
-            "unknown" if url_pdf else "failed",
+            "pending",
             0,
-            None if url_pdf else "Item sin url_pdf",
-            None,
         ),
     )
 
@@ -299,7 +257,7 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
     counters["insertados"] += 1
 
 
-def parse_and_insert(root: ET.Element) -> int:
+def parse_and_insert(root: ET.Element, *, run_date: date) -> int:
     counters = {
         "insertados": 0,
         "omitidos_existentes": 0,
@@ -313,7 +271,7 @@ def parse_and_insert(root: ET.Element) -> int:
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            _ensure_status_columns(cur)
+            _ensure_ai_columns(cur)
 
             for seccion in root.findall(".//seccion"):
                 sec_nombre = (seccion.get("nombre", "") or "").strip()
@@ -322,13 +280,12 @@ def parse_and_insert(root: ET.Element) -> int:
                 for dept in seccion.findall("departamento"):
                     for epigrafe in dept.findall("epigrafe"):
                         for item in epigrafe.findall("item"):
-                            procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters)
-
+                            procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters, run_date)
                     for item in dept.findall("item"):
-                        procesar_item(cur, item, seccion, dept, None, clase_item, counters)
+                        procesar_item(cur, item, seccion, dept, None, clase_item, counters, run_date)
 
                 for item in seccion.findall("item"):
-                    procesar_item(cur, item, seccion, None, None, clase_item, counters)
+                    procesar_item(cur, item, seccion, None, None, clase_item, counters, run_date)
                     counters["huerfanos_en_seccion"] += 1
 
         conn.commit()

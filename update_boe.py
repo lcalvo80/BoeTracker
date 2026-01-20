@@ -23,7 +23,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-# ✅ Cargar .env solo en desarrollo/local (no en GitHub Actions)
 if os.getenv("GITHUB_ACTIONS") != "true":
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
@@ -31,6 +30,11 @@ if os.getenv("GITHUB_ACTIONS") != "true":
         logging.info("🟢 .env file loaded.")
     else:
         logging.warning("⚠️ No .env file found.")
+
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    logging.error("❌ OPENAI_API_KEY not found. Check .env o GitHub secret.")
+    sys.exit(1)
 
 
 def get_item_count() -> int:
@@ -65,12 +69,12 @@ def _iter_dates(start: date, end: date):
 
 def _parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        description="Ingesta del BOE en PostgreSQL (INGESTA ONLY, sin OpenAI)."
+        description="Ingesta del BOE en PostgreSQL (solo inserta + marca pending IA)."
     )
     parser.add_argument(
         "--from-date",
         dest="from_date",
-        help="Fecha inicio (YYYY-MM-DD o YYYYMMDD). Vacío = hoy.",
+        help="Fecha inicio (YYYY-MM-DD o YYYYMMDD). Vacío = hoy+ayer.",
     )
     parser.add_argument(
         "--to-date",
@@ -80,107 +84,72 @@ def _parse_args(argv: list[str] | None = None):
     return parser.parse_args(argv)
 
 
-def _run_single_day(d: date | None = None) -> int:
-    if d is None:
-        logging.info("🗓️ Ejecutando ingesta SOLO para hoy (por defecto).")
-    else:
-        logging.info("🗓️ Ejecutando ingesta para la fecha %s.", d.isoformat())
-
-    initial_count = get_item_count()
-    logging.info("📦 Ítems antes: %s", initial_count)
+def _run_for_date(d: date) -> int:
+    logging.info("📅 Procesando BOE del %s…", d.isoformat())
 
     try:
-        root = fetch_boe_xml(d) if d is not None else fetch_boe_xml()
+        root = fetch_boe_xml(d)
     except Exception:
-        logging.exception("❌ Error descargando sumario del BOE.")
+        logging.exception("❌ Error descargando sumario del BOE para %s.", d)
         return 1
 
     if root is None:
-        logging.warning(
-            "ℹ️ No hay sumario disponible para la fecha objetivo (BOE 404). "
-            "Proceso completado sin cambios."
-        )
-        final_count = get_item_count()
-        logging.info("📦 Total actual en BD: %s", final_count)
+        logging.info("ℹ️ No hay sumario disponible para %s (BOE 404).", d.isoformat())
         return 0
 
     try:
-        inserted = parse_and_insert(root)
+        inserted = parse_and_insert(root, run_date=d)
+        logging.info("✅ BOE %s procesado. Ítems nuevos insertados: %s.", d.isoformat(), inserted)
+        return 0
     except Exception:
-        logging.exception("❌ Error parseando/inserando el BOE.")
+        logging.exception("❌ Error parseando/inserando el BOE para %s.", d)
         return 1
-
-    final_count = get_item_count()
-    logging.info("🆕 Ítems nuevos insertados: %s", inserted)
-    logging.info("📦 Total actual en BD: %s", final_count)
-    logging.info("✅ Proceso de ingesta BOE completado con éxito.")
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    if not args.from_date and not args.to_date:
-        return _run_single_day(None)
+    initial_count = get_item_count()
+    logging.info("📦 Ítems antes: %s", initial_count)
 
+    # Caso A: sin fechas -> HOY + AYER
+    if not args.from_date and not args.to_date:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+
+        logging.info("🗓️ Ejecutando ingesta por defecto para AYER + HOY.")
+        rc1 = _run_for_date(yesterday)
+        rc2 = _run_for_date(today)
+
+        final_count = get_item_count()
+        logging.info("📦 Total actual en BD: %s", final_count)
+        logging.info("✅ Proceso de ingesta BOE completado (ayer+hoy).")
+        return 0 if (rc1 == 0 and rc2 == 0) else 1
+
+    # Caso B: rango explícito
     try:
         if args.from_date:
             start_date = _parse_input_date(args.from_date)
-        elif args.to_date:
+        else:
             start_date = _parse_input_date(args.to_date)
-        else:
-            return _run_single_day(None)
 
-        if args.to_date:
-            end_date = _parse_input_date(args.to_date)
-        else:
-            end_date = start_date
-
+        end_date = _parse_input_date(args.to_date) if args.to_date else start_date
     except ValueError as e:
         logging.error("❌ %s", e)
         return 1
 
     if end_date < start_date:
-        logging.warning(
-            "⚠️ to-date (%s) es anterior a from-date (%s). Intercambiando.",
-            end_date,
-            start_date,
-        )
+        logging.warning("⚠️ to-date (%s) < from-date (%s). Intercambiando.", end_date, start_date)
         start_date, end_date = end_date, start_date
 
-    logging.info(
-        "🗓️ Ejecutando ingesta para el rango %s → %s (inclusive).",
-        start_date,
-        end_date,
-    )
+    logging.info("🗓️ Ejecutando ingesta para el rango %s → %s (inclusive).", start_date, end_date)
 
-    initial_count = get_item_count()
-    logging.info("📦 Ítems antes: %s", initial_count)
-
-    total_inserted = 0
     for d in _iter_dates(start_date, end_date):
-        logging.info("📅 Procesando BOE del %s…", d.isoformat())
-        try:
-            root = fetch_boe_xml(d)
-        except Exception:
-            logging.exception("❌ Error descargando sumario del BOE para %s.", d)
-            continue
-
-        if root is None:
-            logging.info("ℹ️ No hay sumario disponible para %s (BOE 404). Se omite.", d.isoformat())
-            continue
-
-        try:
-            inserted = parse_and_insert(root)
-            total_inserted += inserted
-            logging.info("✅ BOE %s procesado. Ítems nuevos insertados: %s.", d.isoformat(), inserted)
-        except Exception:
-            logging.exception("❌ Error parseando/inserando BOE para la fecha %s.", d)
+        _run_for_date(d)
 
     final_count = get_item_count()
-    logging.info("🆕 Ítems nuevos insertados en el rango: %s", total_inserted)
     logging.info("📦 Total actual en BD: %s", final_count)
-    logging.info("✅ Proceso de ingesta BOE (rango) completado con éxito.")
+    logging.info("✅ Proceso de ingesta BOE (rango) completado.")
     return 0
 
 
