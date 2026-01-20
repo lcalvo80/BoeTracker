@@ -27,10 +27,7 @@ jobs:
     timeout-minutes: 120
 
     env:
-      # PROD (Railway)
       DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-
-      # OpenAI
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: gpt-4o
       OPENAI_TIMEOUT: "45"
@@ -40,6 +37,9 @@ jobs:
       # Logging CI
       PYTHONUNBUFFERED: "1"
       LOG_LEVEL: "INFO"
+
+      # Control de coste/tiempo por corrida
+      AI_BATCH_LIMIT: "50"
       # FAIL_ON_ERRORS: "1"
 
     steps:
