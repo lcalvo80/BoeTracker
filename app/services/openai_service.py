@@ -25,6 +25,9 @@ _MODEL_TITLE = os.getenv("OPENAI_MODEL_TITLE", _OPENAI_MODEL)
 _MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", _OPENAI_MODEL)
 _MODEL_IMPACT = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
 
+# Nuevo: no llamar OpenAI si la fuente es demasiado pobre (título-only)
+_OPENAI_MIN_SOURCE_CHARS = int(os.getenv("OPENAI_MIN_SOURCE_CHARS", "800"))
+
 # Chunking
 _OPENAI_CHUNK_SIZE_CHARS = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
 _OPENAI_CHUNK_OVERLAP_CHARS = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
@@ -298,10 +301,6 @@ def _json_schema_completion_with_retry(
     seed: Optional[int] = 7,
     fallback_to_json_object_on_timeout: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Intenta con json_schema. Si tras reintentos hay timeout y fallback activo,
-    reintenta una vez con json_object y tokens reducidos para evitar timeouts.
-    """
     use_model = model or _OPENAI_MODEL
     last_err: Optional[Exception] = None
 
@@ -326,7 +325,6 @@ def _json_schema_completion_with_retry(
             text = f"{e}"
             code = getattr(getattr(e, "response", None), "status_code", None)
 
-            # Fallback si el backend no soporta json_schema
             if "response_format" in text or "json_schema" in text or code == 400:
                 logging.warning("⚠️ json_schema no soportado. Fallback a json_object.")
                 return _json_completion_with_retry(
@@ -347,10 +345,8 @@ def _json_schema_completion_with_retry(
                 logging.error(f"❌ OpenAI error (JSON schema): code={code} {e}")
                 raise
 
-            # Timeout final → salimos para aplicar fallback
             break
 
-    # ───── Fallback por timeout ─────
     if fallback_to_json_object_on_timeout:
         fb_tokens = min(int(max_tokens * _OPENAI_JSON_FALLBACK_FACTOR), _OPENAI_JSON_FALLBACK_MAX_TOKENS)
         logging.warning(f"⏱️ Timeout con json_schema. Reintentando con json_object (max_tokens={fb_tokens})…")
@@ -368,7 +364,6 @@ def _json_schema_completion_with_retry(
             logging.error(f"❌ Fallback json_object también falló: {e2}")
             raise last_err or e2
 
-    # Sin fallback → error final
     raise last_err or TimeoutError("Timeout en json_schema")
 
 
@@ -389,7 +384,7 @@ def _ensure_resumen_shape(obj: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(obj, dict):
         summary = obj.get("summary", None)
         if (summary is None or str(summary).strip() == "") and "context" in obj:
-            summary = obj.get("context")  # retro-compat
+            summary = obj.get("context")
         out["summary"] = str(summary or "").strip()
         out["key_changes"] = [str(x).strip() for x in obj.get("key_changes", []) if str(x).strip()]
         out["key_dates_events"] = [str(x).strip() for x in obj.get("key_dates_events", []) if str(x).strip()]
@@ -508,12 +503,8 @@ def _grade_title(s: str, max_words: int = 10) -> str:
     return s
 
 
-# ─────────────────────────── API principal (mantenida por compatibilidad) ───────────────────────────
+# ─────────────────────────── API principal ───────────────────────────
 def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
-    """
-    Devuelve: (titulo_resumen, resumen_json_str, impacto_json_str)
-    Mantener por compatibilidad. Internamente usa las funciones nuevas generate_*.
-    """
     titulo = generate_title(title_hint=title, content=content)
     resumen = generate_summary(content=content, title_hint=title)
     impacto = generate_impact(content=content, title_hint=title)
@@ -527,6 +518,7 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
 def get_openai_responses_from_pdf(identificador: str, titulo: str, url_pdf: str) -> Tuple[str, str, str]:
     """
     Variante que usa SIEMPRE el texto del PDF del BOE como contenido.
+    Si el PDF no se puede extraer, NO llamamos a OpenAI con título-only.
     """
     content = ""
     if url_pdf:
@@ -535,18 +527,40 @@ def get_openai_responses_from_pdf(identificador: str, titulo: str, url_pdf: str)
         except Exception as e:
             logging.error("❌ Error extrayendo texto del PDF (%s): %s", identificador, e)
 
-    if not content:
-        logging.warning("⚠️ No se pudo extraer texto del PDF para %s. Uso título como contenido.", identificador)
-        content = (titulo or "").strip()
+    content = (content or "").strip()
+    titulo_clean = (titulo or "").strip()
 
-    return get_openai_responses(titulo, content)
+    if not content:
+        logging.warning(
+            "⚠️ No se pudo extraer texto del PDF para %s. Se omite OpenAI y se deja pendiente.",
+            identificador,
+        )
+        # No inventamos: devolvemos título y JSON vacíos.
+        return (
+            titulo_clean,
+            json.dumps(dict(_EMPTY_RESUMEN), ensure_ascii=False),
+            json.dumps(dict(_EMPTY_IMPACTO), ensure_ascii=False),
+        )
+
+    # Si por algún motivo llega un contenido demasiado corto, evitamos también gastar.
+    if len(content) < _OPENAI_MIN_SOURCE_CHARS:
+        logging.warning(
+            "⚠️ Texto PDF demasiado corto para %s (%s chars < %s). Omito OpenAI para evitar baja calidad.",
+            identificador,
+            len(content),
+            _OPENAI_MIN_SOURCE_CHARS,
+        )
+        return (
+            titulo_clean,
+            json.dumps(dict(_EMPTY_RESUMEN), ensure_ascii=False),
+            json.dumps(dict(_EMPTY_IMPACTO), ensure_ascii=False),
+        )
+
+    return get_openai_responses(titulo_clean, content)
 
 
 # ─────────────────────────── NUEVO: funciones públicas por endpoint ───────────────────────────
 def generate_title(*, title_hint: str, content: str) -> str:
-    """
-    Genera título (≤10 palabras) usando el contenido (texto del PDF) y un hint opcional del título oficial.
-    """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido título.")
         return (title_hint or "").strip()
@@ -596,9 +610,6 @@ def generate_title(*, title_hint: str, content: str) -> str:
 
 
 def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
-    """
-    Genera resumen boe_resumen (dict).
-    """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido resumen.")
         return dict(_EMPTY_RESUMEN)
@@ -708,7 +719,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
 
     out = _merge_resumen_objs(parts) if parts else dict(_EMPTY_RESUMEN)
 
-    # Señal de QA si sospechoso (texto largo pero respuesta vacía)
     if len(content_norm) > 1000 and (not out.get("summary") or out["summary"].strip() == ""):
         out["conclusion"] = "Revisión necesaria: el modelo devolvió un resumen vacío pese a haber contenido suficiente."
 
@@ -716,9 +726,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
 
 
 def generate_impact(*, content: str, title_hint: str = "") -> Dict[str, Any]:
-    """
-    Genera impacto boe_impacto (dict).
-    """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido impacto.")
         return dict(_EMPTY_IMPACTO)
