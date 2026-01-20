@@ -27,7 +27,10 @@ jobs:
     timeout-minutes: 120
 
     env:
+      # PROD (Railway)
       DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+
+      # OpenAI
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: gpt-4o
       OPENAI_TIMEOUT: "45"
@@ -41,6 +44,16 @@ jobs:
       # Control de coste/tiempo por corrida
       AI_BATCH_LIMIT: "50"
       # FAIL_ON_ERRORS: "1"
+
+      # Hardening DB para batch (recomendado)
+      DB_APP_NAME: "boe-ai"
+      DB_STATEMENT_TIMEOUT_MS: "60000"
+      DB_LOCK_TIMEOUT_MS: "10000"
+      DB_IDLE_TX_TIMEOUT_MS: "60000"
+      DB_KEEPALIVES: "1"
+      DB_KEEPALIVES_IDLE: "30"
+      DB_KEEPALIVES_INTERVAL: "10"
+      DB_KEEPALIVES_COUNT: "5"
 
     steps:
       - name: Checkout
