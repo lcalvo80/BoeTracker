@@ -10,22 +10,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Estructura esperada:
-#   <PROJECT_ROOT>/
-#       update_boe.py
-#       app/
-#         services/
-#         scripts/
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-# Imports locales
 from app.services.postgres import get_db
 from app.services.boe_fetcher import fetch_boe_xml
 from app.services.parser import parse_and_insert
 
-# 🪵 Logging básico
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -40,17 +32,8 @@ if os.getenv("GITHUB_ACTIONS") != "true":
     else:
         logging.warning("⚠️ No .env file found.")
 
-# 🔐 Verificar API Key (necesaria para las llamadas a OpenAI)
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    logging.error("❌ OPENAI_API_KEY not found. Check .env o GitHub secret.")
-    sys.exit(1)
-
 
 def get_item_count() -> int:
-    """
-    Devuelve el número de registros en la tabla `items`.
-    """
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM items")
@@ -59,31 +42,20 @@ def get_item_count() -> int:
 
 
 def _parse_input_date(value: str) -> date:
-    """
-    Parsea una fecha en formato YYYY-MM-DD o YYYYMMDD y devuelve `date`.
-    Lanza ValueError si el formato no es válido.
-    """
     v = (value or "").strip()
     if not v:
         raise ValueError("Fecha vacía")
 
-    # YYYYMMDD
     if len(v) == 8 and v.isdigit():
         return datetime.strptime(v, "%Y%m%d").date()
 
-    # YYYY-MM-DD
     try:
         return datetime.strptime(v, "%Y-%m-%d").date()
     except ValueError as e:
-        raise ValueError(
-            f"Fecha inválida '{value}'. Usa formato YYYY-MM-DD o YYYYMMDD."
-        ) from e
+        raise ValueError(f"Fecha inválida '{value}'. Usa YYYY-MM-DD o YYYYMMDD.") from e
 
 
 def _iter_dates(start: date, end: date):
-    """
-    Iterador de fechas [start, end] inclusive.
-    """
     current = start
     delta = timedelta(days=1)
     while current <= end:
@@ -93,7 +65,7 @@ def _iter_dates(start: date, end: date):
 
 def _parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        description="Ingesta del BOE en PostgreSQL usando el pipeline de IA (PDF)."
+        description="Ingesta del BOE en PostgreSQL (INGESTA ONLY, sin OpenAI)."
     )
     parser.add_argument(
         "--from-date",
@@ -109,10 +81,6 @@ def _parse_args(argv: list[str] | None = None):
 
 
 def _run_single_day(d: date | None = None) -> int:
-    """
-    Ejecuta la ingesta para un único día.
-    Si d es None, usa el comportamiento por defecto de `fetch_boe_xml` (hoy).
-    """
     if d is None:
         logging.info("🗓️ Ejecutando ingesta SOLO para hoy (por defecto).")
     else:
@@ -145,26 +113,22 @@ def _run_single_day(d: date | None = None) -> int:
     final_count = get_item_count()
     logging.info("🆕 Ítems nuevos insertados: %s", inserted)
     logging.info("📦 Total actual en BD: %s", final_count)
-    logging.info("✅ Proceso de actualización del BOE completado con éxito.")
+    logging.info("✅ Proceso de ingesta BOE completado con éxito.")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    # Caso 1: sin fechas → comportamiento legacy (solo hoy)
     if not args.from_date and not args.to_date:
         return _run_single_day(None)
 
-    # Caso 2: con rango (from/to)
     try:
         if args.from_date:
             start_date = _parse_input_date(args.from_date)
         elif args.to_date:
-            # Solo to_date definido → usamos esa fecha como inicio
             start_date = _parse_input_date(args.to_date)
         else:
-            # No debería llegar aquí, pero por robustez:
             return _run_single_day(None)
 
         if args.to_date:
@@ -176,7 +140,6 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("❌ %s", e)
         return 1
 
-    # Normalizar orden
     if end_date < start_date:
         logging.warning(
             "⚠️ to-date (%s) es anterior a from-date (%s). Intercambiando.",
@@ -204,29 +167,20 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         if root is None:
-            logging.info(
-                "ℹ️ No hay sumario disponible para %s (BOE 404). Se omite.",
-                d.isoformat(),
-            )
+            logging.info("ℹ️ No hay sumario disponible para %s (BOE 404). Se omite.", d.isoformat())
             continue
 
         try:
             inserted = parse_and_insert(root)
             total_inserted += inserted
-            logging.info(
-                "✅ BOE %s procesado. Ítems nuevos insertados: %s.",
-                d.isoformat(),
-                inserted,
-            )
+            logging.info("✅ BOE %s procesado. Ítems nuevos insertados: %s.", d.isoformat(), inserted)
         except Exception:
-            logging.exception(
-                "❌ Error parseando/inserando BOE para la fecha %s.", d
-            )
+            logging.exception("❌ Error parseando/inserando BOE para la fecha %s.", d)
 
     final_count = get_item_count()
     logging.info("🆕 Ítems nuevos insertados en el rango: %s", total_inserted)
     logging.info("📦 Total actual en BD: %s", final_count)
-    logging.info("✅ Proceso de actualización del BOE (rango) completado con éxito.")
+    logging.info("✅ Proceso de ingesta BOE (rango) completado con éxito.")
     return 0
 
 

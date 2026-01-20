@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from datetime import date, datetime
 from typing import Optional
@@ -10,29 +9,10 @@ from xml.etree import ElementTree as ET
 
 from psycopg2 import sql
 
-from app.services.openai_service import (
-    get_openai_responses,
-    get_openai_responses_from_pdf,  # ⬅️ TEXTO PDF
-)
 from app.services.postgres import get_db
 from app.utils.compression import compress_json
 
 logger = logging.getLogger(__name__)
-
-# ───────────────────── Límite opcional de items por ejecución ─────────────────────
-_MAX_ITEMS_ENV = (os.getenv("BOE_MAX_ITEMS_PER_RUN") or "").strip()
-try:
-    _MAX_ITEMS_PER_RUN: Optional[int] = (
-        int(_MAX_ITEMS_ENV) if _MAX_ITEMS_ENV else None
-    )
-    if _MAX_ITEMS_PER_RUN is not None and _MAX_ITEMS_PER_RUN <= 0:
-        _MAX_ITEMS_PER_RUN = None
-except ValueError:
-    logger.warning("BOE_MAX_ITEMS_PER_RUN no es un entero válido: %r", _MAX_ITEMS_ENV)
-    _MAX_ITEMS_PER_RUN = None
-
-# Contador global de items insertados en ESTE proceso (para respetar el límite)
-_RUN_INSERTED = 0
 
 # ───────────────────── Import robusto del lookup ─────────────────────
 try:
@@ -117,31 +97,21 @@ def ensure_departamento_cur(cur, codigo: str, nombre: str) -> str:
     )
 
 
-# ───────────────────── Helpers de clasificación y fechas ─────────────────────
 def clasificar_item(nombre_seccion: str) -> str:
     nombre = (nombre_seccion or "").lower()
     if "anuncio" in nombre:
         return "Anuncio"
-    elif (
-        "disposición" in nombre
-        or "disposicion" in nombre
-        or "otras disposiciones" in nombre
-    ):
+    if "disposición" in nombre or "disposicion" in nombre or "otras disposiciones" in nombre:
         return "Disposición"
-    elif "notificación" in nombre or "notificacion" in nombre:
+    if "notificación" in nombre or "notificacion" in nombre:
         return "Notificación"
-    elif "edicto" in nombre or "judicial" in nombre:
+    if "edicto" in nombre or "judicial" in nombre:
         return "Edicto judicial"
-    elif (
-        "personal" in nombre
-        or "nombramiento" in nombre
-        or "concurso" in nombre
-    ):
+    if "personal" in nombre or "nombramiento" in nombre or "concurso" in nombre:
         return "Personal"
-    elif "otros" in nombre:
+    if "otros" in nombre:
         return "Otros anuncios"
-    else:
-        return "Disposición"
+    return "Disposición"
 
 
 def safe_date(text: str) -> Optional[date]:
@@ -163,11 +133,6 @@ def _emptyish(x) -> bool:
 
 
 def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
-    """
-    Intenta construir un cuerpo de texto base con los campos XML "normales".
-    Se usa para el campo `contenido` y como fallback si todo lo demás falla.
-    (MVP: NO usamos html_enricher; para texto completo el FE enlaza a boe.es)
-    """
     candidates = []
     for tag in (
         "contenido",
@@ -197,14 +162,26 @@ def _compose_text(item: ET.Element, seccion, dept, epigrafe) -> str:
     return "\n\n".join([c for c in candidates if c]).strip()
 
 
-# ───────────────────── Procesado de cada item ─────────────────────
+def _ensure_status_columns(cur) -> None:
+    """
+    Migración defensiva (idempotente). Aun así, mantenemos un script formal de migración.
+    """
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS contenido TEXT")
+
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_status TEXT")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_attempts INTEGER")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_last_error TEXT")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_last_attempt_at TIMESTAMP")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_completed_at TIMESTAMP")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_source TEXT")
+
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_status TEXT")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_attempts INTEGER")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_last_error TEXT")
+    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS pdf_last_attempt_at TIMESTAMP")
+
+
 def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
-    global _RUN_INSERTED
-
-    # Límite global por ejecución (para tests desde CI)
-    if _MAX_ITEMS_PER_RUN is not None and _RUN_INSERTED >= _MAX_ITEMS_PER_RUN:
-        return
-
     identificador = (item.findtext("identificador", "") or "").strip()
     titulo = (item.findtext("titulo", "") or "").strip()
 
@@ -213,14 +190,12 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         counters["omitidos_vacios"] += 1
         return
 
-    # Evitar duplicados
     cur.execute("SELECT 1 FROM items WHERE identificador = %s", (identificador,))
     if cur.fetchone():
-        logger.info(f"⏭️  Ya procesado: {identificador}")
+        logger.info("⏭️  Ya existe: %s", identificador)
         counters["omitidos_existentes"] += 1
         return
 
-    # Normaliza códigos y asegura lookups
     sec_codigo_norm = normalize_code(seccion.get("codigo", "") if seccion else "")
     dep_codigo_norm = normalize_code(dept.get("codigo", "") if dept else "")
 
@@ -240,17 +215,12 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         elif act_dep == "update_name":
             counters["lookup_dep_update"] += 1
 
-    # Texto base y URLs
     cuerpo_base = _compose_text(item, seccion, dept, epigrafe)
     url_pdf = (item.findtext("url_pdf", "") or "").strip()
     url_html = (item.findtext("url_html", "") or "").strip()
     url_xml = (item.findtext("url_xml", "") or "").strip()
 
-    # MVP: NO llamamos a html_enricher.
-    # `contenido` será el cuerpo base construido desde el XML (sumario/extracto/etc).
     cuerpo_final = cuerpo_base
-
-    # Fallback si quedó vacío: nunca dejamos sin contenido mínimo
     if _emptyish(cuerpo_final):
         meta = " | ".join(
             filter(
@@ -265,39 +235,14 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
         )
         cuerpo_final = (titulo + ("\n\n" + meta if meta else "")).strip()
 
-    # ───────── OpenAI: SIEMPRE que podamos, usamos PDF ─────────
-    try:
-        if url_pdf:
-            # Nuevo flujo: usamos directamente el texto del PDF del BOE
-            titulo_resumen, resumen_json, impacto_json = get_openai_responses_from_pdf(
-                identificador=identificador,
-                titulo=titulo,
-                url_pdf=url_pdf,
-            )
-        else:
-            # Fallback (raro): usamos el cuerpo construido como contenido
-            logger.warning(
-                "⚠️ Item %s sin url_pdf. Uso texto base para OpenAI.",
-                identificador,
-            )
-            titulo_resumen, resumen_json, impacto_json = get_openai_responses(
-                titulo, cuerpo_final
-            )
-    except Exception as e:
-        logger.error(f"❌ OpenAI error en '{identificador}': {e}")
-        counters["fallos_openai"] += 1
-        titulo_resumen, resumen_json, impacto_json = "", "", ""
+    fecha_publicacion = safe_date((item.findtext("fecha_publicacion", "") or "").strip())
 
-    resumen_comp = None if _emptyish(resumen_json) else compress_json(resumen_json)
-    impacto_comp = None if _emptyish(impacto_json) else compress_json(impacto_json)
+    # Importante: En ingesta NO generamos IA.
+    titulo_resumen_final = titulo
+    resumen_comp = None
+    impacto_comp = None
 
-    fecha_publicacion = safe_date(
-        (item.findtext("fecha_publicacion", "") or "").strip()
-    )
-    titulo_resumen_final = (titulo_resumen or "").strip().rstrip(".") or titulo
-
-    # Migración defensiva + insert con contenido
-    cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS contenido TEXT")
+    _ensure_status_columns(cur)
 
     cur.execute(
         """
@@ -305,12 +250,16 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             identificador, titulo, titulo_resumen, resumen, informe_impacto,
             contenido, url_pdf, url_html, url_xml,
             seccion_codigo, departamento_codigo,
-            epigrafe, control, fecha_publicacion, clase_item
+            epigrafe, control, fecha_publicacion, clase_item,
+            ai_status, ai_attempts, ai_last_error, ai_last_attempt_at, ai_completed_at, ai_source,
+            pdf_status, pdf_attempts, pdf_last_error, pdf_last_attempt_at
         )
         VALUES (
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s
         )
         ON CONFLICT (identificador) DO NOTHING
@@ -331,21 +280,30 @@ def procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters):
             (item.findtext("control", "") or "").strip(),
             fecha_publicacion,
             clase_item,
+            # estados IA
+            "pending",  # ai_status
+            0,          # ai_attempts
+            None,       # ai_last_error
+            None,       # ai_last_attempt_at
+            None,       # ai_completed_at
+            None,       # ai_source
+            # estados PDF
+            "unknown" if url_pdf else "failed",
+            0,
+            None if url_pdf else "Item sin url_pdf",
+            None,
         ),
     )
 
-    logger.info(f"✅ Insertado: {identificador}")
+    logger.info("✅ Insertado: %s (ai_status=pending)", identificador)
     counters["insertados"] += 1
-    _RUN_INSERTED += 1
 
 
-# ───────────────────── Entry principal ─────────────────────
 def parse_and_insert(root: ET.Element) -> int:
     counters = {
         "insertados": 0,
         "omitidos_existentes": 0,
         "omitidos_vacios": 0,
-        "fallos_openai": 0,
         "huerfanos_en_seccion": 0,
         "lookup_sec_insert": 0,
         "lookup_sec_update": 0,
@@ -355,7 +313,7 @@ def parse_and_insert(root: ET.Element) -> int:
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS contenido TEXT")
+            _ensure_status_columns(cur)
 
             for seccion in root.findall(".//seccion"):
                 sec_nombre = (seccion.get("nombre", "") or "").strip()
@@ -364,24 +322,19 @@ def parse_and_insert(root: ET.Element) -> int:
                 for dept in seccion.findall("departamento"):
                     for epigrafe in dept.findall("epigrafe"):
                         for item in epigrafe.findall("item"):
-                            procesar_item(
-                                cur, item, seccion, dept, epigrafe, clase_item, counters
-                            )
+                            procesar_item(cur, item, seccion, dept, epigrafe, clase_item, counters)
+
                     for item in dept.findall("item"):
-                        procesar_item(
-                            cur, item, seccion, dept, None, clase_item, counters
-                        )
+                        procesar_item(cur, item, seccion, dept, None, clase_item, counters)
 
                 for item in seccion.findall("item"):
-                    procesar_item(
-                        cur, item, seccion, None, None, clase_item, counters
-                    )
+                    procesar_item(cur, item, seccion, None, None, clase_item, counters)
                     counters["huerfanos_en_seccion"] += 1
 
         conn.commit()
 
-    logger.info("📊 RESUMEN FINAL:")
+    logger.info("📊 RESUMEN FINAL (INGESTA):")
     for k, v in counters.items():
-        logger.info(f"   {k}: {v}")
+        logger.info("   %s: %s", k, v)
 
     return counters["insertados"]

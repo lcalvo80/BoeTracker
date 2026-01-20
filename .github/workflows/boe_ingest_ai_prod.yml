@@ -13,11 +13,11 @@ on:
         required: false
         type: string
         default: ""
-      limit:
-        description: "Máximo de notificaciones a procesar (vacío = sin límite)"
-        required: false
-        type: string
-        default: ""
+
+  # GitHub cron es UTC.
+  # 04:00 UTC = 05:00 CET (invierno). En verano será 06:00 CEST.
+  schedule:
+    - cron: "0 4 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,15 +29,25 @@ jobs:
     timeout-minutes: 90
 
     env:
-      # 🔗 IMPORTANTÍSIMO: misma DB que Railway
       DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
       OPENAI_MODEL: gpt-4o
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
-      # 👇 Nuevo: límite de items por ejecución (lo leerá parser.py)
-      BOE_MAX_ITEMS_PER_RUN: ${{ github.event.inputs.limit }}
+
+      # PDF extraction hardening (evita el connect_timeout=90 inesperado)
+      BOE_PDF_CONNECT_TIMEOUT: "10"
+      BOE_PDF_READ_TIMEOUT: "120"
+      BOE_PDF_TOTAL_BUDGET_SECS: "60"
+      BOE_PDF_RETRIES_TOTAL: "3"
+      BOE_PDF_ENABLE_HOST_FALLBACK: "1"
+
+      # Backfill IA
+      AI_MAX_ATTEMPTS: "3"
+      AI_RECOVERY_LIMIT: "200"
+      AI_RECOVERY_COOLDOWN_HOURS: "6"
 
     steps:
       - name: Checkout
@@ -53,7 +63,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ejecutar ingesta BOE + PDF + IA
+      - name: Ejecutar ingesta BOE (sumario) + insert DB
         env:
           FROM_DATE: ${{ github.event.inputs.from_date }}
           TO_DATE: ${{ github.event.inputs.to_date }}
@@ -62,11 +72,6 @@ jobs:
 
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
-          echo "BOE_MAX_ITEMS_PER_RUN=${BOE_MAX_ITEMS_PER_RUN}"
-
-          # 🚫 IMPORTANTE:
-          # Ya NO usamos 'python -m app.scripts.update_boe'
-          # ✅ Usamos el script de la RAÍZ: update_boe.py
 
           if [ -n "$FROM_DATE" ] && [ -n "$TO_DATE" ]; then
             python update_boe.py --from-date "$FROM_DATE" --to-date "$TO_DATE"
@@ -76,14 +81,7 @@ jobs:
             python update_boe.py
           fi
 
-      # (Opcional) Reprocesar items sin IA
-      # - name: Reprocesar items sin IA (backfill IA)
-      #   env:
-      #     DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-      #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      #     OPENAI_MODEL: gpt-4o
-      #     OPENAI_TIMEOUT: "45"
-      #     OPENAI_MAX_RETRIES: "3"
-      #     OPENAI_BUDGET_SECS: "120"
-      #   run: |
-      #     python -m app.scripts.refetch_missing_ai
+      - name: Backfill IA (hoy/ayer + recovery, PDF-first)
+        run: |
+          set -e
+          python -m app.scripts.refetch_missing_ai
