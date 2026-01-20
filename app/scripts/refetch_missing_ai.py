@@ -8,7 +8,6 @@ import time
 from datetime import date, timedelta
 from typing import List, Tuple
 
-import psycopg2
 from psycopg2 import OperationalError, InterfaceError
 
 from app.services.postgres import get_db
@@ -29,9 +28,8 @@ logger = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3
 RECOVERY_LIMIT = 200
 
-# Para no intentar procesar 540 items en una única corrida (muy caro y largo)
-# Puedes ajustar en Actions con AI_BATCH_LIMIT=30 por ejemplo.
-AI_BATCH_LIMIT = int((os.getenv("AI_BATCH_LIMIT") or "50").strip())
+# Considera "processing" huérfano si lleva más de X horas.
+PROCESSING_STALE_HOURS = int((os.getenv("PROCESSING_STALE_HOURS") or "2").strip())
 
 
 def _today_yesterday() -> Tuple[date, date]:
@@ -39,15 +37,37 @@ def _today_yesterday() -> Tuple[date, date]:
     return today, today - timedelta(days=1)
 
 
+def _db_write_with_retry(fn, *, attempts: int = 3, base_sleep: float = 0.5):
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except (OperationalError, InterfaceError) as e:
+            last_err = e
+            sleep_s = base_sleep * (2 ** (i - 1))
+            logger.warning(
+                "DB write falló (intento %s/%s): %s. Reintentando en %.1fs",
+                i,
+                attempts,
+                e,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+    raise last_err  # type: ignore[misc]
+
+
 def _fetch_candidates() -> List[tuple]:
     """
-    Lee candidatos en una conexión corta (solo SELECT).
-    Devolvemos: [(id, identificador, titulo, url_pdf), ...]
+    Devuelve candidatos deduplicados:
+    - Principal: hoy+ayer en pending/failed
+    - Recuperación: pending/failed con last_attempt > 6h o null (limitada a RECOVERY_LIMIT)
+    - Recuperación extra: processing "stale" (huérfanos) con last_attempt_at viejo
     """
     today, yesterday = _today_yesterday()
 
     with get_db() as conn:
         with conn.cursor() as cur:
+            # Principal: hoy+ayer
             cur.execute(
                 """
                 SELECT id, identificador, titulo, url_pdf
@@ -62,6 +82,7 @@ def _fetch_candidates() -> List[tuple]:
             )
             main_rows = cur.fetchall()
 
+            # Recuperación: pending/failed antiguos
             cur.execute(
                 """
                 SELECT id, identificador, titulo, url_pdf
@@ -80,38 +101,37 @@ def _fetch_candidates() -> List[tuple]:
             )
             recovery_rows = cur.fetchall()
 
-    # Junta (principal primero), dedup por id
+            # Recuperación: processing huérfanos
+            cur.execute(
+                """
+                SELECT id, identificador, titulo, url_pdf
+                FROM items
+                WHERE
+                  ai_status = 'processing'
+                  AND COALESCE(ai_attempts, 0) < %s
+                  AND ai_last_attempt_at < NOW() - (%s || ' hours')::interval
+                ORDER BY ai_last_attempt_at ASC
+                """,
+                (MAX_ATTEMPTS, PROCESSING_STALE_HOURS),
+            )
+            stale_processing_rows = cur.fetchall()
+
     seen = set()
     out: List[tuple] = []
-    for r in (main_rows + recovery_rows):
+    for r in (main_rows + recovery_rows + stale_processing_rows):
         if r[0] in seen:
             continue
         seen.add(r[0])
         out.append(r)
 
-    if AI_BATCH_LIMIT > 0:
-        out = out[:AI_BATCH_LIMIT]
-
-    logger.info("Candidatos: principal=%s recuperación=%s total_dedup=%s batch_limit=%s",
-                len(main_rows), len(recovery_rows), len(out), AI_BATCH_LIMIT)
+    logger.info(
+        "Candidatos: principal=%s recuperación=%s processing_stale=%s total_dedup=%s",
+        len(main_rows),
+        len(recovery_rows),
+        len(stale_processing_rows),
+        len(out),
+    )
     return out
-
-
-def _db_write_with_retry(fn, *, attempts: int = 3, base_sleep: float = 0.5):
-    """
-    Reintenta escrituras DB ante fallos transitorios (SSL drop, etc.).
-    """
-    last_err = None
-    for i in range(1, attempts + 1):
-        try:
-            return fn()
-        except (OperationalError, InterfaceError) as e:
-            last_err = e
-            sleep_s = base_sleep * (2 ** (i - 1))
-            logger.warning("DB write falló (intento %s/%s): %s. Reintentando en %.1fs",
-                           i, attempts, e, sleep_s)
-            time.sleep(sleep_s)
-    raise last_err  # type: ignore[misc]
 
 
 def _mark_processing(item_id: int) -> None:
@@ -185,14 +205,14 @@ def run() -> int:
     today, yesterday = _today_yesterday()
     logger.info("Arrancando refetch_missing_ai")
     logger.info("Ventana principal: %s y %s", today, yesterday)
-    logger.info("MAX_ATTEMPTS=%s RECOVERY_LIMIT=%s AI_BATCH_LIMIT=%s", MAX_ATTEMPTS, RECOVERY_LIMIT, AI_BATCH_LIMIT)
+    logger.info("MAX_ATTEMPTS=%s RECOVERY_LIMIT=%s PROCESSING_STALE_HOURS=%s", MAX_ATTEMPTS, RECOVERY_LIMIT, PROCESSING_STALE_HOURS)
 
     processed = 0
     done = 0
     failed = 0
 
     candidates = _fetch_candidates()
-    logger.info("Procesando lote: %s items", len(candidates))
+    logger.info("Procesando lote: %s items (sin límite)", len(candidates))
 
     for (item_id, identificador, titulo, url_pdf) in candidates:
         processed += 1
@@ -204,17 +224,14 @@ def run() -> int:
             continue
 
         try:
-            # 1) DB: marcar processing (con commit) en conexión corta
             _mark_processing(item_id)
 
-            # 2) OpenAI (sin DB abierta)
             titulo_r, resumen_json, impacto_json = get_openai_responses_from_pdf(
                 identificador=identificador,
                 titulo=titulo,
                 url_pdf=url_pdf,
             )
 
-            # 3) DB: persistir done (con commit) en conexión corta
             _mark_done(item_id, titulo_r, resumen_json, impacto_json)
             done += 1
             logger.info("IA OK %s", identificador)
@@ -222,7 +239,6 @@ def run() -> int:
         except Exception as e:
             failed += 1
             logger.exception("IA falló %s", identificador)
-            # Importante: incluso si DB “tiembla”, _mark_failed reintenta.
             _mark_failed(item_id, str(e))
 
     logger.info("Fin refetch_missing_ai: processed=%s done=%s failed=%s", processed, done, failed)

@@ -24,28 +24,19 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
 
     env:
-      # PROD (Railway)
       DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-
-      # OpenAI
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: gpt-4o
       OPENAI_TIMEOUT: "45"
       OPENAI_MAX_RETRIES: "3"
       OPENAI_BUDGET_SECS: "120"
 
-      # Logging CI
       PYTHONUNBUFFERED: "1"
       LOG_LEVEL: "INFO"
 
-      # Control de coste/tiempo por corrida
-      AI_BATCH_LIMIT: "50"
-      # FAIL_ON_ERRORS: "1"
-
-      # Hardening DB para batch (recomendado)
+      # Hardening DB
       DB_APP_NAME: "boe-ai"
       DB_STATEMENT_TIMEOUT_MS: "60000"
       DB_LOCK_TIMEOUT_MS: "10000"
@@ -54,6 +45,10 @@ jobs:
       DB_KEEPALIVES_IDLE: "30"
       DB_KEEPALIVES_INTERVAL: "10"
       DB_KEEPALIVES_COUNT: "5"
+
+      # Recuperación de processing huérfanos
+      PROCESSING_STALE_HOURS: "2"
+      # FAIL_ON_ERRORS: "1"
 
     steps:
       - name: Checkout
@@ -81,10 +76,6 @@ jobs:
           else
             python update_boe.py
           fi
-
-      - name: Smoke check refetch_missing_ai
-        run: |
-          python -c "import app.scripts.refetch_missing_ai as m; print('module:', m.__file__); print('has run:', hasattr(m,'run'))"
 
       - name: Reprocesar IA pendientes
         run: python -m app.scripts.refetch_missing_ai
