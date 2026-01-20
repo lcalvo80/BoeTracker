@@ -62,5 +62,10 @@ jobs:
           fi
 
       - name: Reprocesar IA pendientes
-        run: |
-          python -m app.scripts.refetch_missing_ai
+        run: python -m app.scripts.refetch_missing_ai
+        env:
+          PYTHONUNBUFFERED: "1"
+          LOG_LEVEL: "INFO"
+          # FAIL_ON_ERRORS: "1"
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
