@@ -16,7 +16,7 @@ def _append_param(url: str, k: str, v: str) -> str:
 
 
 def _normalize_db_url(url: str) -> str:
-    # Si ya trae sslmode en la URL, respétalo; si no, decide por host
+    # sslmode
     if "sslmode=" not in url:
         env_mode = os.getenv("DB_SSLMODE")
         if env_mode:
@@ -31,14 +31,32 @@ def _normalize_db_url(url: str) -> str:
             url = _append_param(url, "sslmode", mode)
 
     # connect_timeout (s)
-    ct = os.getenv("DB_CONNECT_TIMEOUT", "10")
+    ct = os.getenv("DB_CONNECT_TIMEOUT", "10").strip() or "10"
     url = _append_param(url, "connect_timeout", ct)
 
     # application_name
-    app_name = os.getenv("DB_APP_NAME", "boe-ingestor")
+    app_name = (os.getenv("DB_APP_NAME", "boe-api") or "boe-api").strip()
     url = _append_param(url, "application_name", app_name)
 
     return url
+
+
+def _apply_session_timeouts(conn) -> None:
+    """
+    Evita 'pending' indefinidos: corta queries lentas/bloqueos en DB.
+    Valores por defecto razonables para API:
+      - statement_timeout: 15000ms
+      - lock_timeout: 5000ms
+      - idle_in_transaction_session_timeout: 30000ms
+    """
+    statement_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000") or "15000")
+    lock_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", "5000") or "5000")
+    idle_tx_ms = int(os.getenv("DB_IDLE_TX_TIMEOUT_MS", "30000") or "30000")
+
+    with conn.cursor() as cur:
+        cur.execute("SET statement_timeout = %s;", (statement_ms,))
+        cur.execute("SET lock_timeout = %s;", (lock_ms,))
+        cur.execute("SET idle_in_transaction_session_timeout = %s;", (idle_tx_ms,))
 
 
 @contextmanager
@@ -46,9 +64,11 @@ def get_db():
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL no configurada")
+
     dsn = _normalize_db_url(url)
     conn = psycopg2.connect(dsn)
     try:
+        _apply_session_timeouts(conn)
         yield conn
         conn.commit()
     finally:

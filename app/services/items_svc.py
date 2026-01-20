@@ -1,8 +1,9 @@
 # app/services/items_svc.py
 from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-import base64, gzip, json
+import base64, gzip, json, time
 
 from psycopg2 import sql
 from app.services.postgres import get_db
@@ -64,44 +65,6 @@ def _list_param(params: Dict[str, Any], *names: str) -> List[str]:
             return _as_list(params[n])
     return []
 
-def _table_exists(conn, table: str) -> bool:
-    if not table:
-        return False
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema='public' AND table_name=%s
-            LIMIT 1
-            """,
-            (table,),
-        )
-        return cur.fetchone() is not None
-
-def _col_exists(conn, table: str, col: str) -> bool:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema='public'
-              AND table_name=%s
-              AND column_name=%s
-            LIMIT 1
-            """,
-            (table, col),
-        )
-        return cur.fetchone() is not None
-
-def _fts_available(conn) -> bool:
-    return _col_exists(conn, "items", "fts")
-
-def _ts_lang(conn) -> str:
-    return "spanish"
-
-# ---- Inflado gzip+base64 seguro -----------------------------------------
-
 def _inflate_b64_gzip_maybe(val: Any) -> Any:
     if not isinstance(val, str) or len(val) < 8:
         return val
@@ -128,13 +91,65 @@ def _parse_json_maybe(text: Optional[str]) -> Any:
             return text
     return text
 
-# ---- Reactions helpers (1 tabla por item y user) -------------------------
+def _ts_lang() -> str:
+    return "spanish"
 
-def _reactions_table_exists(conn) -> bool:
-    return _table_exists(conn, "item_reactions")
+
+# ============================ Schema cache por conexión ============================
+
+def _load_schema_cache(conn) -> Dict[str, Any]:
+    """
+    Evita decenas de consultas a information_schema por request.
+    Cacheamos: tablas public + columnas por tabla.
+    """
+    cache = getattr(conn, "_boe_schema_cache", None)
+    if cache:
+        return cache
+
+    tables: set[str] = set()
+    columns_by_table: Dict[str, set[str]] = {}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema='public'
+            """
+        )
+        for (t,) in cur.fetchall():
+            tables.add(t)
+
+        cur.execute(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema='public'
+            """
+        )
+        for t, c in cur.fetchall():
+            columns_by_table.setdefault(t, set()).add(c)
+
+    cache = {"tables": tables, "columns_by_table": columns_by_table}
+    setattr(conn, "_boe_schema_cache", cache)
+    return cache
+
+def _table_exists_cached(schema: Dict[str, Any], table: str) -> bool:
+    return table in schema["tables"]
+
+def _col_exists_cached(schema: Dict[str, Any], table: str, col: str) -> bool:
+    return col in schema["columns_by_table"].get(table, set())
+
+def _fts_available(schema: Dict[str, Any]) -> bool:
+    return _col_exists_cached(schema, "items", "fts")
+
+
+# ====================== Reactions helpers ======================
+
+def _reactions_table_exists(schema: Dict[str, Any]) -> bool:
+    return _table_exists_cached(schema, "item_reactions")
 
 def _reactions_agg_join_sql() -> sql.SQL:
-    # Agregamos por item_id
     return sql.SQL(
         """
         LEFT JOIN (
@@ -148,21 +163,11 @@ def _reactions_agg_join_sql() -> sql.SQL:
         """
     )
 
-def _my_reaction_scalar_sql() -> sql.SQL:
-    # my_reaction (por usuario) en detalle
-    return sql.SQL(
-        """
-        (
-          SELECT COALESCE(MAX(reaction), 0)::int
-          FROM item_reactions
-          WHERE item_id = i.identificador AND user_id = %s
-        ) AS my_reaction
-        """
-    )
-
 # ====================== Búsqueda / listado ======================
 
 def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
+    t0 = time.time()
+
     # paginación
     try:
         page = max(int(params.get("page", 1)), 1)
@@ -171,15 +176,16 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
 
     try:
         limit = int(params.get("limit", 12))
-        if limit < 1:  limit = 1
-        if limit > 100: limit = 100
+        if limit < 1:
+            limit = 1
+        if limit > 100:
+            limit = 100
     except Exception:
         limit = 12
 
     # ordenación
     sort_by = (params.get("sort_by", "created_at") or "").lower()
     sort_dir = (params.get("sort_dir", "desc") or "").lower()
-    # Nota: likes/dislikes ahora pueden venir de reactions; mantenemos keys para FE
     if sort_by not in {"created_at", "titulo", "id", "likes", "dislikes", "relevancia"}:
         sort_by = "created_at"
     if sort_dir not in {"asc", "desc"}:
@@ -199,30 +205,31 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
     control_val = _norm(params.get("control"))
 
     with get_db() as conn:
-        # columnas
-        has_titulo_resumen   = _col_exists(conn, "items", "titulo_resumen")
-        has_titulo_corto     = _col_exists(conn, "items", "titulo_corto")
-        has_titulo_completo  = _col_exists(conn, "items", "titulo_completo")
-        has_created_at       = _col_exists(conn, "items", "created_at")
-        has_created_at_date  = _col_exists(conn, "items", "created_at_date")
-        has_fecha_public     = _col_exists(conn, "items", "fecha_publicacion")
-        has_control          = _col_exists(conn, "items", "control")
-        has_contenido        = _col_exists(conn, "items", "contenido")
-        has_resumen          = _col_exists(conn, "items", "resumen")
-        has_titulo           = _col_exists(conn, "items", "titulo")
-        has_likes_legacy     = _col_exists(conn, "items", "likes")
-        has_dislikes_legacy  = _col_exists(conn, "items", "dislikes")
-        has_informe_imp      = _col_exists(conn, "items", "informe_impacto")
-        has_impacto          = _col_exists(conn, "items", "impacto")
-        has_id               = _col_exists(conn, "items", "id")
+        schema = _load_schema_cache(conn)
 
-        use_reactions = _reactions_table_exists(conn)
+        has_titulo_resumen   = _col_exists_cached(schema, "items", "titulo_resumen")
+        has_titulo_corto     = _col_exists_cached(schema, "items", "titulo_corto")
+        has_titulo_completo  = _col_exists_cached(schema, "items", "titulo_completo")
+        has_created_at       = _col_exists_cached(schema, "items", "created_at")
+        has_created_at_date  = _col_exists_cached(schema, "items", "created_at_date")
+        has_fecha_public     = _col_exists_cached(schema, "items", "fecha_publicacion")
+        has_control          = _col_exists_cached(schema, "items", "control")
+        has_contenido        = _col_exists_cached(schema, "items", "contenido")
+        has_resumen          = _col_exists_cached(schema, "items", "resumen")
+        has_titulo           = _col_exists_cached(schema, "items", "titulo")
+        has_likes_legacy     = _col_exists_cached(schema, "items", "likes")
+        has_dislikes_legacy  = _col_exists_cached(schema, "items", "dislikes")
+        has_informe_imp      = _col_exists_cached(schema, "items", "informe_impacto")
+        has_impacto          = _col_exists_cached(schema, "items", "impacto")
+        has_id               = _col_exists_cached(schema, "items", "id")
+
+        use_reactions = _reactions_table_exists(schema)
 
         # WHERE
         where_sql_parts: List[sql.SQL] = []
         args: List[Any] = []
 
-        # Expresión de fecha coherente
+        # fecha coherente
         if has_created_at:
             date_expr = sql.SQL("DATE(i.created_at)")
             created_expr = sql.SQL("i.created_at AS created_at")
@@ -270,9 +277,9 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         # texto
         _use_fts_rank = False
         if q_adv and len(q_adv) >= 2:
-            if _fts_available(conn):
+            if _fts_available(schema):
                 where_sql_parts.append(sql.SQL("i.fts @@ plainto_tsquery(%s, %s)"))
-                args.extend([_ts_lang(conn), q_adv])
+                args.extend([_ts_lang(), q_adv])
                 _use_fts_rank = True
             else:
                 like_val = f"%{q_adv}%"
@@ -290,10 +297,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
                 if has_contenido:
                     text_clauses.append(sql.SQL("i.contenido ILIKE %s")); args.append(like_val)
                 if has_informe_imp or has_impacto:
-                    text_clauses.append(sql.SQL(
-                        "CAST(i.informe_impacto AS TEXT) ILIKE %s" if has_informe_imp else
-                        "CAST(i.impacto AS TEXT) ILIKE %s"
-                    ))
+                    text_clauses.append(
+                        sql.SQL("CAST(i.informe_impacto AS TEXT) ILIKE %s") if has_informe_imp
+                        else sql.SQL("CAST(i.impacto AS TEXT) ILIKE %s")
+                    )
                     args.append(like_val)
                 if text_clauses:
                     where_sql_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(text_clauses) + sql.SQL(")"))
@@ -327,15 +334,17 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
 
         joins: List[sql.SQL] = []
 
-        # Lookups nombres
+        # Lookups nombres (si existen tablas)
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
-            if _table_exists(conn, t):
-                dep_table = t; break
+            if _table_exists_cached(schema, t):
+                dep_table = t
+                break
         sec_table = None
         for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
-            if _table_exists(conn, t):
-                sec_table = t; break
+            if _table_exists_cached(schema, t):
+                sec_table = t
+                break
 
         if dep_table:
             select_cols.append(sql.SQL("d.nombre AS departamento_nombre"))
@@ -362,16 +371,16 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         order_params: List[Any] = []
         if sort_by == "relevancia" and _use_fts_rank:
             order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s)) ")
-            order_params = [_ts_lang(conn), q_adv]
+            order_params = [_ts_lang(), q_adv]
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
             order_clause = order_by_sql + sort_dir_sql
         else:
             if sort_by == "created_at":
                 sort_by_sql = created_order_col
             elif sort_by == "likes":
-                sort_by_sql = sql.SQL("likes")  # alias en SELECT
+                sort_by_sql = sql.SQL("likes")
             elif sort_by == "dislikes":
-                sort_by_sql = sql.SQL("dislikes")  # alias en SELECT
+                sort_by_sql = sql.SQL("dislikes")
             else:
                 cand = sql.SQL(f"i.{sort_by}")
                 if (sort_by == "id" and not has_id) or (sort_by == "titulo" and not has_titulo):
@@ -400,10 +409,20 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         offset = (page - 1) * limit
 
         with conn.cursor() as cur:
+            t_count = time.time()
             cur.execute(count_sql, args)
             total = cur.fetchone()[0]
+            t_count_ms = int((time.time() - t_count) * 1000)
+
+            t_sel = time.time()
             cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
+            t_sel_ms = int((time.time() - t_sel) * 1000)
+
+    total_ms = int((time.time() - t0) * 1000)
+    # Esto lo verás en Railway logs
+    # (si prefieres menos ruido, lo bajamos a debug)
+    print(f"[items_svc.search_items] ms_total={total_ms} ms_count={t_count_ms} ms_select={t_sel_ms} total={total} page={page} limit={limit}")
 
     return {
         "items": data,
@@ -425,107 +444,119 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
     if not identificador:
         return None
 
-    with get_db() as conn, conn.cursor() as cur:
-        base_cols = [
-            "identificador",
-            "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
-            "contenido", "resumen",
-            "departamento_codigo", "seccion_codigo", "epigrafe",
-        ]
-        def _col_exists_inner(c): return _col_exists(conn, "items", c)
-        existing_cols = [c for c in base_cols if _col_exists_inner(c)]
+    with get_db() as conn:
+        schema = _load_schema_cache(conn)
 
-        impacto_expr = None
-        if _col_exists_inner("informe_impacto"):
-            impacto_expr = "i.informe_impacto AS impacto"
-        elif _col_exists_inner("impacto"):
-            impacto_expr = "i.impacto AS impacto"
+        def _col(c: str) -> bool:
+            return _col_exists_cached(schema, "items", c)
 
-        url_pdf_expr = None
-        for cand in ("url_pdf", "pdf_url", "pdf", "urlPdf"):
-            if _col_exists_inner(cand):
-                url_pdf_expr = f"i.{cand} AS url_pdf"; break
+        with conn.cursor() as cur:
+            base_cols = [
+                "identificador",
+                "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
+                "contenido", "resumen",
+                "departamento_codigo", "seccion_codigo", "epigrafe",
+            ]
+            existing_cols = [c for c in base_cols if _col(c)]
 
-        source_url_expr = None
-        for cand in ("sourceUrl", "url_boe"):
-            if _col_exists_inner(cand):
-                source_url_expr = f"i.{cand} AS sourceUrl"; break
+            impacto_expr = None
+            if _col("informe_impacto"):
+                impacto_expr = "i.informe_impacto AS impacto"
+            elif _col("impacto"):
+                impacto_expr = "i.impacto AS impacto"
 
-        fecha_pub_expr = "i.fecha_publicacion AS fecha_publicacion" if _col_exists_inner("fecha_publicacion") else "NULL AS fecha_publicacion"
+            url_pdf_expr = None
+            for cand in ("url_pdf", "pdf_url", "pdf", "urlPdf"):
+                if _col(cand):
+                    url_pdf_expr = f"i.{cand} AS url_pdf"
+                    break
 
-        use_reactions = _reactions_table_exists(conn)
-        has_likes_legacy = _col_exists_inner("likes")
-        has_dislikes_legacy = _col_exists_inner("dislikes")
+            source_url_expr = None
+            for cand in ("sourceUrl", "url_boe"):
+                if _col(cand):
+                    source_url_expr = f"i.{cand} AS sourceUrl"
+                    break
 
-        sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
-        sel_parts.append(fecha_pub_expr)
-        if impacto_expr:    sel_parts.append(impacto_expr)
-        if url_pdf_expr:    sel_parts.append(url_pdf_expr)
-        if source_url_expr: sel_parts.append(source_url_expr)
+            fecha_pub_expr = "i.fecha_publicacion AS fecha_publicacion" if _col("fecha_publicacion") else "NULL AS fecha_publicacion"
 
-        # Nombres lookups
-        dep_table = None
-        for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
-            if _table_exists(conn, t):
-                dep_table = t; break
-        sec_table = None
-        for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
-            if _table_exists(conn, t):
-                sec_table = t; break
+            use_reactions = _reactions_table_exists(schema)
+            has_likes_legacy = _col("likes")
+            has_dislikes_legacy = _col("dislikes")
 
-        if dep_table: sel_parts.append("d.nombre AS departamento_nombre")
-        else:         sel_parts.append("NULL AS departamento_nombre")
-        if sec_table: sel_parts.append("s.nombre AS seccion_nombre")
-        else:         sel_parts.append("NULL AS seccion_nombre")
+            sel_parts: List[str] = [f"i.{c}" for c in existing_cols]
+            sel_parts.append(fecha_pub_expr)
+            if impacto_expr:    sel_parts.append(impacto_expr)
+            if url_pdf_expr:    sel_parts.append(url_pdf_expr)
+            if source_url_expr: sel_parts.append(source_url_expr)
 
-        # Likes/dislikes + my_reaction (si reactions existe)
-        params: List[Any] = [identificador]
-        joins_sql: List[str] = []
+            dep_table = None
+            for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
+                if _table_exists_cached(schema, t):
+                    dep_table = t
+                    break
+            sec_table = None
+            for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
+                if _table_exists_cached(schema, t):
+                    sec_table = t
+                    break
 
-        if dep_table:
-            joins_sql.append(f'LEFT JOIN {dep_table} d ON d.codigo = i.departamento_codigo')
-        if sec_table:
-            joins_sql.append(f'LEFT JOIN {sec_table} s ON s.codigo = i.seccion_codigo')
-
-        if use_reactions:
-            joins_sql.append(
-                """
-                LEFT JOIN (
-                  SELECT
-                    item_id,
-                    COALESCE(SUM(CASE WHEN reaction = 1 THEN 1 ELSE 0 END), 0)::int  AS likes_calc,
-                    COALESCE(SUM(CASE WHEN reaction = -1 THEN 1 ELSE 0 END), 0)::int AS dislikes_calc
-                  FROM item_reactions
-                  GROUP BY item_id
-                ) r ON r.item_id = i.identificador
-                """
-            )
-            sel_parts.append("COALESCE(r.likes_calc, 0) AS likes")
-            sel_parts.append("COALESCE(r.dislikes_calc, 0) AS dislikes")
-            if user_id:
-                sel_parts.append(
-                    "(SELECT COALESCE(MAX(reaction),0)::int FROM item_reactions WHERE item_id=i.identificador AND user_id=%s) AS my_reaction"
-                )
-                params.append(user_id)
+            if dep_table:
+                sel_parts.append("d.nombre AS departamento_nombre")
             else:
+                sel_parts.append("NULL AS departamento_nombre")
+            if sec_table:
+                sel_parts.append("s.nombre AS seccion_nombre")
+            else:
+                sel_parts.append("NULL AS seccion_nombre")
+
+            params2: List[Any] = [identificador]
+            joins_sql: List[str] = []
+
+            if dep_table:
+                joins_sql.append(f"LEFT JOIN {dep_table} d ON d.codigo = i.departamento_codigo")
+            if sec_table:
+                joins_sql.append(f"LEFT JOIN {sec_table} s ON s.codigo = i.seccion_codigo")
+
+            if use_reactions:
+                joins_sql.append(
+                    """
+                    LEFT JOIN (
+                      SELECT
+                        item_id,
+                        COALESCE(SUM(CASE WHEN reaction = 1 THEN 1 ELSE 0 END), 0)::int  AS likes_calc,
+                        COALESCE(SUM(CASE WHEN reaction = -1 THEN 1 ELSE 0 END), 0)::int AS dislikes_calc
+                      FROM item_reactions
+                      GROUP BY item_id
+                    ) r ON r.item_id = i.identificador
+                    """
+                )
+                sel_parts.append("COALESCE(r.likes_calc, 0) AS likes")
+                sel_parts.append("COALESCE(r.dislikes_calc, 0) AS dislikes")
+                if user_id:
+                    sel_parts.append(
+                        "(SELECT COALESCE(MAX(reaction),0)::int FROM item_reactions WHERE item_id=i.identificador AND user_id=%s) AS my_reaction"
+                    )
+                    params2.append(user_id)
+                else:
+                    sel_parts.append("0 AS my_reaction")
+            else:
+                sel_parts.append("COALESCE(i.likes,0) AS likes" if has_likes_legacy else "0 AS likes")
+                sel_parts.append("COALESCE(i.dislikes,0) AS dislikes" if has_dislikes_legacy else "0 AS dislikes")
                 sel_parts.append("0 AS my_reaction")
-        else:
-            sel_parts.append("COALESCE(i.likes,0) AS likes" if has_likes_legacy else "0 AS likes")
-            sel_parts.append("COALESCE(i.dislikes,0) AS dislikes" if has_dislikes_legacy else "0 AS dislikes")
-            sel_parts.append("0 AS my_reaction")
 
-        sel = ", ".join(sel_parts) or "i.identificador"
-        joins = " ".join(joins_sql)
+            sel = ", ".join(sel_parts) or "i.identificador"
+            joins = " ".join(joins_sql)
 
-        cur.execute(
-            f"SELECT {sel} FROM items i {joins} WHERE i.identificador = %s LIMIT 1",
-            tuple(params),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        names = [desc.name for desc in cur.description]
-        data = dict(zip(names, row))
+            cur.execute(
+                f"SELECT {sel} FROM items i {joins} WHERE i.identificador = %s LIMIT 1",
+                tuple(params2),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            names = [desc.name for desc in cur.description]
+            data = dict(zip(names, row))
 
     # Inflados / normalizaciones
     for k in (
@@ -543,10 +574,8 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
 
     if "impacto" in data and data["impacto"] is not None:
         imp_text = _inflate_b64_gzip_maybe(data["impacto"])
-        parsed = _parse_json_maybe(imp_text)
-        data["impacto"] = parsed
+        data["impacto"] = _parse_json_maybe(imp_text)
 
-    # Normaliza my_reaction a int seguro
     try:
         data["my_reaction"] = int(data.get("my_reaction") or 0)
     except Exception:
@@ -555,28 +584,32 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
     return data
 
 def get_item_resumen(identificador: str) -> Dict[str, Any]:
-    with get_db() as conn, conn.cursor() as cur:
-        if not _col_exists(conn, "items", "resumen"):
+    with get_db() as conn:
+        schema = _load_schema_cache(conn)
+        if not _col_exists_cached(schema, "items", "resumen"):
             return {"identificador": identificador, "resumen": None}
-        cur.execute("SELECT resumen FROM items WHERE identificador = %s LIMIT 1", (identificador,))
-        row = cur.fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT resumen FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+            row = cur.fetchone()
     raw = row[0] if row else None
     inflated = _inflate_b64_gzip_maybe(raw)
     text = (inflated or "").strip()
     return {"identificador": identificador, "resumen": text if text != "" else None}
 
 def get_item_impacto(identificador: str) -> Dict[str, Any]:
-    with get_db() as conn, conn.cursor() as cur:
+    with get_db() as conn:
+        schema = _load_schema_cache(conn)
         col = None
-        if _col_exists(conn, "items", "informe_impacto"):
+        if _col_exists_cached(schema, "items", "informe_impacto"):
             col = "informe_impacto"
-        elif _col_exists(conn, "items", "impacto"):
+        elif _col_exists_cached(schema, "items", "impacto"):
             col = "impacto"
         else:
             return {"identificador": identificador, "impacto": None}
 
-        cur.execute(f"SELECT {col} FROM items WHERE identificador = %s LIMIT 1", (identificador,))
-        row = cur.fetchone()
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {col} FROM items WHERE identificador = %s LIMIT 1", (identificador,))
+            row = cur.fetchone()
 
     raw = row[0] if row else None
     inflated = _inflate_b64_gzip_maybe(raw)
@@ -585,8 +618,6 @@ def get_item_impacto(identificador: str) -> Dict[str, Any]:
         parsed = None
     return {"identificador": identificador, "impacto": parsed}
 
-# Importante: like_item/dislike_item legacy quedan como compatibilidad,
-# pero a partir de ahora el blueprint debe usar reactions_svc.set_reaction
 def like_item(identificador: str) -> Dict[str, Any]:
     return {"identificador": identificador, "detail": "Use reactions_svc via blueprint", "ok": False}
 
@@ -608,8 +639,10 @@ def list_epigrafes() -> List[str]:
         WHERE TRIM(COALESCE(epigrafe,'')) <> ''
         ORDER BY epigrafe
     """
-    with get_db() as conn, conn.cursor() as cur:
-        if not _col_exists(conn, "items", "epigrafe"):
+    with get_db() as conn:
+        schema = _load_schema_cache(conn)
+        if not _col_exists_cached(schema, "items", "epigrafe"):
             return []
-        cur.execute(sql_text)
-        return [r[0] for r in cur.fetchall()]
+        with conn.cursor() as cur:
+            cur.execute(sql_text)
+            return [r[0] for r in cur.fetchall()]

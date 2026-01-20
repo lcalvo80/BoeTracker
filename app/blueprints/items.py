@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
+
 from flask import Blueprint, jsonify, request, current_app, make_response, g
 
-from app.auth import require_auth, require_active_subscription
+from app.auth import require_auth
 from app.services import items_svc
 from app.services.reactions_svc import set_reaction
 
@@ -14,8 +16,10 @@ bp = Blueprint("items", __name__)
 def _safe_int(v, d, mi=1, ma=100):
     try:
         n = int(v)
-        if n < mi: n = mi
-        if n > ma: n = ma
+        if n < mi:
+            n = mi
+        if n > ma:
+            n = ma
         return n
     except Exception:
         return d
@@ -26,8 +30,10 @@ def _safe_bool(v, default=None):
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:  return True
-    if s in {"0", "false", "f", "no", "n", "off"}: return False
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
     return default
 
 def _safe_date(v, default=None):
@@ -119,18 +125,22 @@ def _parse_query_args(args):
         data["fecha_hasta"] = fecha_exacta
         data.pop("fecha", None)
     else:
-        if fecha_desde: data["fecha_desde"] = fecha_desde
-        else:           data.pop("fecha_desde", None)
-        if fecha_hasta: data["fecha_hasta"] = fecha_hasta
-        else:           data.pop("fecha_hasta", None)
+        if fecha_desde:
+            data["fecha_desde"] = fecha_desde
+        else:
+            data.pop("fecha_desde", None)
+        if fecha_hasta:
+            data["fecha_hasta"] = fecha_hasta
+        else:
+            data.pop("fecha_hasta", None)
         data.pop("fecha", None)
 
-    data["page"]  = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
+    data["page"] = _safe_int(data.get("page", 1), 1, 1, 1_000_000)
     data["limit"] = _safe_int(data.get("limit", 12), 12, 1, 100)
 
-    raw_sort_by  = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
+    raw_sort_by = str(data.get("sort_by", "created_at") or "created_at").strip().lower()
     raw_sort_dir = str(data.get("sort_dir", "desc") or "desc").strip().lower()
-    data["sort_by"]  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
+    data["sort_by"] = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
     data["sort_dir"] = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
     return data
 
@@ -149,10 +159,14 @@ def _allow_options():
 
 @bp.get("")
 @require_auth
-@require_active_subscription
 def list_items():
+    t0 = time.time()
     try:
         parsed = _parse_query_args(request.args)
+
+        # Si quieres pasar user_id a la búsqueda (para futuros favoritos, etc.)
+        # user_id = getattr(g, "user_id", None)
+        # result = items_svc.search_items(parsed, user_id=user_id)
         result = items_svc.search_items(parsed)
 
         if isinstance(result, dict):
@@ -160,44 +174,21 @@ def list_items():
             limit = result.get("limit", parsed.get("limit", 12)) or 12
             pages = result.get("pages")
             if pages is None and limit:
-                pages = (total + limit - 1) // limit
-                result["pages"] = pages
-
-        if request.headers.get("X-Debug-Filters") == "1" and current_app.config.get("DEBUG_FILTERS_ENABLED", False):
-            debug = {
-                "_debug": True,
-                "raw_query": request.query_string.decode("utf-8", errors="ignore"),
-                "parsed_filters": parsed,
-            }
-            if isinstance(result, dict):
-                result = {**result, **debug}
-            else:
-                result = {"data": result, **debug}
+                result["pages"] = (total + limit - 1) // limit
 
         return jsonify(result), 200
 
     except Exception:
         current_app.logger.exception("items list failed")
-        page  = _safe_int(request.args.get("page", 1), 1, 1, 1_000_000)
-        limit = _safe_int(request.args.get("limit", 12), 12, 1, 100)
-        raw_sort_by  = (request.args.get("sort_by") or "created_at").strip().lower()
-        raw_sort_dir = (request.args.get("sort_dir") or "desc").strip().lower()
-        sort_by  = ALLOWED_SORT_BY.get(raw_sort_by, "created_at")
-        sort_dir = raw_sort_dir if raw_sort_dir in ALLOWED_SORT_DIR else "desc"
-
-        return jsonify({
-            "items": [],
-            "page": page,
-            "limit": limit,
-            "total": 0,
-            "pages": 0,
-            "sort_by": sort_by,
-            "sort_dir": sort_dir,
-        }), 200
+        # IMPORTANTE: NO devolvemos vacío silencioso sin saber qué pasa.
+        # Devolvemos 500 controlado para que lo veas en FE/DevTools.
+        return jsonify({"ok": False, "error": "items_list_failed"}), 500
+    finally:
+        dt = int((time.time() - t0) * 1000)
+        current_app.logger.info("GET /api/items ms=%s", dt)
 
 @bp.get("/<identificador>")
 @require_auth
-@require_active_subscription
 def get_item(identificador):
     data = items_svc.get_item_by_id(identificador)
     if not data:
@@ -206,19 +197,16 @@ def get_item(identificador):
 
 @bp.get("/<identificador>/resumen")
 @require_auth
-@require_active_subscription
 def get_resumen(identificador):
     return jsonify(items_svc.get_item_resumen(identificador)), 200
 
 @bp.get("/<identificador>/impacto")
 @require_auth
-@require_active_subscription
 def get_impacto(identificador):
     return jsonify(items_svc.get_item_impacto(identificador)), 200
 
 @bp.post("/<identificador>/like")
 @require_auth
-@require_active_subscription
 def like(identificador):
     user_id = getattr(g, "user_id", None)
     if not user_id:
@@ -234,7 +222,6 @@ def like(identificador):
 
 @bp.post("/<identificador>/dislike")
 @require_auth
-@require_active_subscription
 def dislike(identificador):
     user_id = getattr(g, "user_id", None)
     if not user_id:
@@ -250,7 +237,6 @@ def dislike(identificador):
 
 @bp.get("/departamentos")
 @require_auth
-@require_active_subscription
 def departamentos():
     try:
         data = items_svc.list_departamentos()
@@ -261,7 +247,6 @@ def departamentos():
 
 @bp.get("/secciones")
 @require_auth
-@require_active_subscription
 def secciones():
     try:
         data = items_svc.list_secciones()
@@ -272,7 +257,6 @@ def secciones():
 
 @bp.get("/epigrafes")
 @require_auth
-@require_active_subscription
 def epigrafes():
     try:
         data = items_svc.list_epigrafes()
@@ -283,7 +267,6 @@ def epigrafes():
 
 @bp.get("/_debug/echo")
 @require_auth
-@require_active_subscription
 def echo():
     if not current_app.config.get("DEBUG_FILTERS_ENABLED", False):
         return jsonify({"detail": "Debug endpoint disabled"}), 404
