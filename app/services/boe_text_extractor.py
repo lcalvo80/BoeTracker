@@ -179,6 +179,14 @@ def _download_pdf_streaming(
                     url_pdf,
                     resp.status_code,
                 )
+                _LOG.warning(
+                     "boe_text_extractor.py LOADED | connect=%.1fs read=%.1fs budget=%.1fs retries_total=%s host_fallback=%s",
+                     _PDF_CONNECT_TIMEOUT,
+                     _PDF_READ_TIMEOUT,
+                     _PDF_TOTAL_BUDGET_SECS,
+                     _PDF_RETRIES_TOTAL,
+                     _ENABLE_HOST_FALLBACK,
+                     )
                 return None
 
             # Leemos un pequeño prefijo para validar PDF/ctype
