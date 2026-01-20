@@ -94,17 +94,22 @@ def _parse_json_maybe(text: Optional[str]) -> Any:
 def _ts_lang() -> str:
     return "spanish"
 
+# ============================ Schema cache (proceso) ============================
 
-# ============================ Schema cache por conexión ============================
+_SCHEMA_CACHE: Optional[Dict[str, Any]] = None
+_SCHEMA_CACHE_TS: float = 0.0
+_SCHEMA_CACHE_TTL_S: int = 300  # 5 min (ajustable)
 
 def _load_schema_cache(conn) -> Dict[str, Any]:
     """
+    Cache de tablas/columnas en memoria (por proceso) con TTL.
     Evita decenas de consultas a information_schema por request.
-    Cacheamos: tablas public + columnas por tabla.
     """
-    cache = getattr(conn, "_boe_schema_cache", None)
-    if cache:
-        return cache
+    global _SCHEMA_CACHE, _SCHEMA_CACHE_TS
+
+    now = time.time()
+    if _SCHEMA_CACHE and (now - _SCHEMA_CACHE_TS) < _SCHEMA_CACHE_TTL_S:
+        return _SCHEMA_CACHE
 
     tables: set[str] = set()
     columns_by_table: Dict[str, set[str]] = {}
@@ -130,9 +135,9 @@ def _load_schema_cache(conn) -> Dict[str, Any]:
         for t, c in cur.fetchall():
             columns_by_table.setdefault(t, set()).add(c)
 
-    cache = {"tables": tables, "columns_by_table": columns_by_table}
-    setattr(conn, "_boe_schema_cache", cache)
-    return cache
+    _SCHEMA_CACHE = {"tables": tables, "columns_by_table": columns_by_table}
+    _SCHEMA_CACHE_TS = now
+    return _SCHEMA_CACHE
 
 def _table_exists_cached(schema: Dict[str, Any], table: str) -> bool:
     return table in schema["tables"]
@@ -142,7 +147,6 @@ def _col_exists_cached(schema: Dict[str, Any], table: str, col: str) -> bool:
 
 def _fts_available(schema: Dict[str, Any]) -> bool:
     return _col_exists_cached(schema, "items", "fts")
-
 
 # ====================== Reactions helpers ======================
 
@@ -334,7 +338,7 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
 
         joins: List[sql.SQL] = []
 
-        # Lookups nombres (si existen tablas)
+        # Lookups nombres
         dep_table = None
         for t in ("departamentos", "lookup_departamentos", "cat_departamentos", "dim_departamentos", "departamentos_lookup"):
             if _table_exists_cached(schema, t):
@@ -358,7 +362,6 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         else:
             select_cols.append(sql.SQL("NULL AS seccion_nombre"))
 
-        # Reactions (preferente) vs legacy columns
         if use_reactions:
             joins.append(_reactions_agg_join_sql())
             select_cols.append(sql.SQL("COALESCE(r.likes_calc, 0) AS likes"))
@@ -412,17 +415,16 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             t_count = time.time()
             cur.execute(count_sql, args)
             total = cur.fetchone()[0]
-            t_count_ms = int((time.time() - t_count) * 1000)
+            ms_count = int((time.time() - t_count) * 1000)
 
             t_sel = time.time()
             cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
-            t_sel_ms = int((time.time() - t_sel) * 1000)
+            ms_sel = int((time.time() - t_sel) * 1000)
 
-    total_ms = int((time.time() - t0) * 1000)
-    # Esto lo verás en Railway logs
-    # (si prefieres menos ruido, lo bajamos a debug)
-    print(f"[items_svc.search_items] ms_total={total_ms} ms_count={t_count_ms} ms_select={t_sel_ms} total={total} page={page} limit={limit}")
+    ms_total = int((time.time() - t0) * 1000)
+    # Mejor que print: en WSGI normalmente sale a logs igual, pero puedes cambiarlo a logger si lo prefieres.
+    print(f"[items_svc.search_items] ms_total={ms_total} ms_count={ms_count} ms_select={ms_sel} total={total} page={page} limit={limit}")
 
     return {
         "items": data,
@@ -504,6 +506,7 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
                 sel_parts.append("d.nombre AS departamento_nombre")
             else:
                 sel_parts.append("NULL AS departamento_nombre")
+
             if sec_table:
                 sel_parts.append("s.nombre AS seccion_nombre")
             else:
@@ -558,7 +561,6 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
             names = [desc.name for desc in cur.description]
             data = dict(zip(names, row))
 
-    # Inflados / normalizaciones
     for k in (
         "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
         "contenido", "resumen", "impacto",
