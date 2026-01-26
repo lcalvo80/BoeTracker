@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-import base64, gzip, json, time
+import base64
+import gzip
+import json
+import time
 
 from psycopg2 import sql
-from app.services.postgres import get_db
 
+from app.services.postgres import get_db
 from app.services.lookup import (
     list_departamentos_lookup,
     list_secciones_lookup,
@@ -23,6 +26,7 @@ def _norm(s: Optional[str]) -> Optional[str]:
         return None
     return s
 
+
 def _to_date(s: Optional[str]):
     if not s:
         return None
@@ -33,15 +37,18 @@ def _to_date(s: Optional[str]):
             pass
     return None
 
+
 def _rows(cur) -> List[Dict[str, Any]]:
     cols = [c.name for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
 
 def _split_csv(s: Optional[str]) -> List[str]:
     if not s:
         return []
     parts = [p.strip() for p in s.split(",")]
     return [p for p in parts if p]
+
 
 def _as_list(val: Any) -> List[str]:
     if val is None:
@@ -59,11 +66,13 @@ def _as_list(val: Any) -> List[str]:
         return out
     return []
 
+
 def _list_param(params: Dict[str, Any], *names: str) -> List[str]:
     for n in names:
         if n in params and params[n] is not None:
             return _as_list(params[n])
     return []
+
 
 def _inflate_b64_gzip_maybe(val: Any) -> Any:
     if not isinstance(val, str) or len(val) < 8:
@@ -78,6 +87,7 @@ def _inflate_b64_gzip_maybe(val: Any) -> Any:
     except Exception:
         return val
 
+
 def _parse_json_maybe(text: Optional[str]) -> Any:
     if not isinstance(text, str):
         return text
@@ -91,14 +101,17 @@ def _parse_json_maybe(text: Optional[str]) -> Any:
             return text
     return text
 
+
 def _ts_lang() -> str:
     return "spanish"
+
 
 # ============================ Schema cache (proceso) ============================
 
 _SCHEMA_CACHE: Optional[Dict[str, Any]] = None
 _SCHEMA_CACHE_TS: float = 0.0
 _SCHEMA_CACHE_TTL_S: int = 300  # 5 min (ajustable)
+
 
 def _load_schema_cache(conn) -> Dict[str, Any]:
     """
@@ -139,19 +152,24 @@ def _load_schema_cache(conn) -> Dict[str, Any]:
     _SCHEMA_CACHE_TS = now
     return _SCHEMA_CACHE
 
+
 def _table_exists_cached(schema: Dict[str, Any], table: str) -> bool:
     return table in schema["tables"]
+
 
 def _col_exists_cached(schema: Dict[str, Any], table: str, col: str) -> bool:
     return col in schema["columns_by_table"].get(table, set())
 
+
 def _fts_available(schema: Dict[str, Any]) -> bool:
     return _col_exists_cached(schema, "items", "fts")
+
 
 # ====================== Reactions helpers ======================
 
 def _reactions_table_exists(schema: Dict[str, Any]) -> bool:
     return _table_exists_cached(schema, "item_reactions")
+
 
 def _reactions_agg_join_sql() -> sql.SQL:
     return sql.SQL(
@@ -166,6 +184,7 @@ def _reactions_agg_join_sql() -> sql.SQL:
         ) r ON r.item_id = i.identificador
         """
     )
+
 
 # ====================== Categorías (Fase 4) ======================
 
@@ -243,6 +262,7 @@ def get_category_filters() -> Dict[str, Any]:
         "categorias_n2_por_n1": categories_l2_by_l1,
     }
 
+
 # ====================== Búsqueda / listado ======================
 
 def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
@@ -313,36 +333,48 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
 
         use_reactions = _reactions_table_exists(schema)
 
-        # WHERE
-        where_sql_parts: List[sql.SQL] = []
-        args: List[Any] = []
-
-        # fecha coherente
+        # ====================== Fecha canónica ======================
+        # - Para filtros: COALESCE(fecha_publicacion, DATE(created_at/created_at_date))
+        # - Para orden default: COALESCE(fecha_publicacion::timestamp, created_at/created_at_date)
+        created_ts_expr: Optional[sql.SQL] = None
         if has_created_at:
-            date_expr = sql.SQL("DATE(i.created_at)")
-            created_expr = sql.SQL("i.created_at AS created_at")
-            created_order_col = sql.SQL("i.created_at")
+            created_ts_expr = sql.SQL("i.created_at")
         elif has_created_at_date:
-            date_expr = sql.SQL("DATE(i.created_at_date)")
-            created_expr = sql.SQL("i.created_at_date AS created_at")
-            created_order_col = sql.SQL("i.created_at_date")
+            created_ts_expr = sql.SQL("i.created_at_date")
+
+        if has_fecha_public and created_ts_expr is not None:
+            date_expr = sql.SQL("COALESCE(i.fecha_publicacion, DATE({}))").format(created_ts_expr)
+            created_order_col = sql.SQL("COALESCE(i.fecha_publicacion::timestamp, {})").format(created_ts_expr)
+            created_expr = sql.SQL("{} AS created_at").format(created_ts_expr)  # mantenemos created_at real si existe
         elif has_fecha_public:
             date_expr = sql.SQL("DATE(i.fecha_publicacion)")
-            created_expr = sql.SQL("i.fecha_publicacion AS created_at")
             created_order_col = sql.SQL("i.fecha_publicacion")
+            created_expr = sql.SQL("i.fecha_publicacion AS created_at")
+        elif created_ts_expr is not None:
+            date_expr = sql.SQL("DATE({})").format(created_ts_expr)
+            created_order_col = created_ts_expr
+            created_expr = sql.SQL("{} AS created_at").format(created_ts_expr)
         else:
             date_expr = None
             created_expr = sql.SQL("NULL AS created_at")
             created_order_col = sql.SQL("i.id") if has_id else sql.SQL("i.identificador")
 
+        # WHERE
+        where_sql_parts: List[sql.SQL] = []
+        args: List[Any] = []
+
+        # fecha coherente
         if date_expr is not None:
             if fecha_eq:
-                where_sql_parts.append(sql.SQL("{} = %s").format(date_expr)); args.append(fecha_eq)
+                where_sql_parts.append(sql.SQL("{} = %s").format(date_expr))
+                args.append(fecha_eq)
             else:
                 if fecha_desde:
-                    where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr)); args.append(fecha_desde)
+                    where_sql_parts.append(sql.SQL("{} >= %s").format(date_expr))
+                    args.append(fecha_desde)
                 if fecha_hasta:
-                    where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr)); args.append(fecha_hasta)
+                    where_sql_parts.append(sql.SQL("{} <= %s").format(date_expr))
+                    args.append(fecha_hasta)
 
         def _in_clause(col_name: str, values: Sequence[str]) -> Optional[Tuple[sql.SQL, List[str]]]:
             if not values:
@@ -368,7 +400,6 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
                 where_sql_parts.append(sql.SQL("i.category_l1 = ANY(%s::text[])"))
                 args.append(cat_l1_list)
             else:
-                # el cliente pidió filtro pero la columna no existe -> 0 resultados
                 where_sql_parts.append(sql.SQL("1=0"))
 
         if cat_l2_list:
@@ -427,7 +458,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             sql.SQL("i.titulo_corto") if has_titulo_corto else sql.SQL("NULL AS titulo_corto"),
             sql.SQL("i.titulo_completo") if has_titulo_completo else sql.SQL("NULL AS titulo_completo"),
             sql.SQL("i.resumen") if has_resumen else sql.SQL("NULL AS resumen"),
-            (sql.SQL("i.informe_impacto AS impacto") if has_informe_imp else (sql.SQL("i.impacto AS impacto") if has_impacto else sql.SQL("NULL AS impacto"))),
+            (
+                sql.SQL("i.informe_impacto AS impacto") if has_informe_imp
+                else (sql.SQL("i.impacto AS impacto") if has_impacto else sql.SQL("NULL AS impacto"))
+            ),
             sql.SQL("i.departamento_codigo"),
             sql.SQL("i.seccion_codigo"),
             sql.SQL("i.epigrafe"),
@@ -437,7 +471,11 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
 
             # Fase 4: devolver categorías (defensivo)
             (sql.SQL("i.category_l1") if has_category_l1 else sql.SQL("NULL AS category_l1")),
-            (sql.SQL("COALESCE(i.category_l2, ARRAY[]::text[]) AS category_l2") if has_category_l2 else sql.SQL("ARRAY[]::text[] AS category_l2")),
+            (
+                sql.SQL("COALESCE(i.category_l2, ARRAY[]::text[]) AS category_l2")
+                if has_category_l2
+                else sql.SQL("ARRAY[]::text[] AS category_l2")
+            ),
         ]
 
         joins: List[sql.SQL] = []
@@ -448,6 +486,7 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             if _table_exists_cached(schema, t):
                 dep_table = t
                 break
+
         sec_table = None
         for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
             if _table_exists_cached(schema, t):
@@ -477,10 +516,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         # ORDER BY
         order_params: List[Any] = []
         if sort_by == "relevancia" and _use_fts_rank:
-            order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s)) ")
+            order_by_sql = sql.SQL("ts_rank(i.fts, plainto_tsquery(%s, %s))")
             order_params = [_ts_lang(), q_adv]
             sort_dir_sql = sql.SQL("ASC") if sort_dir == "asc" else sql.SQL("DESC")
-            order_clause = order_by_sql + sort_dir_sql
+            order_clause = order_by_sql + sql.SQL(" ") + sort_dir_sql
         else:
             if sort_by == "created_at":
                 sort_by_sql = created_order_col
@@ -512,7 +551,9 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             order_clause=order_clause,
         )
 
+        # COUNT (no necesita joins porque where solo filtra por columnas de items)
         count_sql = sql.SQL("SELECT COUNT(*) FROM items i ") + where_sql
+
         offset = (page - 1) * limit
 
         with conn.cursor() as cur:
@@ -539,8 +580,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         "sort_dir": sort_dir,
     }
 
+
 def get_filtered_items(params: Dict[str, Any]) -> Dict[str, Any]:
     return search_items(params)
+
 
 # ====================== Detalle & derivados ======================
 
@@ -601,6 +644,7 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
                 if _table_exists_cached(schema, t):
                     dep_table = t
                     break
+
             sec_table = None
             for t in ("secciones", "lookup_secciones", "cat_secciones", "dim_secciones", "secciones_lookup"):
                 if _table_exists_cached(schema, t):
@@ -696,6 +740,7 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
 
     return data
 
+
 def get_item_resumen(identificador: str) -> Dict[str, Any]:
     with get_db() as conn:
         schema = _load_schema_cache(conn)
@@ -708,6 +753,7 @@ def get_item_resumen(identificador: str) -> Dict[str, Any]:
     inflated = _inflate_b64_gzip_maybe(raw)
     text = (inflated or "").strip()
     return {"identificador": identificador, "resumen": text if text != "" else None}
+
 
 def get_item_impacto(identificador: str) -> Dict[str, Any]:
     with get_db() as conn:
@@ -731,19 +777,24 @@ def get_item_impacto(identificador: str) -> Dict[str, Any]:
         parsed = None
     return {"identificador": identificador, "impacto": parsed}
 
+
 def like_item(identificador: str) -> Dict[str, Any]:
     return {"identificador": identificador, "detail": "Use reactions_svc via blueprint", "ok": False}
 
+
 def dislike_item(identificador: str) -> Dict[str, Any]:
     return {"identificador": identificador, "detail": "Use reactions_svc via blueprint", "ok": False}
+
 
 # ====================== Catálogos ======================
 
 def list_departamentos() -> List[Dict[str, Any]]:
     return list_departamentos_lookup()
 
+
 def list_secciones() -> List[Dict[str, Any]]:
     return list_secciones_lookup()
+
 
 def list_epigrafes() -> List[str]:
     sql_text = """

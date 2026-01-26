@@ -39,10 +39,20 @@ _MODEL_IMPACT = os.getenv("OPENAI_MODEL_IMPACT", _OPENAI_MODEL)
 # Nuevo: no llamar OpenAI si la fuente es demasiado pobre (título-only)
 _OPENAI_MIN_SOURCE_CHARS = int(os.getenv("OPENAI_MIN_SOURCE_CHARS", "800"))
 
-# Chunking
+# Chunking (genérico)
 _OPENAI_CHUNK_SIZE_CHARS = int(os.getenv("OPENAI_CHUNK_SIZE_CHARS", "12000"))
 _OPENAI_CHUNK_OVERLAP_CHARS = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500"))
 _OPENAI_MAX_CHUNKS = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))
+
+# Chunking específico para SUMMARY (para limitar llamadas: 2 MAP + 1 REDUCE = 3)
+# Nota: como _normalize_content() ya limita a ~28k chars, 15000 suele dar 2 chunks.
+_OPENAI_SUMMARY_CHUNK_SIZE_CHARS = int(
+    os.getenv("OPENAI_SUMMARY_CHUNK_SIZE_CHARS", "15000")
+)
+_OPENAI_SUMMARY_CHUNK_OVERLAP_CHARS = int(
+    os.getenv("OPENAI_SUMMARY_CHUNK_OVERLAP_CHARS", str(_OPENAI_CHUNK_OVERLAP_CHARS))
+)
+_OPENAI_SUMMARY_MAX_CHUNKS = int(os.getenv("OPENAI_SUMMARY_MAX_CHUNKS", "2"))
 
 # Fallbacks en timeout
 _OPENAI_JSON_FALLBACK_FACTOR = float(os.getenv("OPENAI_JSON_FALLBACK_FACTOR", "0.6"))
@@ -764,17 +774,31 @@ def _ensure_impacto_shape(obj: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _split_chunks(text: str, size: int, overlap: int) -> List[str]:
+def _split_chunks(text: str, size: int, overlap: int, *, max_chunks: Optional[int] = None) -> List[str]:
+    """
+    Split por ventana deslizante.
+    IMPORTANTE: respeta max_chunks estrictamente (antes podía exceder por el append final).
+    Si el texto no cabe y se alcanza max_chunks, sustituye el último chunk por el tail para
+    garantizar cobertura del final sin añadir chunks extra.
+    """
     if size <= 0:
         return [text]
+
+    limit = int(max_chunks if max_chunks is not None else _OPENAI_MAX_CHUNKS)
+    limit = max(1, limit)
+
     chunks: List[str] = []
     i = 0
-    n = max(0, size - overlap)
-    while i < len(text) and len(chunks) < _OPENAI_MAX_CHUNKS:
+    step = max(1, size - overlap)
+
+    while i < len(text) and len(chunks) < limit:
         chunks.append(text[i : i + size])
-        i += n if n > 0 else size
-    if i < len(text):
-        chunks.append(text[-size:])
+        i += step
+
+    # Si quedó texto sin cubrir y ya estamos en el límite, garantizamos que el último sea el tail
+    if i < len(text) and chunks:
+        chunks[-1] = text[-size:]
+
     return chunks
 
 
@@ -1230,6 +1254,9 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     - Elimina la call de título en pipeline: aquí generamos title_short + category_l1/l2.
     - Si no hay chunking: 1 llamada FULL.
     - Si hay chunking: MAP (chunks → schema base) + REDUCE (1 llamada FULL con ancla corta del PDF).
+
+    OPTIMIZACIÓN (enero 2026):
+    - Forzamos SUMMARY a max 2 chunks por defecto => 2 MAP + 1 REDUCE = 3 llamadas (no 4).
     """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido resumen.")
@@ -1257,7 +1284,9 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     resumen_schema_full = copy.deepcopy(_RESUMEN_JSON_SCHEMA_FULL)
     resumen_schema_full["schema"]["properties"]["key_dates_events"]["minItems"] = (1 if has_dates else 0)
 
-    if len(content_norm) <= _OPENAI_CHUNK_SIZE_CHARS:
+    # Umbral de chunking específico para SUMMARY
+    if len(content_norm) <= _OPENAI_SUMMARY_CHUNK_SIZE_CHARS:
+        logging.info("🧠 [summary] FULL (1 llamada) chars=%s", len(content_norm))
         messages = _build_summary_messages_full(
             title_hint=title_hint,
             content=content_norm,
@@ -1293,11 +1322,26 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
             logging.warning(f"⚠️ OpenAI (resumen FULL) con fallback agotado: {e}")
             return _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint=title_hint)
 
-    chunks = _split_chunks(content_norm, _OPENAI_CHUNK_SIZE_CHARS, _OPENAI_CHUNK_OVERLAP_CHARS)
-    logging.info(f"✂️ Chunking contenido en {len(chunks)} trozos")
+    # Chunking SUMMARY: cap a max 2 chunks por defecto (configurable)
+    chunks = _split_chunks(
+        content_norm,
+        _OPENAI_SUMMARY_CHUNK_SIZE_CHARS,
+        _OPENAI_SUMMARY_CHUNK_OVERLAP_CHARS,
+        max_chunks=_OPENAI_SUMMARY_MAX_CHUNKS,
+    )
+    logging.info(
+        "✂️ [summary] Chunking contenido en %s trozos (size=%s overlap=%s max=%s) chars=%s",
+        len(chunks),
+        _OPENAI_SUMMARY_CHUNK_SIZE_CHARS,
+        _OPENAI_SUMMARY_CHUNK_OVERLAP_CHARS,
+        _OPENAI_SUMMARY_MAX_CHUNKS,
+        len(content_norm),
+    )
+    logging.info("🧠 [summary] Llamadas esperadas: %s (MAP=%s + REDUCE=1)", len(chunks) + 1, len(chunks))
 
     parts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, start=1):
+        logging.info("🧠 [summary] MAP %s/%s", idx, len(chunks))
         messages = _build_summary_messages_chunk(
             hints=hints,
             part_label=f"PARTE {idx}/{len(chunks)}",
@@ -1332,6 +1376,7 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     )
 
     try:
+        logging.info("🧠 [summary] REDUCE (1 llamada)")
         r_final = _json_schema_completion_with_retry(
             client,
             messages=messages_reduce,
@@ -1389,13 +1434,19 @@ def generate_impact(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     chunks = (
         [content_norm]
         if len(content_norm) <= _OPENAI_CHUNK_SIZE_CHARS
-        else _split_chunks(content_norm, _OPENAI_CHUNK_SIZE_CHARS, _OPENAI_CHUNK_OVERLAP_CHARS)
+        else _split_chunks(content_norm, _OPENAI_CHUNK_SIZE_CHARS, _OPENAI_CHUNK_OVERLAP_CHARS, max_chunks=_OPENAI_MAX_CHUNKS)
     )
     if len(chunks) > 1:
-        logging.info(f"✂️ Chunking contenido en {len(chunks)} trozos")
+        logging.info("✂️ [impact] Chunking contenido en %s trozos", len(chunks))
+        logging.info("🧠 [impact] Llamadas esperadas: %s (MAP=%s, sin REDUCE)", len(chunks), len(chunks))
+    else:
+        logging.info("🧠 [impact] FULL (1 llamada) chars=%s", len(content_norm))
 
     parts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            logging.info("🧠 [impact] MAP %s/%s", idx, len(chunks))
+
         prompt = "\n".join(
             [
                 "=== OBJECTIVE ===",
