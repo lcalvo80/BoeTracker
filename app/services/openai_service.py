@@ -12,6 +12,7 @@ from typing import Dict, Any, Tuple, List, Optional
 
 from app.utils.helpers import clean_code_block, extract_section  # noqa: F401
 from app.services.boe_text_extractor import extract_boe_text  # PDF → texto
+from app.utils.boe_ai_sanitizer import sanitize_for_ai  # NUEVO
 
 # ─────────────────────────── Excepciones controladas ───────────────────────────
 class OpenAISourceTextUnavailable(RuntimeError):
@@ -45,7 +46,6 @@ _OPENAI_CHUNK_OVERLAP_CHARS = int(os.getenv("OPENAI_CHUNK_OVERLAP_CHARS", "500")
 _OPENAI_MAX_CHUNKS = int(os.getenv("OPENAI_MAX_CHUNKS", "12"))
 
 # Chunking específico para SUMMARY (para limitar llamadas: 2 MAP + 1 REDUCE = 3)
-# Nota: como _normalize_content() ya limita a ~28k chars, 15000 suele dar 2 chunks.
 _OPENAI_SUMMARY_CHUNK_SIZE_CHARS = int(
     os.getenv("OPENAI_SUMMARY_CHUNK_SIZE_CHARS", "15000")
 )
@@ -60,6 +60,9 @@ _OPENAI_JSON_FALLBACK_MAX_TOKENS = int(os.getenv("OPENAI_JSON_FALLBACK_MAX_TOKEN
 
 # Reduce (MAP→REDUCE): ancla mínima del PDF para seguir siendo “PDF-first”
 _OPENAI_REDUCE_ANCHOR_CHARS = int(os.getenv("OPENAI_REDUCE_ANCHOR_CHARS", "2800"))  # 1500..3000 recomendado
+
+# NUEVO: strip boilerplate transversal BOE antes de normalizar / llamar a IA
+_OPENAI_STRIP_BOE_BOILERPLATE = os.getenv("OPENAI_STRIP_BOE_BOILERPLATE", "1") == "1"
 
 # ─────────────────────────── Taxonomía (Nivel 1 / Nivel 2) ───────────────────────────
 DEFAULT_CATEGORY_L1 = "Administración pública y Organización territorial"
@@ -314,7 +317,6 @@ _RESUMEN_JSON_SCHEMA_BASE: Dict[str, Any] = {
     },
 }
 
-# Nuevo: schema FULL (resumen + title_short + categorías)
 _RESUMEN_JSON_SCHEMA_FULL: Dict[str, Any] = {
     "name": "boe_resumen",
     "strict": True,
@@ -322,7 +324,7 @@ _RESUMEN_JSON_SCHEMA_FULL: Dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "title_short": {"type": "string", "maxLength": 90},  # título humano; validamos ≤10 palabras en server
+            "title_short": {"type": "string", "maxLength": 90},
             "summary": {"type": "string", "maxLength": 600},
             "key_changes": {
                 "type": "array",
@@ -395,6 +397,30 @@ _KEYWORDS_DATES = re.compile(
     re.I,
 )
 _WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
+
+# ─────────────────────────── NUEVO: preparar texto para IA ───────────────────────────
+def _prepare_source_for_ai(content: str) -> str:
+    """
+    Aplica un sanitizado conservador para eliminar boilerplate transversal del BOE
+    (cabeceras/pies, verificable, cve, issn, etc.) antes de normalizar/truncar.
+
+    Si el sanitizado deja el texto vacío, cae al original.
+    """
+    raw = str(content or "")
+    if not raw.strip():
+        return ""
+    if not _OPENAI_STRIP_BOE_BOILERPLATE:
+        return raw
+    try:
+        cleaned = sanitize_for_ai(raw)
+        # Conservador: si por cualquier razón quedó demasiado agresivo, usa el original
+        if cleaned and len(cleaned) >= 200:
+            return cleaned
+        return raw
+    except Exception as e:
+        logging.warning("⚠️ Sanitizador BOE falló; uso texto original. err=%s", e)
+        return raw
+
 
 # ─────────────────────────── Utils ───────────────────────────
 def _extract_hints(text: str, max_per_type: int = 6) -> Dict[str, List[str]]:
@@ -775,12 +801,6 @@ def _ensure_impacto_shape(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _split_chunks(text: str, size: int, overlap: int, *, max_chunks: Optional[int] = None) -> List[str]:
-    """
-    Split por ventana deslizante.
-    IMPORTANTE: respeta max_chunks estrictamente (antes podía exceder por el append final).
-    Si el texto no cabe y se alcanza max_chunks, sustituye el último chunk por el tail para
-    garantizar cobertura del final sin añadir chunks extra.
-    """
     if size <= 0:
         return [text]
 
@@ -795,7 +815,6 @@ def _split_chunks(text: str, size: int, overlap: int, *, max_chunks: Optional[in
         chunks.append(text[i : i + size])
         i += step
 
-    # Si quedó texto sin cubrir y ya estamos en el límite, garantizamos que el último sea el tail
     if i < len(text) and chunks:
         chunks[-1] = text[-size:]
 
@@ -867,12 +886,6 @@ def _merge_impacto_objs(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 # ─────────────────────────── NUEVO helper: ejecutar pipeline y devolver objetos ───────────────────────────
 def _compute_summary_impact_objects(*, title_hint: str, content: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """
-    Ejecuta el pipeline actual (summary FULL/MAP→REDUCE + impact) y devuelve:
-    - titulo_resumen (derivado de resumen.title_short)
-    - resumen_obj (shape completa)
-    - impacto_obj
-    """
     resumen_obj = generate_summary(content=content, title_hint=title_hint)
     resumen_obj = _ensure_resumen_shape(resumen_obj, title_hint=title_hint)
 
@@ -883,7 +896,11 @@ def _compute_summary_impact_objects(*, title_hint: str, content: str) -> Tuple[s
     resumen_obj["category_l1"] = l1
     resumen_obj["category_l2"] = l2
 
-    titulo_resumen = _grade_title(resumen_obj.get("title_short") or "") or _grade_title(title_hint or "") or (title_hint or "").strip()
+    titulo_resumen = (
+        _grade_title(resumen_obj.get("title_short") or "")
+        or _grade_title(title_hint or "")
+        or (title_hint or "").strip()
+    )
 
     impacto_obj = generate_impact(content=content, title_hint=title_hint)
     impacto_obj = _ensure_impacto_shape(impacto_obj)
@@ -893,13 +910,6 @@ def _compute_summary_impact_objects(*, title_hint: str, content: str) -> Tuple[s
 
 # ─────────────────────────── API principal ───────────────────────────
 def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
-    """
-    COMPAT: devuelve 3 strings:
-      (titulo_resumen, resumen_json, impacto_json)
-
-    Cambio: ya NO llamamos a generate_title() en el pipeline.
-    El titulo_resumen sale del propio resumen (title_short).
-    """
     titulo_resumen, resumen_obj, impacto_obj = _compute_summary_impact_objects(title_hint=title, content=content)
     return (
         titulo_resumen,
@@ -909,12 +919,6 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
 
 
 def get_openai_responses_with_taxonomy(title: str, content: str) -> Tuple[str, str, str, str, List[str]]:
-    """
-    Devuelve 5 valores para el worker:
-      (titulo_resumen, resumen_json, impacto_json, category_l1, category_l2)
-
-    Nota: aquí asumimos que el caller ya ha validado que hay contenido suficiente.
-    """
     titulo_resumen, resumen_obj, impacto_obj = _compute_summary_impact_objects(title_hint=title, content=content)
     cat_l1 = str(resumen_obj.get("category_l1") or DEFAULT_CATEGORY_L1)
     cat_l2 = list(resumen_obj.get("category_l2") or [])
@@ -928,11 +932,6 @@ def get_openai_responses_with_taxonomy(title: str, content: str) -> Tuple[str, s
 
 
 def get_openai_responses_from_pdf(identificador: str, titulo: str, url_pdf: str) -> Tuple[str, str, str]:
-    """
-    Variante PDF-first COMPAT (3-tuple). Mantiene el comportamiento previo:
-    - Si no se puede extraer texto o es demasiado corto: NO llama a OpenAI y devuelve objetos vacíos.
-    (Esto se usa para compat/diagnóstico. El worker usa la variante _with_taxonomy.)
-    """
     content = ""
     if url_pdf:
         try:
@@ -964,14 +963,6 @@ def get_openai_responses_from_pdf_with_taxonomy(
     titulo: str,
     url_pdf: str,
 ) -> Tuple[str, str, str, str, List[str]]:
-    """
-    Worker/PDF-first (5-tuple):
-      (titulo_resumen, resumen_json, impacto_json, category_l1, category_l2)
-
-    Regla crítica:
-    - Si NO hay texto real suficiente del PDF o OPENAI_DISABLE=1, lanzamos OpenAISourceTextUnavailable
-      para que el worker NO marque done con datos vacíos.
-    """
     if _OPENAI_DISABLE:
         raise OpenAISourceTextUnavailable("OPENAI_DISABLE=1: IA deshabilitada en entorno actual")
 
@@ -998,10 +989,6 @@ def get_openai_responses_from_pdf_with_taxonomy(
 
 # ─────────────────────────── NUEVO: funciones públicas por endpoint ───────────────────────────
 def generate_title(*, title_hint: str, content: str) -> str:
-    """
-    Se mantiene por compat/diagnóstico (p.ej. endpoint /api/ai/title),
-    pero ya NO se usa en el pipeline principal.
-    """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido título.")
         return (title_hint or "").strip()
@@ -1013,7 +1000,9 @@ def generate_title(*, title_hint: str, content: str) -> str:
     start_ts = time.time()
     deadline_ts: Optional[float] = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
 
-    content_norm = _normalize_content(content or "")
+    # NUEVO: strip boilerplate transversal antes de normalizar
+    content_src = _prepare_source_for_ai(content or "")
+    content_norm = _normalize_content(content_src)
 
     messages: List[Dict[str, Any]] = [
         {
@@ -1249,15 +1238,6 @@ def _build_summary_messages_reduce(
 
 
 def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
-    """
-    Nuevo comportamiento:
-    - Elimina la call de título en pipeline: aquí generamos title_short + category_l1/l2.
-    - Si no hay chunking: 1 llamada FULL.
-    - Si hay chunking: MAP (chunks → schema base) + REDUCE (1 llamada FULL con ancla corta del PDF).
-
-    OPTIMIZACIÓN (enero 2026):
-    - Forzamos SUMMARY a max 2 chunks por defecto => 2 MAP + 1 REDUCE = 3 llamadas (no 4).
-    """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido resumen.")
         return _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint=title_hint)
@@ -1269,7 +1249,9 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     start_ts = time.time()
     deadline_ts: Optional[float] = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
 
-    content_norm = _normalize_content(content or "")
+    # NUEVO: strip boilerplate transversal antes de normalizar / chunking
+    content_src = _prepare_source_for_ai(content or "")
+    content_norm = _normalize_content(content_src)
     if not content_norm:
         return _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint=title_hint)
 
@@ -1284,7 +1266,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     resumen_schema_full = copy.deepcopy(_RESUMEN_JSON_SCHEMA_FULL)
     resumen_schema_full["schema"]["properties"]["key_dates_events"]["minItems"] = (1 if has_dates else 0)
 
-    # Umbral de chunking específico para SUMMARY
     if len(content_norm) <= _OPENAI_SUMMARY_CHUNK_SIZE_CHARS:
         logging.info("🧠 [summary] FULL (1 llamada) chars=%s", len(content_norm))
         messages = _build_summary_messages_full(
@@ -1322,7 +1303,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
             logging.warning(f"⚠️ OpenAI (resumen FULL) con fallback agotado: {e}")
             return _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint=title_hint)
 
-    # Chunking SUMMARY: cap a max 2 chunks por defecto (configurable)
     chunks = _split_chunks(
         content_norm,
         _OPENAI_SUMMARY_CHUNK_SIZE_CHARS,
@@ -1425,7 +1405,9 @@ def generate_impact(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     start_ts = time.time()
     deadline_ts: Optional[float] = start_ts + _OPENAI_BUDGET_SECS if _OPENAI_BUDGET_SECS > 0 else None
 
-    content_norm = _normalize_content(content or "")
+    # NUEVO: strip boilerplate transversal antes de normalizar / chunking
+    content_src = _prepare_source_for_ai(content or "")
+    content_norm = _normalize_content(content_src)
     if not content_norm:
         return dict(_EMPTY_IMPACTO)
 
