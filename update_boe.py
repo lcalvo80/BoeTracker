@@ -18,11 +18,19 @@ from app.services.postgres import get_db
 from app.services.boe_fetcher import fetch_boe_xml
 from app.services.parser import parse_and_insert
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
 
+def _configure_logging() -> None:
+    level_name = (os.getenv("LOG_LEVEL") or "INFO").upper().strip()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+_configure_logging()
+
+# En local cargamos .env; en GitHub Actions NO
 if os.getenv("GITHUB_ACTIONS") != "true":
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
@@ -30,11 +38,6 @@ if os.getenv("GITHUB_ACTIONS") != "true":
         logging.info("🟢 .env file loaded.")
     else:
         logging.warning("⚠️ No .env file found.")
-
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    logging.error("❌ OPENAI_API_KEY not found. Check .env o GitHub secret.")
-    sys.exit(1)
 
 
 def get_item_count() -> int:
@@ -109,8 +112,11 @@ def _run_for_date(d: date) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
+    # Nota: la ingesta NO requiere OPENAI_API_KEY; eso lo usa el worker de IA.
     initial_count = get_item_count()
     logging.info("📦 Ítems antes: %s", initial_count)
+
+    had_error = False
 
     # Caso A: sin fechas -> HOY + AYER
     if not args.from_date and not args.to_date:
@@ -120,11 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         logging.info("🗓️ Ejecutando ingesta por defecto para AYER + HOY.")
         rc1 = _run_for_date(yesterday)
         rc2 = _run_for_date(today)
+        had_error = (rc1 != 0) or (rc2 != 0)
 
         final_count = get_item_count()
         logging.info("📦 Total actual en BD: %s", final_count)
         logging.info("✅ Proceso de ingesta BOE completado (ayer+hoy).")
-        return 0 if (rc1 == 0 and rc2 == 0) else 1
+        return 1 if had_error else 0
 
     # Caso B: rango explícito
     try:
@@ -145,12 +152,14 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("🗓️ Ejecutando ingesta para el rango %s → %s (inclusive).", start_date, end_date)
 
     for d in _iter_dates(start_date, end_date):
-        _run_for_date(d)
+        rc = _run_for_date(d)
+        if rc != 0:
+            had_error = True
 
     final_count = get_item_count()
     logging.info("📦 Total actual en BD: %s", final_count)
     logging.info("✅ Proceso de ingesta BOE (rango) completado.")
-    return 0
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":

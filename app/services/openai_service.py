@@ -13,6 +13,17 @@ from typing import Dict, Any, Tuple, List, Optional
 from app.utils.helpers import clean_code_block, extract_section  # noqa: F401
 from app.services.boe_text_extractor import extract_boe_text  # PDF → texto
 
+# ─────────────────────────── Excepciones controladas ───────────────────────────
+class OpenAISourceTextUnavailable(RuntimeError):
+    """
+    Se lanza cuando NO hay texto suficiente del PDF para ejecutar IA con calidad:
+    - No se pudo extraer texto
+    - Texto demasiado corto
+    - OPENAI_DISABLE=1 (si se usa el worker)
+    """
+    pass
+
+
 # ─────────────────────────── Config ───────────────────────────
 _OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "45"))
 _OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
@@ -645,9 +656,7 @@ def _anchor_text(text: str, target_chars: int) -> str:
     Devuelve un ancla corta del PDF (inicio + final) para mantener “PDF-first” en el REDUCE.
     """
     t = str(text or "").strip()
-    if not t:
-        return ""
-    if target_chars <= 0:
+    if not t or target_chars <= 0:
         return ""
     if len(t) <= target_chars:
         return t
@@ -672,23 +681,7 @@ def _grade_title(s: str, max_words: int = 10) -> str:
 
     parts = s.split()
     if len(parts) > max_words:
-        low_info = {
-            "de",
-            "la",
-            "del",
-            "al",
-            "y",
-            "en",
-            "por",
-            "para",
-            "el",
-            "los",
-            "las",
-            "un",
-            "una",
-            "unos",
-            "unas",
-        }
+        low_info = {"de", "la", "del", "al", "y", "en", "por", "para", "el", "los", "las", "un", "una", "unos", "unas"}
         kept: List[str] = []
         for w in parts:
             if len(kept) >= max_words:
@@ -708,11 +701,9 @@ def _normalize_categories(*, category_l1: str, category_l2: List[str]) -> Tuple[
     raw_l2 = []
     for x in (category_l2 or []):
         sx = str(x or "").strip()
-        if not sx:
-            continue
-        raw_l2.append(sx)
+        if sx:
+            raw_l2.append(sx)
 
-    # Validación contra vocabulario y coherencia con L1
     allowed_for_l1 = _TAX_L2_BY_L1.get(l1, set())
     out_l2: List[str] = []
     seen = set()
@@ -735,7 +726,6 @@ def _ensure_resumen_shape(obj: Dict[str, Any], *, title_hint: str = "") -> Dict[
     out = dict(_EMPTY_RESUMEN)
 
     if isinstance(obj, dict):
-        # Compat antiguo: "context" podía venir como summary
         summary = obj.get("summary", None)
         if (summary is None or str(summary).strip() == "") and "context" in obj:
             summary = obj.get("context")
@@ -745,7 +735,6 @@ def _ensure_resumen_shape(obj: Dict[str, Any], *, title_hint: str = "") -> Dict[
         out["key_dates_events"] = [str(x).strip() for x in obj.get("key_dates_events", []) if str(x).strip()]
         out["conclusion"] = str(obj.get("conclusion", "")).strip()
 
-        # Nuevo: title_short + categorías
         ts = obj.get("title_short", "") or obj.get("title", "") or ""
         ts = _grade_title(str(ts or "").strip())
         if not ts:
@@ -829,7 +818,6 @@ def _merge_resumen_objs(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
         "key_changes": _uniq_keep_order(all_changes, limit=12),
         "key_dates_events": _uniq_keep_order(all_dates, limit=10),
         "conclusion": conclusion_join[:300],
-        # No intentamos consolidar title/categories aquí: se calculan en REDUCE o en la llamada FULL
         "title_short": "",
         "category_l1": DEFAULT_CATEGORY_L1,
         "category_l2": [],
@@ -864,7 +852,6 @@ def _compute_summary_impact_objects(*, title_hint: str, content: str) -> Tuple[s
     resumen_obj = generate_summary(content=content, title_hint=title_hint)
     resumen_obj = _ensure_resumen_shape(resumen_obj, title_hint=title_hint)
 
-    # Guardrail categorías siempre normalizadas
     l1, l2 = _normalize_categories(
         category_l1=str(resumen_obj.get("category_l1", "") or ""),
         category_l2=list(resumen_obj.get("category_l2", []) or []),
@@ -883,7 +870,7 @@ def _compute_summary_impact_objects(*, title_hint: str, content: str) -> Tuple[s
 # ─────────────────────────── API principal ───────────────────────────
 def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
     """
-    COMPAT: seguimos devolviendo 3 strings:
+    COMPAT: devuelve 3 strings:
       (titulo_resumen, resumen_json, impacto_json)
 
     Cambio: ya NO llamamos a generate_title() en el pipeline.
@@ -899,8 +886,10 @@ def get_openai_responses(title: str, content: str) -> Tuple[str, str, str]:
 
 def get_openai_responses_with_taxonomy(title: str, content: str) -> Tuple[str, str, str, str, List[str]]:
     """
-    NUEVO: devuelve 5 valores para el worker:
+    Devuelve 5 valores para el worker:
       (titulo_resumen, resumen_json, impacto_json, category_l1, category_l2)
+
+    Nota: aquí asumimos que el caller ya ha validado que hay contenido suficiente.
     """
     titulo_resumen, resumen_obj, impacto_obj = _compute_summary_impact_objects(title_hint=title, content=content)
     cat_l1 = str(resumen_obj.get("category_l1") or DEFAULT_CATEGORY_L1)
@@ -916,10 +905,9 @@ def get_openai_responses_with_taxonomy(title: str, content: str) -> Tuple[str, s
 
 def get_openai_responses_from_pdf(identificador: str, titulo: str, url_pdf: str) -> Tuple[str, str, str]:
     """
-    Variante que usa SIEMPRE el texto del PDF del BOE como contenido.
-    Si el PDF no se puede extraer, NO llamamos a OpenAI con título-only.
-
-    COMPAT: devuelve 3 valores.
+    Variante PDF-first COMPAT (3-tuple). Mantiene el comportamiento previo:
+    - Si no se puede extraer texto o es demasiado corto: NO llama a OpenAI y devuelve objetos vacíos.
+    (Esto se usa para compat/diagnóstico. El worker usa la variante _with_taxonomy.)
     """
     content = ""
     if url_pdf:
@@ -931,20 +919,9 @@ def get_openai_responses_from_pdf(identificador: str, titulo: str, url_pdf: str)
     content = (content or "").strip()
     titulo_clean = (titulo or "").strip()
 
-    if not content:
+    if not content or len(content) < _OPENAI_MIN_SOURCE_CHARS:
         logging.warning(
-            "⚠️ No se pudo extraer texto del PDF para %s. Se omite OpenAI y se deja pendiente.",
-            identificador,
-        )
-        return (
-            titulo_clean,
-            json.dumps(dict(_EMPTY_RESUMEN), ensure_ascii=False),
-            json.dumps(dict(_EMPTY_IMPACTO), ensure_ascii=False),
-        )
-
-    if len(content) < _OPENAI_MIN_SOURCE_CHARS:
-        logging.warning(
-            "⚠️ Texto PDF demasiado corto para %s (%s chars < %s). Omito OpenAI para evitar baja calidad.",
+            "⚠️ PDF sin texto suficiente para %s (chars=%s, min=%s). No llamo a OpenAI.",
             identificador,
             len(content),
             _OPENAI_MIN_SOURCE_CHARS,
@@ -959,52 +936,37 @@ def get_openai_responses_from_pdf(identificador: str, titulo: str, url_pdf: str)
 
 
 def get_openai_responses_from_pdf_with_taxonomy(
-    identificador: str, titulo: str, url_pdf: str
+    identificador: str,
+    titulo: str,
+    url_pdf: str,
 ) -> Tuple[str, str, str, str, List[str]]:
     """
-    NUEVO (para el worker):
-    Variante PDF-first que devuelve 5 valores:
+    Worker/PDF-first (5-tuple):
       (titulo_resumen, resumen_json, impacto_json, category_l1, category_l2)
 
-    Importante: NO rompe callers existentes porque no toca get_openai_responses_from_pdf().
+    Regla crítica:
+    - Si NO hay texto real suficiente del PDF o OPENAI_DISABLE=1, lanzamos OpenAISourceTextUnavailable
+      para que el worker NO marque done con datos vacíos.
     """
+    if _OPENAI_DISABLE:
+        raise OpenAISourceTextUnavailable("OPENAI_DISABLE=1: IA deshabilitada en entorno actual")
+
     content = ""
     if url_pdf:
         try:
             content = extract_boe_text(identificador=identificador, url_pdf=url_pdf)
         except Exception as e:
-            logging.error("❌ Error extrayendo texto del PDF (%s): %s", identificador, e)
+            raise OpenAISourceTextUnavailable(f"Error extrayendo texto del PDF: {e}") from e
 
     content = (content or "").strip()
     titulo_clean = (titulo or "").strip()
 
     if not content:
-        logging.warning(
-            "⚠️ No se pudo extraer texto del PDF para %s. Se omite OpenAI y se deja pendiente.",
-            identificador,
-        )
-        # Devuelve categorías por defecto (para DB)
-        return (
-            titulo_clean,
-            json.dumps(dict(_EMPTY_RESUMEN), ensure_ascii=False),
-            json.dumps(dict(_EMPTY_IMPACTO), ensure_ascii=False),
-            DEFAULT_CATEGORY_L1,
-            [],
-        )
+        raise OpenAISourceTextUnavailable("No se pudo extraer texto del PDF (vacío)")
 
     if len(content) < _OPENAI_MIN_SOURCE_CHARS:
-        logging.warning(
-            "⚠️ Texto PDF demasiado corto para %s (%s chars < %s). Omito OpenAI para evitar baja calidad.",
-            identificador,
-            len(content),
-            _OPENAI_MIN_SOURCE_CHARS,
-        )
-        return (
-            titulo_clean,
-            json.dumps(dict(_EMPTY_RESUMEN), ensure_ascii=False),
-            json.dumps(dict(_EMPTY_IMPACTO), ensure_ascii=False),
-            DEFAULT_CATEGORY_L1,
-            [],
+        raise OpenAISourceTextUnavailable(
+            f"Texto del PDF demasiado corto ({len(content)} chars < {_OPENAI_MIN_SOURCE_CHARS})"
         )
 
     return get_openai_responses_with_taxonomy(titulo_clean, content)
@@ -1271,7 +1233,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     """
     if _OPENAI_DISABLE:
         logging.warning("⚠️ OPENAI_DISABLE=1: omitido resumen.")
-        # devolvemos shape completa para no romper el pipeline
         return _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint=title_hint)
 
     client = _make_client()
@@ -1290,15 +1251,12 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
     hints = _extract_hints(content_norm)
     has_dates = _has_dates(content_norm, hints)
 
-    # Schema chunk (base) con minItems dinámico para fechas
     resumen_schema_chunk = copy.deepcopy(_RESUMEN_JSON_SCHEMA_BASE)
     resumen_schema_chunk["schema"]["properties"]["key_dates_events"]["minItems"] = (1 if has_dates else 0)
 
-    # Schema full con minItems dinámico para fechas
     resumen_schema_full = copy.deepcopy(_RESUMEN_JSON_SCHEMA_FULL)
     resumen_schema_full["schema"]["properties"]["key_dates_events"]["minItems"] = (1 if has_dates else 0)
 
-    # 1) Sin chunking: 1 llamada FULL
     if len(content_norm) <= _OPENAI_CHUNK_SIZE_CHARS:
         messages = _build_summary_messages_full(
             title_hint=title_hint,
@@ -1321,8 +1279,10 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
             )
             out = _ensure_resumen_shape(r_obj, title_hint=title_hint)
 
-            # Guardrail adicional: coherencia L2 con L1
-            l1, l2 = _normalize_categories(category_l1=out.get("category_l1", ""), category_l2=out.get("category_l2", []))
+            l1, l2 = _normalize_categories(
+                category_l1=out.get("category_l1", ""),
+                category_l2=out.get("category_l2", []),
+            )
             out["category_l1"] = l1
             out["category_l2"] = l2
 
@@ -1333,7 +1293,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
             logging.warning(f"⚠️ OpenAI (resumen FULL) con fallback agotado: {e}")
             return _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint=title_hint)
 
-    # 2) Chunking: MAP → REDUCE
     chunks = _split_chunks(content_norm, _OPENAI_CHUNK_SIZE_CHARS, _OPENAI_CHUNK_OVERLAP_CHARS)
     logging.info(f"✂️ Chunking contenido en {len(chunks)} trozos")
 
@@ -1363,7 +1322,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
 
     merged = _merge_resumen_objs(parts) if parts else _ensure_resumen_shape(dict(_EMPTY_RESUMEN), title_hint="")
 
-    # REDUCE: 1 llamada FULL con ancla corta del PDF + hechos agregados
     anchor = _anchor_text(content_norm, _OPENAI_REDUCE_ANCHOR_CHARS)
     messages_reduce = _build_summary_messages_reduce(
         title_hint=title_hint,
@@ -1387,12 +1345,14 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
         )
         out = _ensure_resumen_shape(r_final, title_hint=title_hint)
 
-        # Guardrails: dedup y coherencia
         out["key_changes"] = _uniq_keep_order(out.get("key_changes", []), limit=12)
         out["key_dates_events"] = _uniq_keep_order(out.get("key_dates_events", []), limit=10)
         out["title_short"] = _grade_title(out.get("title_short", "") or "", max_words=10) or _grade_title(title_hint or "", max_words=10)
 
-        l1, l2 = _normalize_categories(category_l1=out.get("category_l1", ""), category_l2=out.get("category_l2", []))
+        l1, l2 = _normalize_categories(
+            category_l1=out.get("category_l1", ""),
+            category_l2=out.get("category_l2", []),
+        )
         out["category_l1"] = l1
         out["category_l2"] = l2
 
@@ -1401,7 +1361,6 @@ def generate_summary(*, content: str, title_hint: str = "") -> Dict[str, Any]:
         return out
     except Exception as e:
         logging.warning(f"⚠️ OpenAI (resumen REDUCE) con fallback agotado: {e}")
-        # Fallback: usa merged (sin title/categories fiables) y completa defaults
         fallback = dict(merged)
         fallback["title_short"] = _grade_title(title_hint or "", max_words=10)
         fallback["category_l1"] = DEFAULT_CATEGORY_L1

@@ -12,7 +12,10 @@ from typing import Any, List, Optional, Tuple
 from psycopg2 import InterfaceError, OperationalError
 
 from app.services.postgres import get_db
-from app.services.openai_service import get_openai_responses_from_pdf_with_taxonomy as get_openai_responses_from_pdf
+from app.services.openai_service import (
+    get_openai_responses_from_pdf_with_taxonomy as get_openai_responses_from_pdf,
+    OpenAISourceTextUnavailable,
+)
 
 
 def _configure_logging() -> None:
@@ -94,7 +97,6 @@ def _sanitize_category_l2(v: Any, *, max_items: int = 5) -> Optional[List[str]]:
             if sx:
                 items.append(sx)
     elif isinstance(v, str):
-        # Permite strings tipo "A;B;C" o "A,B,C" como fallback
         raw = v.replace(";", ",")
         for part in raw.split(","):
             sx = _sanitize_str(part)
@@ -105,7 +107,6 @@ def _sanitize_category_l2(v: Any, *, max_items: int = 5) -> Optional[List[str]]:
         if sx:
             items.append(sx)
 
-    # Dedup preservando orden
     seen = set()
     out: List[str] = []
     for x in items:
@@ -146,7 +147,6 @@ def _fetch_candidates() -> List[tuple]:
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            # Principal: hoy+ayer (incluye done si necesita backfill de taxonomía o force)
             cur.execute(
                 """
                 SELECT id, identificador, titulo, url_pdf, ai_status, titulo_resumen, category_l1, ai_taxonomy_version
@@ -182,7 +182,6 @@ def _fetch_candidates() -> List[tuple]:
             )
             main_rows = cur.fetchall()
 
-            # Recuperación: pending/failed antiguos (y done si necesita backfill), limit
             cur.execute(
                 """
                 SELECT id, identificador, titulo, url_pdf, ai_status, titulo_resumen, category_l1, ai_taxonomy_version
@@ -226,7 +225,6 @@ def _fetch_candidates() -> List[tuple]:
             )
             recovery_rows = cur.fetchall()
 
-            # Recuperación: processing huérfanos
             cur.execute(
                 """
                 SELECT id, identificador, titulo, url_pdf, ai_status, titulo_resumen, category_l1, ai_taxonomy_version
@@ -320,7 +318,6 @@ def _mark_done(
                         (titulo_r, resumen_json, impacto_json, category_l1, category_l2, ai_taxonomy_version, item_id),
                     )
                 else:
-                    # Solo rellena si viene valor (si pasamos None, mantiene el existente)
                     cur.execute(
                         """
                         UPDATE items
@@ -392,7 +389,7 @@ def run() -> int:
         processed += 1
         logger.info("Procesando IA %s (id=%s, status=%s)", identificador, item_id, ai_status)
 
-        # Guardia final (por seguridad): si ya está completo y no forzamos, skip
+        # Guardia final: si ya está completo y no forzamos, skip
         if (
             not force_taxonomy
             and ai_status == "done"
@@ -417,7 +414,7 @@ def run() -> int:
                 url_pdf=url_pdf,
             )
 
-            # Compatibilidad: resp puede ser (titulo, resumen, impacto) o (titulo, resumen, impacto, cat_l1, cat_l2)
+            # resp esperado: (titulo_resumen, resumen_json, impacto_json, cat_l1, cat_l2)
             titulo_r: Optional[str]
             resumen_json: str
             impacto_json: str
@@ -432,18 +429,17 @@ def run() -> int:
                     cat_l1_new = _sanitize_str(resp[3])
                     cat_l2_new = _sanitize_category_l2(resp[4])
                 else:
-                    # Alternativa: extraer del resumen_json si viene embebido
                     cat_l1_new, cat_l2_new = _extract_taxonomy_from_resumen_json(resumen_json)
             else:
                 raise RuntimeError("get_openai_responses_from_pdf() devolvió un formato inesperado")
 
-            # Decide qué guardar para NO pisar title/tags si ya existen (y no forzamos)
+            # No pisar título si ya existe (y no forzamos)
             if not force_taxonomy and titulo_exist:
                 titulo_to_save = None
             else:
                 titulo_to_save = titulo_r
 
-            # Si ya hay taxonomía v1, no la pises (salvo force). Si versión distinta o NULL, sí actualiza.
+            # No pisar taxonomía si ya está completa y versión OK (salvo force)
             if not force_taxonomy and cat_l1_exist and (tax_ver_exist == TAXONOMY_VERSION):
                 cat_l1_to_save = None
                 cat_l2_to_save = None
@@ -465,6 +461,12 @@ def run() -> int:
             )
             done += 1
             logger.info("IA OK %s", identificador)
+
+        except OpenAISourceTextUnavailable as e:
+            # Caso controlado: NO hay texto suficiente del PDF o IA deshabilitada -> no marcar done.
+            failed += 1
+            logger.warning("IA omitida %s: %s", identificador, e)
+            _mark_failed(item_id, f"source_unavailable: {e}")
 
         except Exception as e:
             failed += 1
