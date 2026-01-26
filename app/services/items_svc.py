@@ -167,6 +167,82 @@ def _reactions_agg_join_sql() -> sql.SQL:
         """
     )
 
+# ====================== Categorías (Fase 4) ======================
+
+def get_category_filters() -> Dict[str, Any]:
+    """
+    Devuelve filtros de categorías de forma defensiva.
+    Keys nuevas:
+      - categories_l1: distinct category_l1
+      - categories_l2: distinct unnest(category_l2)
+      - categories_l2_by_l1: { l1: [l2,...] }
+
+    Incluye compat ES opcional:
+      - categorias_n1, categorias_n2, categorias_n2_por_n1
+    """
+    with get_db() as conn:
+        schema = _load_schema_cache(conn)
+
+        has_l1 = _col_exists_cached(schema, "items", "category_l1")
+        has_l2 = _col_exists_cached(schema, "items", "category_l2")
+
+        categories_l1: List[str] = []
+        categories_l2: List[str] = []
+        categories_l2_by_l1: Dict[str, List[str]] = {}
+
+        with conn.cursor() as cur:
+            if has_l1:
+                cur.execute(
+                    """
+                    SELECT DISTINCT category_l1
+                    FROM items
+                    WHERE category_l1 IS NOT NULL AND btrim(category_l1) <> ''
+                    ORDER BY 1
+                    """
+                )
+                categories_l1 = [r[0] for r in cur.fetchall()]
+
+            if has_l2:
+                cur.execute(
+                    """
+                    SELECT DISTINCT x AS category_l2
+                    FROM items
+                    CROSS JOIN LATERAL unnest(items.category_l2) AS x
+                    WHERE items.category_l2 IS NOT NULL
+                      AND x IS NOT NULL AND btrim(x) <> ''
+                    ORDER BY 1
+                    """
+                )
+                categories_l2 = [r[0] for r in cur.fetchall()]
+
+                if has_l1:
+                    cur.execute(
+                        """
+                        SELECT
+                            items.category_l1,
+                            array_agg(DISTINCT x ORDER BY x) AS l2s
+                        FROM items
+                        CROSS JOIN LATERAL unnest(items.category_l2) AS x
+                        WHERE items.category_l1 IS NOT NULL AND btrim(items.category_l1) <> ''
+                          AND items.category_l2 IS NOT NULL
+                          AND x IS NOT NULL AND btrim(x) <> ''
+                        GROUP BY items.category_l1
+                        ORDER BY items.category_l1
+                        """
+                    )
+                    for l1, l2s in cur.fetchall():
+                        categories_l2_by_l1[str(l1)] = list(l2s or [])
+
+    return {
+        "categories_l1": categories_l1,
+        "categories_l2": categories_l2,
+        "categories_l2_by_l1": categories_l2_by_l1,
+        # compat ES
+        "categorias_n1": categories_l1,
+        "categorias_n2": categories_l2,
+        "categorias_n2_por_n1": categories_l2_by_l1,
+    }
+
 # ====================== Búsqueda / listado ======================
 
 def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
@@ -204,6 +280,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
     sec_list = _list_param(params, "seccion_codigo", "seccion", "secciones")
     epi_list = _list_param(params, "epigrafe", "epigrafes")
 
+    # Fase 4: categorías (multi)
+    cat_l1_list = _list_param(params, "category_l1", "categories_l1", "categoria_n1", "categorias_n1")
+    cat_l2_list = _list_param(params, "category_l2", "categories_l2", "categoria_n2", "categorias_n2")
+
     q_adv = _norm(params.get("q")) or _norm(params.get("q_adv"))
     identificador = _norm(params.get("identificador"))
     control_val = _norm(params.get("control"))
@@ -226,6 +306,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         has_informe_imp      = _col_exists_cached(schema, "items", "informe_impacto")
         has_impacto          = _col_exists_cached(schema, "items", "impacto")
         has_id               = _col_exists_cached(schema, "items", "id")
+
+        # Fase 4: columnas categorías
+        has_category_l1      = _col_exists_cached(schema, "items", "category_l1")
+        has_category_l2      = _col_exists_cached(schema, "items", "category_l2")
 
         use_reactions = _reactions_table_exists(schema)
 
@@ -277,6 +361,22 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         in_epi = _in_clause("i.epigrafe", epi_list)
         if in_epi:
             where_sql_parts.append(in_epi[0]); args.extend(in_epi[1])
+
+        # Fase 4: filtros por categorías (defensivo)
+        if cat_l1_list:
+            if has_category_l1:
+                where_sql_parts.append(sql.SQL("i.category_l1 = ANY(%s::text[])"))
+                args.append(cat_l1_list)
+            else:
+                # el cliente pidió filtro pero la columna no existe -> 0 resultados
+                where_sql_parts.append(sql.SQL("1=0"))
+
+        if cat_l2_list:
+            if has_category_l2:
+                where_sql_parts.append(sql.SQL("i.category_l2 && %s::text[]"))
+                args.append(cat_l2_list)
+            else:
+                where_sql_parts.append(sql.SQL("1=0"))
 
         # texto
         _use_fts_rank = False
@@ -334,6 +434,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             (sql.SQL("i.fecha_publicacion") if has_fecha_public else sql.SQL("NULL AS fecha_publicacion")),
             created_expr,
             sql.SQL("i.control") if has_control else sql.SQL("NULL AS control"),
+
+            # Fase 4: devolver categorías (defensivo)
+            (sql.SQL("i.category_l1") if has_category_l1 else sql.SQL("NULL AS category_l1")),
+            (sql.SQL("COALESCE(i.category_l2, ARRAY[]::text[]) AS category_l2") if has_category_l2 else sql.SQL("ARRAY[]::text[] AS category_l2")),
         ]
 
         joins: List[sql.SQL] = []
@@ -423,7 +527,6 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             ms_sel = int((time.time() - t_sel) * 1000)
 
     ms_total = int((time.time() - t0) * 1000)
-    # Mejor que print: en WSGI normalmente sale a logs igual, pero puedes cambiarlo a logger si lo prefieres.
     print(f"[items_svc.search_items] ms_total={ms_total} ms_count={ms_count} ms_select={ms_sel} total={total} page={page} limit={limit}")
 
     return {
@@ -458,6 +561,8 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
                 "titulo", "titulo_resumen", "titulo_corto", "titulo_completo",
                 "contenido", "resumen",
                 "departamento_codigo", "seccion_codigo", "epigrafe",
+                # Fase 4:
+                "category_l1", "category_l2",
             ]
             existing_cols = [c for c in base_cols if _col(c)]
 
@@ -566,9 +671,15 @@ def get_item_by_id(identificador: str, *, user_id: Optional[str] = None) -> Opti
         "contenido", "resumen", "impacto",
         "likes", "dislikes", "my_reaction",
         "control", "departamento_codigo", "seccion_codigo", "epigrafe",
-        "fecha_publicacion", "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre"
+        "fecha_publicacion", "url_pdf", "sourceUrl", "departamento_nombre", "seccion_nombre",
+        # Fase 4:
+        "category_l1", "category_l2",
     ):
         data.setdefault(k, None)
+
+    # Normaliza category_l2 a lista
+    if data.get("category_l2") is None:
+        data["category_l2"] = []
 
     if data.get("resumen") is not None:
         inflated = _inflate_b64_gzip_maybe(data["resumen"])

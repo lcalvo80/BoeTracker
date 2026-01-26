@@ -56,7 +56,13 @@ def _dedupe_preserve_order(seq):
             out.append(x)
     return out
 
-MULTI_KEYS_PLURALS = {"departamentos", "secciones", "epigrafes", "tags", "ids"}
+# Multi-keys (se aceptan repetidos y/o CSV, se deduplican)
+MULTI_KEYS_PLURALS = {
+    "departamentos", "secciones", "epigrafes", "tags", "ids",
+    # Fase 4: categorías
+    "category_l1", "category_l2",
+}
+
 NORMALIZE_KEYS = {
     "departamento": "departamentos", "departamentos": "departamentos",
     "seccion": "secciones", "secciones": "secciones",
@@ -65,20 +71,37 @@ NORMALIZE_KEYS = {
     "id": "ids", "ids": "ids",
     "seccion_codigo": "secciones",
     "departamento_codigo": "departamentos",
+
     "q": "q", "query": "q", "search": "q", "q_adv": "q",
     "search_mode": "search_mode",
+
     "fecha": "fecha",
     "fecha_desde": "fecha_desde", "desde": "fecha_desde", "from": "fecha_desde", "date_from": "fecha_desde",
     "fecha_hasta": "fecha_hasta", "hasta": "fecha_hasta", "to": "fecha_hasta", "date_to": "fecha_hasta",
+
     "useRange": "useRange",
+
     "has_resumen": "has_resumen",
     "has_impacto": "has_impacto",
     "has_comments": "has_comments",
     "favoritos": "favoritos",
     "destacado": "destacado",
+
     "page": "page", "limit": "limit",
     "sort_by": "sort_by", "sort_dir": "sort_dir",
+
+    # Fase 4: categorías (compat)
+    "category_l1": "category_l1",
+    "categories_l1": "category_l1",
+    "categoria_n1": "category_l1",
+    "categorias_n1": "category_l1",
+
+    "category_l2": "category_l2",
+    "categories_l2": "category_l2",
+    "categoria_n2": "category_l2",
+    "categorias_n2": "category_l2",
 }
+
 ALLOWED_SORT_BY = {
     "created_at": "created_at",
     "fecha": "fecha",
@@ -164,7 +187,6 @@ def list_items():
     try:
         parsed = _parse_query_args(request.args)
 
-        # Si quieres pasar user_id a la búsqueda (para futuros favoritos, etc.)
         # user_id = getattr(g, "user_id", None)
         # result = items_svc.search_items(parsed, user_id=user_id)
         result = items_svc.search_items(parsed)
@@ -180,8 +202,6 @@ def list_items():
 
     except Exception:
         current_app.logger.exception("items list failed")
-        # IMPORTANTE: NO devolvemos vacío silencioso sin saber qué pasa.
-        # Devolvemos 500 controlado para que lo veas en FE/DevTools.
         return jsonify({"ok": False, "error": "items_list_failed"}), 500
     finally:
         dt = int((time.time() - t0) * 1000)
