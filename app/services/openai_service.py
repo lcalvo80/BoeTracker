@@ -609,8 +609,37 @@ def _json_schema_completion_with_retry(
     seed: Optional[int] = 7,
     fallback_to_json_object_on_timeout: bool = True,
 ) -> Dict[str, Any]:
+    """Completion JSON con `json_schema` + reintentos.
+
+    Por qué:
+    - Aunque `response_format=json_schema` reduce mucho el riesgo, en la práctica
+      pueden aparecer respuestas con JSON truncado o con comillas sin escapar.
+    - Esos casos suelen manifestarse como `json.JSONDecodeError`, y deben tratarse
+      como *retryable* (igual que timeouts/429/5xx) para no perder una sección.
+
+    Estrategia:
+    - Parse directo.
+    - Si falla (JSONDecodeError):
+        * limpiar fences/código,
+        * extraer el bloque `{...}` más externo,
+        * reintentar con backoff.
+    - Si persiste: fallback a `json_object` (nuestro parser/limpieza ya es más tolerante).
+    """
     use_model = model or _OPENAI_MODEL
     last_err: Optional[Exception] = None
+
+    def _extract_json_object_like(txt: str) -> str:
+        s = (txt or "").strip()
+        if not s:
+            return s
+        s2 = clean_code_block(s).strip()
+        if s2:
+            s = s2
+        a = s.find("{")
+        b = s.rfind("}")
+        if a != -1 and b != -1 and b > a:
+            return s[a : b + 1].strip()
+        return s
 
     for attempt in range(_OPENAI_MAX_RETRIES + 1):
         if deadline_ts is not None and time.time() >= deadline_ts:
@@ -627,7 +656,45 @@ def _json_schema_completion_with_retry(
                 seed=seed,
             )
             content = (resp.choices[0].message.content or "").strip()
-            return json.loads(content)
+
+            # 1) parse directo
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as je:
+                # 2) intenta limpiar/extract
+                for cand in (clean_code_block(content), _extract_json_object_like(content)):
+                    if not cand:
+                        continue
+                    try:
+                        return json.loads(cand)
+                    except Exception:
+                        pass
+
+                # 3) retry si quedan intentos
+                last_err = je
+                snip = content if len(content) <= 1200 else (content[:900] + " … " + content[-200:])
+                logging.warning(
+                    "⚠️ JSON inválido en json_schema (intento %s/%s). Reintentando. snippet=%r",
+                    attempt + 1,
+                    _OPENAI_MAX_RETRIES + 1,
+                    snip,
+                )
+                if attempt < _OPENAI_MAX_RETRIES:
+                    time.sleep((_OPENAI_BACKOFF_BASE ** (attempt + 1)) + random.random() * 0.25)
+                    continue
+
+                # 4) sin intentos → fallback a json_object
+                logging.warning("⚠️ JSON inválido persistente. Fallback a json_object.")
+                return _json_completion_with_retry(
+                    client,
+                    messages=messages,
+                    model=use_model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    deadline_ts=deadline_ts,
+                    seed=seed,
+                )
+
         except Exception as e:
             last_err = e
             text = f"{e}"
@@ -673,9 +740,6 @@ def _json_schema_completion_with_retry(
             raise last_err or e2
 
     raise last_err or TimeoutError("Timeout en json_schema")
-
-
-# ─────────────────────────── Normalización/merge ───────────────────────────
 def _normalize_content(content: str, hard_limit_chars: int = 28000) -> str:
     if not isinstance(content, str):
         return ""
