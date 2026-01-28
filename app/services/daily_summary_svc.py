@@ -3,11 +3,11 @@ from __future__ import annotations
 
 """Persistencia y lectura del Resumen Diario por secciones.
 
-Tabla nueva (independiente de items): daily_section_summaries
+Tabla: daily_section_summaries
 
-Notas:
-- MVP: creamos la tabla de forma defensiva con CREATE TABLE IF NOT EXISTS.
-- El worker (script) escribe; el API solo lee (y también crea la tabla si falta).
+Mejoras:
+- list_available_days() para servir /api/resumen/index con metadata útil (total entradas, updated_at).
+- Inserción JSONB más limpia (psycopg2.extras.Json si está disponible).
 """
 
 import json
@@ -15,6 +15,11 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.postgres import get_db
+
+try:
+    from psycopg2.extras import Json as PgJson  # type: ignore
+except Exception:  # pragma: no cover
+    PgJson = None  # type: ignore
 
 
 TABLE = "public.daily_section_summaries"
@@ -49,6 +54,15 @@ def _ensure_table_cur(cur) -> None:
     )
 
 
+def _pg_json(val: Any):
+    if val is None:
+        return None
+    if PgJson is None:
+        # Fallback: string JSON (funciona, pero luego puede volver como str)
+        return json.dumps(val, ensure_ascii=False)
+    return PgJson(val, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+
+
 def ensure_table() -> None:
     with get_db() as conn, conn.cursor() as cur:
         _ensure_table_cur(cur)
@@ -77,6 +91,44 @@ def list_available_dates(*, limit: int = 30, offset: int = 0) -> List[str]:
             (limit, offset),
         )
         return [r[0].isoformat() for r in cur.fetchall() if r and r[0]]
+
+
+def list_available_days(*, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
+    """Devuelve metadata por día (para /api/resumen/index)."""
+    limit = max(1, min(int(limit), 365))
+    offset = max(0, int(offset))
+
+    with get_db() as conn, conn.cursor() as cur:
+        _ensure_table_cur(cur)
+        cur.execute(
+            f"""
+            SELECT
+              fecha_publicacion,
+              COALESCE(SUM(total_entradas), 0) AS total_entradas,
+              MAX(updated_at) AS updated_at
+            FROM {TABLE}
+            GROUP BY fecha_publicacion
+            ORDER BY fecha_publicacion DESC
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        )
+        rows = cur.fetchall() or []
+
+    out: List[Dict[str, Any]] = []
+    for fp, total, updated_at in rows:
+        iso = fp.isoformat()
+        out.append(
+            {
+                "fecha_publicacion": iso,
+                "yyyymmdd": iso.replace("-", ""),
+                "total_entradas": int(total or 0),
+                "updated_at": updated_at.isoformat() if updated_at else None,
+                "title": f"Resumen BOE — {iso}",
+                "meta_description": "Lo más relevante del BOE del día, resumido por secciones para empresa y compliance.",
+            }
+        )
+    return out
 
 
 def get_daily_summary(*, fecha_publicacion: date) -> Dict[str, Any]:
@@ -109,6 +161,7 @@ def get_daily_summary(*, fecha_publicacion: date) -> Dict[str, Any]:
                 js = json.loads(js)
             except Exception:
                 js = None
+
         sections.append(
             {
                 "codigo": code,
@@ -198,10 +251,10 @@ def upsert_section_summary(
                 str(seccion_nombre or "").strip(),
                 int(total_entradas or 0),
                 str(resumen_texto or "").strip(),
-                json.dumps(resumen_json, ensure_ascii=False) if isinstance(resumen_json, dict) else None,
+                _pg_json(resumen_json) if isinstance(resumen_json, dict) else None,
                 (ai_model or "").strip() or None,
                 int(ai_prompt_version or 1),
-                json.dumps(source_dept_counts, ensure_ascii=False) if source_dept_counts is not None else None,
-                json.dumps(source_sample_items, ensure_ascii=False) if source_sample_items is not None else None,
+                _pg_json(source_dept_counts) if source_dept_counts is not None else None,
+                _pg_json(source_sample_items) if source_sample_items is not None else None,
             ),
         )
