@@ -104,6 +104,9 @@ def create_app() -> Flask:
     # IA BOE: título + resumen + impacto (SIEMPRE PDF)
     from app.blueprints.ai_boe import bp as ai_boe_bp
 
+    # ✅ Resumen diario público (sin login)
+    from app.blueprints.resumen import bp as resumen_bp
+
     # DEV only (_int: endpoints de prueba OpenAI y utilidades)
     from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
 
@@ -117,6 +120,9 @@ def create_app() -> Flask:
 
     # ✅ Nuevas APIs IA BOE
     app.register_blueprint(ai_boe_bp, url_prefix="/api/ai")
+
+    # ✅ Resumen diario (público): /api/resumen/*
+    app.register_blueprint(resumen_bp, url_prefix="/api/resumen")
 
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")

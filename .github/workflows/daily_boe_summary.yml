@@ -1,0 +1,23 @@
+name: daily_boe_summary
+
+on:
+  schedule:
+    - cron: "10 5 * * *"   # 06:10 Madrid aprox (ajusta)
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Madrid
+      LOG_LEVEL: INFO
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+      OPENAI_MODEL_DAILY_SUMMARY: gpt-4o
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python update_resumen_diario.py
