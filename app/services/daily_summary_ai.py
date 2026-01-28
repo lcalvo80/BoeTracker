@@ -3,14 +3,16 @@ from __future__ import annotations
 
 """IA para Resumen Diario por sección.
 
-Mejoras v2:
-- Evitar textos/títulos cortados a mitad de palabra (word-safe truncation + "…").
-- Top-items: validación estricta contra la MUESTRA (no se permiten IDs fuera de la muestra).
-- Prompt más "editorial" y orientado a lectura (empresa/compliance), sin inventar.
+Mejoras v3 (hardening):
+- Evitar textos/títulos cortados o demasiado largos (word-safe truncation + "…").
+- Anti-hallucination: el modelo NO devuelve títulos. Solo devuelve IDs (top_item_ids).
+- Regla clave: top_items[].titulo SIEMPRE se reconstruye desde la MUESTRA (source of truth).
+- Highlights: limpieza + dedupe + fallback conservador si el modelo devuelve pocos.
+- Prompt más editorial y escaneable (empresa/compliance), sin inventar.
 
-Regla clave (anti-cortes y anti-hallucination):
-- Nunca confiamos en top_items[].titulo del modelo.
-- Siempre reconstruimos el título desde la MUESTRA (source of truth) usando el identificador.
+Nota:
+- El output final expuesto por la API mantiene el shape anterior:
+  {summary, highlights, top_items[{identificador,titulo}], ai_model, ai_prompt_version}
 """
 
 import os
@@ -23,7 +25,7 @@ from app.services.openai_service import _make_client, _json_schema_completion_wi
 from app.services.boe_daily_summary import SectionInput, SectionItem
 
 
-PROMPT_VERSION = int(os.getenv("DAILY_SUMMARY_PROMPT_VERSION", "2"))
+PROMPT_VERSION = int(os.getenv("DAILY_SUMMARY_PROMPT_VERSION", "3"))
 
 MODEL_DAILY = (
     os.getenv("OPENAI_MODEL_DAILY_SUMMARY")
@@ -33,15 +35,16 @@ MODEL_DAILY = (
 ).strip()
 
 # Límites editoriales (display)
-SUMMARY_MAX = int(os.getenv("DAILY_SUMMARY_SUMMARY_MAX", "900"))
-HIGHLIGHT_MAX = int(os.getenv("DAILY_SUMMARY_HIGHLIGHT_MAX", "200"))
-TITLE_MAX = int(os.getenv("DAILY_SUMMARY_TITLE_MAX", "260"))  # antes 220
+SUMMARY_MAX = int(os.getenv("DAILY_SUMMARY_SUMMARY_MAX", "700"))  # 👈 más corto = mejor lectura
+HIGHLIGHT_MAX = int(os.getenv("DAILY_SUMMARY_HIGHLIGHT_MAX", "190"))
+TITLE_MAX = int(os.getenv("DAILY_SUMMARY_TITLE_MAX", "220"))  # 👈 más corto en UI; full title existe en fuente
 
 # Reglas de cantidad (UI)
 HIGHLIGHTS_MIN = int(os.getenv("DAILY_SUMMARY_HIGHLIGHTS_MIN", "3"))
 TOP_ITEMS_MIN = int(os.getenv("DAILY_SUMMARY_TOP_ITEMS_MIN", "3"))
 TOP_ITEMS_MAX = int(os.getenv("DAILY_SUMMARY_TOP_ITEMS_MAX", "6"))
 SAMPLE_MAX_JSON = int(os.getenv("DAILY_SUMMARY_SAMPLE_MAX_JSON", "40"))
+PROMPT_TITLE_MAX = int(os.getenv("DAILY_SUMMARY_PROMPT_TITLE_MAX", "240"))  # para reducir tokens del prompt
 
 _WS_RE = re.compile(r"\s+")
 _BULLET_PREFIX_RE = re.compile(r"^\s*([-*•]+)\s+")
@@ -49,34 +52,31 @@ _TRAIL_PUNCT_RE = re.compile(r"[ ,;:\-]+$")
 
 
 def _schema() -> Dict[str, Any]:
-    # Importante: maxLength del schema >= límites de salida para evitar truncados feos “por schema”.
+    """Schema que usa OpenAI.
+
+    Importante:
+    - El modelo NO devuelve títulos (evita truncados/hallucination).
+    - Solo devuelve IDs seleccionados.
+    """
     return {
-        "name": "boe_daily_section_summary",
+        "name": "boe_daily_section_summary_v3",
         "schema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "summary": {"type": "string", "maxLength": SUMMARY_MAX},
+                "summary": {"type": "string", "maxLength": max(200, SUMMARY_MAX)},
                 "highlights": {
                     "type": "array",
                     "maxItems": 6,
-                    "items": {"type": "string", "maxLength": HIGHLIGHT_MAX},
+                    "items": {"type": "string", "maxLength": max(80, HIGHLIGHT_MAX)},
                 },
-                "top_items": {
+                "top_item_ids": {
                     "type": "array",
                     "maxItems": TOP_ITEMS_MAX,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "identificador": {"type": "string", "maxLength": 64},
-                            "titulo": {"type": "string", "maxLength": TITLE_MAX},
-                        },
-                        "required": ["identificador", "titulo"],
-                    },
+                    "items": {"type": "string", "maxLength": 64},
                 },
             },
-            "required": ["summary", "highlights", "top_items"],
+            "required": ["summary", "highlights", "top_item_ids"],
         },
     }
 
@@ -98,10 +98,9 @@ def _truncate_words(s: str, max_len: int, *, ellipsis: str = "…") -> str:
     if len(s) <= max_len:
         return s
 
-    # Cortamos en bruto
     cut = s[:max_len].rstrip()
 
-    # Si hemos cortado en mitad de palabra (alnum-alnum), retrocede al último espacio.
+    # Si cortamos en mitad de palabra (alnum-alnum), retroceder al último espacio.
     if max_len < len(s):
         left = cut[-1] if cut else ""
         right = s[max_len] if max_len < len(s) else ""
@@ -123,11 +122,12 @@ def _dedupe_keep_order(strings: List[str]) -> List[str]:
     seen = set()
     out: List[str] = []
     for s in strings:
-        key = _collapse_ws(s).lower()
-        if not key or key in seen:
+        s2 = _collapse_ws(s)
+        key = s2.lower()
+        if not s2 or key in seen:
             continue
         seen.add(key)
-        out.append(s)
+        out.append(s2)
     return out
 
 
@@ -141,20 +141,6 @@ def _format_dept_counts(counts: List[Tuple[str, int]]) -> str:
     return "\n".join(lines)
 
 
-def _sample_items_json(items: List[SectionItem], *, max_items: int = SAMPLE_MAX_JSON) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    for it in (items or [])[: max(1, int(max_items))]:
-        out.append(
-            {
-                "identificador": _collapse_ws(it.identificador or ""),
-                "titulo": _collapse_ws(it.titulo or ""),
-                "departamento": _collapse_ws(it.departamento or ""),
-                "epigrafe": _collapse_ws(it.epigrafe or ""),
-            }
-        )
-    return out
-
-
 def _build_sample_title_map(items: List[SectionItem]) -> Dict[str, str]:
     """Mapa ident -> título fuente (verdad)."""
     m: Dict[str, str] = {}
@@ -164,6 +150,26 @@ def _build_sample_title_map(items: List[SectionItem]) -> Dict[str, str]:
         if ident and title and ident not in m:
             m[ident] = title
     return m
+
+
+def _sample_items_json(items: List[SectionItem], *, max_items: int = SAMPLE_MAX_JSON) -> List[Dict[str, str]]:
+    """Muestra compacta para el prompt (reduce tokens).
+
+    - titulo en prompt: truncado word-safe para no meter tochos.
+    - El título FULL se mantiene en sample_titles (source of truth).
+    """
+    out: List[Dict[str, str]] = []
+    for it in (items or [])[: max(1, int(max_items))]:
+        titulo_prompt = _truncate_words(_collapse_ws(it.titulo or ""), PROMPT_TITLE_MAX)
+        out.append(
+            {
+                "identificador": _collapse_ws(it.identificador or ""),
+                "titulo": titulo_prompt,
+                "departamento": _collapse_ws(it.departamento or ""),
+                "epigrafe": _collapse_ws(it.epigrafe or ""),
+            }
+        )
+    return out
 
 
 def _fallback_highlights(section: SectionInput) -> List[str]:
@@ -176,10 +182,9 @@ def _fallback_highlights(section: SectionInput) -> List[str]:
         top = [str(d or "").strip() for d, _ in section.dept_counts[:3] if str(d or "").strip()]
         if top:
             out.append("Mayor actividad por departamento: " + ", ".join(top) + ".")
-    # Para secciones masivas: frase genérica (no inventa)
     code = (section.seccion_codigo or "").upper()
     if code in {"2B", "5A", "5B"}:
-        out.append("Conviene revisar oportunidades, convocatorias o anuncios relevantes para tu actividad.")
+        out.append("Revisa si hay convocatorias/anuncios que afecten a tu actividad o licitaciones de interés.")
     return out
 
 
@@ -190,8 +195,12 @@ def generate_section_summary(*, fecha_publicacion: date, section: SectionInput) 
         raise RuntimeError("OPENAI_API_KEY no disponible o cliente OpenAI no inicializable")
 
     dept_counts_txt = _format_dept_counts(section.dept_counts)
-    sample_json = _sample_items_json(section.sample_items)
+
+    # Source of truth (FULL titles)
     sample_titles = _build_sample_title_map(section.sample_items)
+
+    # Prompt sample (compacta)
+    sample_json = _sample_items_json(section.sample_items)
     sample_id_list = [x["identificador"] for x in sample_json if x.get("identificador")]
 
     system = (
@@ -212,15 +221,14 @@ Total de entradas en la sección: {section.total_entradas}
 {json.dumps(sample_json, ensure_ascii=False)}
 
 === INSTRUCCIONES (DURO) ===
-- summary: 2–4 frases, español claro y "escaneable", orientado a empresa/compliance.
-- Evita frases plantilla tipo "La sección incluye..." si puedes abrir con lo relevante.
-- Si la sección es masiva (oposiciones/anuncios), describe tipos de actos/temas, sin intentar enumerar todo.
-- highlights: 3–6 bullets útiles (qué es, por qué importa, y/o acción sugerida) SIN inventar.
-- top_items: 3–6 destacados. Debes elegir SOLO identificadores de esta lista:
+- summary: 2–3 frases, español claro, escaneable y orientado a empresa/compliance.
+- No uses "hoy". No repitas la fecha si no aporta.
+- Si la sección es masiva (oposiciones/anuncios), describe tipos de actos/temas de forma general.
+- highlights: 3–6 bullets útiles y conservadores. No "opines" ni atribuyas relevancia profesional específica si no se deduce del título.
+  Ejemplos válidos: "Se publican convocatorias y listas de admitidos/excluidos." / "Hay anuncios de licitación y formalización de contratos."
+- top_item_ids: devuelve 3–6 identificadores destacados, escogidos SOLO de esta lista (exactos):
   {json.dumps(sample_id_list, ensure_ascii=False)}
-- top_items[].identificador: copia EXACTO.
-- top_items[].titulo: usa el título de la muestra. Si es largo, recórtalo SIN partir palabras y con "…".
-- NO afirmes cosas específicas que no estén en títulos/epígrafes (ej. fechas/plazos) salvo que aparezcan claramente.
+- No inventes fechas, plazos o requisitos salvo que se vean claramente en un título de la muestra.
 """
 
     messages = [
@@ -233,7 +241,7 @@ Total de entradas en la sección: {section.total_entradas}
         messages=messages,
         schema=_schema(),
         model=MODEL_DAILY,
-        max_tokens=900,
+        max_tokens=650,   # output más pequeño
         temperature=0.2,
         seed=7,
     )
@@ -242,62 +250,56 @@ Total de entradas en la sección: {section.total_entradas}
     # Post-procesado editorial (robusto)
     # ─────────────────────────────
 
-    # Summary
+    # Summary (word-safe + límite)
     summary_in = _collapse_ws(str(obj.get("summary") or ""))
     summary_out = _truncate_words(summary_in, SUMMARY_MAX) if summary_in else ""
 
-    # Highlights (limpieza + dedupe + word-safe)
+    # Highlights: limpieza + truncado + dedupe
     highlights_in = obj.get("highlights") if isinstance(obj.get("highlights"), list) else []
     highlights_raw: List[str] = []
     for x in highlights_in:
         s = _strip_bullet_prefix(str(x or ""))
         if not s:
             continue
-        # truncado word-safe (aunque el schema ya limita)
         highlights_raw.append(_truncate_words(s, HIGHLIGHT_MAX))
 
     highlights_out = _dedupe_keep_order([h for h in highlights_raw if h])
 
-    # Si el modelo devuelve pocos highlights, añadimos fallbacks conservadores
+    # Fallback conservador si faltan
     if len(highlights_out) < max(1, HIGHLIGHTS_MIN):
         highlights_out = _dedupe_keep_order(highlights_out + _fallback_highlights(section))
 
-    # recortar a max 6
     highlights_out = highlights_out[:6]
 
-    # Top items: validación estricta por ID + título SIEMPRE desde muestra
-    top_items_in = obj.get("top_items") if isinstance(obj.get("top_items"), list) else []
+    # Top items: modelo devuelve SOLO IDs. Nosotros reconstruimos títulos desde la MUESTRA (truth).
+    top_ids_in = obj.get("top_item_ids") if isinstance(obj.get("top_item_ids"), list) else []
     top_out: List[Dict[str, str]] = []
-    used_ids: set[str] = set()
+    used: set[str] = set()
 
-    def add_top(ident: str):
-        ident = _collapse_ws(ident or "")
-        if not ident or ident in used_ids:
+    def add_top_id(ident: str):
+        ident2 = _collapse_ws(ident or "")
+        if not ident2 or ident2 in used:
             return
-        if ident not in sample_titles:
+        if ident2 not in sample_titles:
             return
-        used_ids.add(ident)
-        title_src = sample_titles[ident]
-        title_out = _truncate_words(title_src, TITLE_MAX)
-        top_out.append({"identificador": ident[:64], "titulo": title_out})
+        used.add(ident2)
+        title_full = sample_titles[ident2]
+        title_out = _truncate_words(title_full, TITLE_MAX)
+        top_out.append({"identificador": ident2[:64], "titulo": title_out})
 
-    # 1) Lo que sugiera el modelo (solo IDs válidos)
-    for it in top_items_in:
-        if not isinstance(it, dict):
-            continue
-        ident = str(it.get("identificador") or "")
-        add_top(ident)
+    # 1) IDs sugeridos por el modelo (si son válidos)
+    for ident in top_ids_in:
+        add_top_id(str(ident or ""))
         if len(top_out) >= TOP_ITEMS_MAX:
             break
 
-    # 2) Si faltan, rellenamos determinísticamente desde la muestra (source of truth)
+    # 2) Relleno determinista si faltan mínimos
     if len(top_out) < max(1, TOP_ITEMS_MIN):
         for ident in sample_id_list:
-            add_top(ident)
+            add_top_id(ident)
             if len(top_out) >= max(1, TOP_ITEMS_MIN):
                 break
 
-    # 3) Si aún quedan menos de TOP_ITEMS_MIN (muestra pequeña), dejamos lo que haya (no inventamos).
     top_out = top_out[:TOP_ITEMS_MAX]
 
     return {
