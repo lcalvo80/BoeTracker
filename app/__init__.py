@@ -25,6 +25,7 @@ def _build_cors_origins(app: Flask):
         if v and v not in seen:
             seen.add(v)
             out.append(v)
+
     # ⚠️ Ojo: con supports_credentials=True, "*" no funciona en navegadores.
     # Solo lo usamos en DEV para pruebas sin credenciales.
     if app.config.get("DEBUG") and not out:
@@ -76,6 +77,10 @@ def create_app() -> Flask:
         CLERK_AUDIENCE=os.getenv("CLERK_AUDIENCE", ""),
     )
 
+    # ───────────────── Logging ─────────────────
+    if not app.debug:
+        logging.basicConfig(level=logging.INFO)
+
     # ───────────────── CORS ─────────────────
     cors_origins = _build_cors_origins(app)
     CORS(
@@ -96,7 +101,7 @@ def create_app() -> Flask:
     from app.blueprints.billing import bp as billing_bp
     from app.blueprints.enterprise import bp as enterprise_bp
 
-    # Nuevos: items / meta / comments
+    # Items / meta / comments
     from app.blueprints.items import bp as items_bp
     from app.blueprints.meta import bp as meta_bp
     from app.blueprints.comments import bp as comments_bp
@@ -107,21 +112,32 @@ def create_app() -> Flask:
     # ✅ Resumen diario público (sin login)
     from app.blueprints.resumen import bp as resumen_bp
 
+    # ✅ SEO: sitemap dinámico (lee resumen_diario)
+    # OJO: este blueprint YA define url_prefix="/api/meta" en su archivo
+    from app.blueprints.seo_sitemap import seo_bp as seo_bp
+
     # DEV only (_int: endpoints de prueba OpenAI y utilidades)
     from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
 
-    # Registro
+    # Registro (rutas canónicas)
     app.register_blueprint(webhooks_bp, url_prefix="/api")
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
     app.register_blueprint(enterprise_bp, url_prefix="/api/enterprise")
+
+    # Items/comments
     app.register_blueprint(items_bp, url_prefix="/api/items")
     app.register_blueprint(comments_bp, url_prefix="/api/items")  # /api/items/<ident>/comments
-    app.register_blueprint(meta_bp, url_prefix="/api/meta")       # /api/meta/filters
 
-    # ✅ Nuevas APIs IA BOE
+    # Meta
+    app.register_blueprint(meta_bp, url_prefix="/api/meta")        # /api/meta/filters
+
+    # ✅ SEO sitemap (ya va con /api/meta/* en el blueprint)
+    app.register_blueprint(seo_bp)
+
+    # ✅ IA BOE
     app.register_blueprint(ai_boe_bp, url_prefix="/api/ai")
 
-    # ✅ Resumen diario (público): /api/resumen/*
+    # ✅ Resumen diario (público)
     app.register_blueprint(resumen_bp, url_prefix="/api/resumen")
 
     if app.config["DEBUG"]:
@@ -158,8 +174,5 @@ def create_app() -> Flask:
     def _500(e):
         app.logger.exception("Unhandled error", exc_info=e)
         return jsonify({"ok": False, "error": "Internal server error"}), 500
-
-    if not app.debug:
-        logging.basicConfig(level=logging.INFO)
 
     return app
