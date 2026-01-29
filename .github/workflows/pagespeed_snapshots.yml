@@ -1,0 +1,39 @@
+name: pagespeed_snapshots
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 05:15 UTC ≈ 06:15 Europe/Madrid (CET) en invierno
+    - cron: "15 5 * * *"
+
+concurrency:
+  group: pagespeed_snapshots
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Collect PageSpeed snapshots
+        env:
+          SITE_URL: "https://www.boetracker.com"
+          PAGESPEED_API_KEY: ${{ secrets.PAGESPEED_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+          # Opcional:
+          # PAGESPEED_ROUTES: "/,/boe,/_tu_ruta_"
+          PAGESPEED_INCLUDE_LAST_DAYS: "7"
+        run: |
+          python -m app.scripts.collect_pagespeed
