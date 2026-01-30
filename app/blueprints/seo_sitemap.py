@@ -1,9 +1,9 @@
-# app/blueprints/seo_sitemap.py
 from __future__ import annotations
 
 import os
+import time
 from datetime import date
-from typing import List
+from typing import List, Optional, Tuple
 
 import psycopg2
 from flask import Blueprint, Response, jsonify
@@ -22,6 +22,14 @@ _CANDIDATE_DATE_COLS = [
 
 # ✅ SOLO indexamos /resumen y /resumen/YYYY-MM-DD
 _STATIC_URLS = ["/resumen"]
+
+# Cache simple para evitar pegar a DB en cada hit
+_CACHE_TTL_SECONDS = int(os.getenv("SITEMAP_CACHE_TTL_SECONDS", "300"))
+_cache: dict = {
+    "ts": 0.0,
+    "dates": None,  # type: ignore
+    "date_col": None,
+}
 
 
 def _site_url() -> str:
@@ -51,7 +59,7 @@ def _detect_date_column(cur) -> str:
     )
 
 
-def _fetch_resumen_dates() -> List[date]:
+def _fetch_resumen_dates_uncached() -> Tuple[str, List[date]]:
     db = _db_url()
     if not db:
         raise RuntimeError("DATABASE_URL no configurada")
@@ -59,7 +67,11 @@ def _fetch_resumen_dates() -> List[date]:
     conn = psycopg2.connect(db, connect_timeout=5)
     try:
         with conn.cursor() as cur:
+            # Evita queries colgadas (10s)
+            cur.execute("SET statement_timeout = 10000")
+
             date_col = _detect_date_column(cur)
+
             cur.execute(
                 f"""
                 SELECT DISTINCT ({date_col})::date AS d
@@ -69,9 +81,29 @@ def _fetch_resumen_dates() -> List[date]:
                 """
             )
             rows = cur.fetchall()
-            return [r[0] for r in rows if r and r[0]]
+            dates = [r[0] for r in rows if r and r[0]]
+
+            # opcional: capear número de días
+            max_days = int(os.getenv("SITEMAP_MAX_DAYS", "0") or "0")
+            if max_days > 0:
+                dates = dates[:max_days]
+
+            return date_col, dates
     finally:
         conn.close()
+
+
+def _fetch_resumen_dates() -> Tuple[str, List[date]]:
+    now = time.time()
+    ts = float(_cache.get("ts") or 0.0)
+    if _cache.get("dates") is not None and (now - ts) < _CACHE_TTL_SECONDS:
+        return str(_cache.get("date_col") or ""), list(_cache.get("dates") or [])
+
+    date_col, dates = _fetch_resumen_dates_uncached()
+    _cache["ts"] = now
+    _cache["date_col"] = date_col
+    _cache["dates"] = dates
+    return date_col, dates
 
 
 def _xml_escape(s: str) -> str:
@@ -87,16 +119,16 @@ def _xml_escape(s: str) -> str:
 @seo_bp.get("/resumen-dates")
 def resumen_dates():
     # Endpoint opcional (debug/inspección)
-    dates = _fetch_resumen_dates()
+    _, dates = _fetch_resumen_dates()
     return jsonify([d.isoformat() for d in dates])
 
 
 @seo_bp.get("/sitemap.xml")
 def sitemap_xml():
     base = _site_url()
-    dates = _fetch_resumen_dates()
+    _, dates = _fetch_resumen_dates()
 
-    parts = []
+    parts: List[str] = []
     parts.append('<?xml version="1.0" encoding="UTF-8"?>')
     parts.append('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
 
@@ -128,4 +160,5 @@ def sitemap_xml():
 
     resp = Response(xml, mimetype="application/xml; charset=utf-8")
     resp.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
+    resp.headers["X-Robots-Tag"] = "noindex,follow"
     return resp
