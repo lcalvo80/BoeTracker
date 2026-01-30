@@ -1,7 +1,8 @@
+# app/blueprints/seo_sitemap.py
 from __future__ import annotations
 
+import logging
 import os
-import time
 from datetime import date
 from typing import List, Optional, Tuple
 
@@ -9,6 +10,7 @@ import psycopg2
 from flask import Blueprint, Response, jsonify
 
 seo_bp = Blueprint("seo_bp", __name__, url_prefix="/api/meta")
+log = logging.getLogger(__name__)
 
 # Detectamos la columna de fecha en resumen_diario (por compat)
 _CANDIDATE_DATE_COLS = [
@@ -16,94 +18,140 @@ _CANDIDATE_DATE_COLS = [
     "fecha",
     "day",
     "date",
+    "fecha_boe",
     "published_date",
     "created_at",
 ]
 
-# ✅ SOLO indexamos /resumen y /resumen/YYYY-MM-DD
-_STATIC_URLS = ["/resumen"]
-
-# Cache simple para evitar pegar a DB en cada hit
-_CACHE_TTL_SECONDS = int(os.getenv("SITEMAP_CACHE_TTL_SECONDS", "300"))
-_cache: dict = {
-    "ts": 0.0,
-    "dates": None,  # type: ignore
-    "date_col": None,
-}
-
-
-def _site_url() -> str:
-    base = (os.getenv("SITE_URL") or os.getenv("PUBLIC_SITE_URL") or "https://www.boetracker.com").strip()
-    return base.rstrip("/")
-
 
 def _db_url() -> str:
-    return os.getenv("DATABASE_URL", "").strip()
+    """
+    Railway/Prod: a veces la URL no está en DATABASE_URL, así que soportamos aliases.
+    """
+    for key in (
+        "DATABASE_URL",
+        "DATABASE_URL_PROD",
+        "POSTGRES_URL",
+        "POSTGRESQL_URL",
+        "RAILWAY_DATABASE_URL",
+    ):
+        v = os.getenv(key)
+        if v and v.strip():
+            return v.strip()
+    return ""
 
 
-def _detect_date_column(cur) -> str:
+def _detect_resumen_diario_schema(cur) -> str:
+    """
+    Encuentra el schema donde vive resumen_diario (preferimos public).
+    """
+    cur.execute(
+        """
+        SELECT table_schema
+        FROM information_schema.tables
+        WHERE table_name = 'resumen_diario'
+          AND table_type = 'BASE TABLE'
+        """
+    )
+    schemas = [r[0] for r in cur.fetchall() if r and r[0]]
+    if not schemas:
+        raise RuntimeError("NO_TABLE: no existe resumen_diario en la DB")
+
+    if "public" in schemas:
+        return "public"
+    return schemas[0]
+
+
+def _detect_date_column(cur, schema: str) -> str:
     cur.execute(
         """
         SELECT column_name
         FROM information_schema.columns
-        WHERE table_schema = 'public'
+        WHERE table_schema = %s
           AND table_name = 'resumen_diario'
-        """
+        """,
+        (schema,),
     )
     cols = {r[0] for r in cur.fetchall()}
     for c in _CANDIDATE_DATE_COLS:
         if c in cols:
             return c
-    raise RuntimeError(
-        f"No se encontró columna de fecha en resumen_diario. Columnas detectadas: {sorted(cols)}"
-    )
+    raise RuntimeError(f"NO_DATE_COL: resumen_diario sin columna fecha. cols={sorted(cols)}")
 
 
-def _fetch_resumen_dates_uncached() -> Tuple[str, List[date]]:
+def _fetch_resumen_dates() -> Tuple[List[date], Optional[str]]:
+    """
+    Devuelve (fechas, motivo_fallback).
+    - Si falla algo (DB missing, tabla, columna...), NO lanza 500: devolvemos fallback.
+    """
     db = _db_url()
     if not db:
-        raise RuntimeError("DATABASE_URL no configurada")
+        return [], "NO_DB_URL"
 
-    conn = psycopg2.connect(db, connect_timeout=5)
+    max_dates = int(os.getenv("SITEMAP_MAX_DATES", "0") or "0")  # 0 = sin límite
+    timeout_ms = int(os.getenv("SITEMAP_DB_TIMEOUT_MS", "3000") or "3000")
+
+    conn = None
     try:
-        with conn.cursor() as cur:
-            # Evita queries colgadas (10s)
-            cur.execute("SET statement_timeout = 10000")
+        conn = psycopg2.connect(db, connect_timeout=5)
+        with conn:
+            with conn.cursor() as cur:
+                # evita consultas colgadas si hay locks
+                cur.execute(f"SET statement_timeout = {timeout_ms}")
 
-            date_col = _detect_date_column(cur)
+                schema = _detect_resumen_diario_schema(cur)
+                table_fq = f'"{schema}"."resumen_diario"'
+                date_col = _detect_date_column(cur, schema)
 
-            cur.execute(
-                f"""
-                SELECT DISTINCT ({date_col})::date AS d
-                FROM resumen_diario
-                WHERE {date_col} IS NOT NULL
-                ORDER BY d DESC
+                limit_sql = ""
+                params: List[object] = []
+                if max_dates > 0:
+                    limit_sql = "LIMIT %s"
+                    params.append(max_dates)
+
+                sql = f"""
+                    SELECT DISTINCT ({date_col})::date AS d
+                    FROM {table_fq}
+                    WHERE {date_col} IS NOT NULL
+                    ORDER BY d DESC
+                    {limit_sql}
                 """
-            )
-            rows = cur.fetchall()
-            dates = [r[0] for r in rows if r and r[0]]
+                cur.execute(sql, params)
+                rows = cur.fetchall()
 
-            # opcional: capear número de días
-            max_days = int(os.getenv("SITEMAP_MAX_DAYS", "0") or "0")
-            if max_days > 0:
-                dates = dates[:max_days]
+        out: List[date] = []
+        for r in rows:
+            if not r:
+                continue
+            d = r[0]
+            if d is None:
+                continue
+            if isinstance(d, date):
+                out.append(d)
+            else:
+                out.append(date.fromisoformat(str(d)))
+        return out, None
 
-            return date_col, dates
+    except Exception as e:
+        log.exception("seo_sitemap: error obteniendo fechas de resumen_diario")
+        # devolvemos fallback sin 500 (pero con header indicativo)
+        return [], f"DB_ERROR:{type(e).__name__}"
     finally:
-        conn.close()
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
-def _fetch_resumen_dates() -> Tuple[str, List[date]]:
-    now = time.time()
-    ts = float(_cache.get("ts") or 0.0)
-    if _cache.get("dates") is not None and (now - ts) < _CACHE_TTL_SECONDS:
-        return str(_cache.get("date_col") or ""), list(_cache.get("dates") or [])
-
-    date_col, dates = _fetch_resumen_dates_uncached()
-    _cache["ts"] = now
-    _cache["date_col"] = date_col
-    _cache["dates"] = dates
-    return date_col, dates
+def _site_base() -> str:
+    base = (
+        os.getenv("SITE_URL")
+        or os.getenv("PUBLIC_SITE_URL")
+        or os.getenv("FRONTEND_URL")
+        or "https://www.boetracker.com"
+    )
+    return str(base).rstrip("/")
 
 
 def _xml_escape(s: str) -> str:
@@ -118,47 +166,41 @@ def _xml_escape(s: str) -> str:
 
 @seo_bp.get("/resumen-dates")
 def resumen_dates():
-    # Endpoint opcional (debug/inspección)
-    _, dates = _fetch_resumen_dates()
-    return jsonify([d.isoformat() for d in dates])
+    dates, reason = _fetch_resumen_dates()
+    payload = {"dates": [d.isoformat() for d in dates], "count": len(dates)}
+    if reason:
+        payload["fallback_reason"] = reason
+    return jsonify(payload), 200
 
 
 @seo_bp.get("/sitemap.xml")
 def sitemap_xml():
-    base = _site_url()
-    _, dates = _fetch_resumen_dates()
+    site = _site_base()
 
-    parts: List[str] = []
-    parts.append('<?xml version="1.0" encoding="UTF-8"?>')
-    parts.append('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
+    dates, fallback_reason = _fetch_resumen_dates()
 
-    # /resumen
-    latest = dates[0].isoformat() if dates else None
-    for p in _STATIC_URLS:
-        loc = _xml_escape(f"{base}{p}")
-        parts.append("  <url>")
-        parts.append(f"    <loc>{loc}</loc>")
-        if latest:
-            parts.append(f"    <lastmod>{latest}</lastmod>")
-        parts.append("    <changefreq>daily</changefreq>")
-        parts.append("    <priority>1.0</priority>")
-        parts.append("  </url>")
+    # lastmod del índice /resumen: la última fecha publicada si existe
+    lastmod_resumen = dates[0].isoformat() if dates else date.today().isoformat()
 
-    # /resumen/YYYY-MM-DD
+    lines: List[str] = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+        f"  <url><loc>{_xml_escape(site + '/')}</loc></url>",
+        f"  <url><loc>{_xml_escape(site + '/resumen')}</loc><lastmod>{lastmod_resumen}</lastmod></url>",
+    ]
+
     for d in dates:
         iso = d.isoformat()
-        loc = _xml_escape(f"{base}/resumen/{iso}")
-        parts.append("  <url>")
-        parts.append(f"    <loc>{loc}</loc>")
-        parts.append(f"    <lastmod>{iso}</lastmod>")
-        parts.append("    <changefreq>daily</changefreq>")
-        parts.append("    <priority>0.7</priority>")
-        parts.append("  </url>")
+        loc = _xml_escape(site + "/resumen/" + iso)
+        lines.append(f"  <url><loc>{loc}</loc><lastmod>{iso}</lastmod></url>")
 
-    parts.append("</urlset>")
-    xml = "\n".join(parts) + "\n"
+    lines.append("</urlset>")
+    xml = "\n".join(lines) + "\n"
 
-    resp = Response(xml, mimetype="application/xml; charset=utf-8")
+    resp = Response(xml, mimetype="application/xml")
     resp.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
-    resp.headers["X-Robots-Tag"] = "noindex,follow"
+    resp.headers["X-Sitemap-Status"] = "FALLBACK" if fallback_reason else "OK"
+    if fallback_reason:
+        resp.headers["X-Sitemap-Fallback-Reason"] = fallback_reason[:120]
+    resp.headers["X-Sitemap-Count"] = str(len(dates))
     return resp
