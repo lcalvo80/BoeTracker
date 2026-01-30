@@ -3,37 +3,33 @@ from __future__ import annotations
 
 import os
 from datetime import date
-from typing import List, Optional
+from typing import List
 
 import psycopg2
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, jsonify
 
 seo_bp = Blueprint("seo_bp", __name__, url_prefix="/api/meta")
 
+# Detectamos la columna de fecha en resumen_diario (por compat)
 _CANDIDATE_DATE_COLS = [
+    "fecha_publicacion",
     "fecha",
     "day",
     "date",
-    "fecha_publicacion",
     "published_date",
     "created_at",
 ]
 
-_STATIC_URLS = [
-    "/", "/resumen",
-    "/sobre", "/contact", "/feedback", "/faq",
-    "/terminos", "/privacidad", "/aviso-legal", "/cookies",
-]
+# ✅ SOLO indexamos /resumen y /resumen/YYYY-MM-DD
+_STATIC_URLS = ["/resumen"]
 
 
 def _site_url() -> str:
-    # Canonical en producción
-    base = (os.getenv("SITE_URL") or "https://www.boetracker.com").strip()
+    base = (os.getenv("SITE_URL") or os.getenv("PUBLIC_SITE_URL") or "https://www.boetracker.com").strip()
     return base.rstrip("/")
 
 
 def _db_url() -> str:
-    # usa tu DATABASE_URL estándar en Railway
     return os.getenv("DATABASE_URL", "").strip()
 
 
@@ -81,16 +77,16 @@ def _fetch_resumen_dates() -> List[date]:
 def _xml_escape(s: str) -> str:
     return (
         s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-         .replace("'", "&apos;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
     )
 
 
 @seo_bp.get("/resumen-dates")
 def resumen_dates():
-    # endpoint opcional (debug/inspección)
+    # Endpoint opcional (debug/inspección)
     dates = _fetch_resumen_dates()
     return jsonify([d.isoformat() for d in dates])
 
@@ -100,29 +96,36 @@ def sitemap_xml():
     base = _site_url()
     dates = _fetch_resumen_dates()
 
-    # Construimos XML
     parts = []
     parts.append('<?xml version="1.0" encoding="UTF-8"?>')
     parts.append('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
 
-    # URLs estáticas
+    # /resumen
+    latest = dates[0].isoformat() if dates else None
     for p in _STATIC_URLS:
         loc = _xml_escape(f"{base}{p}")
         parts.append("  <url>")
         parts.append(f"    <loc>{loc}</loc>")
+        if latest:
+            parts.append(f"    <lastmod>{latest}</lastmod>")
+        parts.append("    <changefreq>daily</changefreq>")
+        parts.append("    <priority>1.0</priority>")
         parts.append("  </url>")
 
-    # Histórico: /resumen/YYYY-MM-DD
+    # /resumen/YYYY-MM-DD
     for d in dates:
-        loc = _xml_escape(f"{base}/resumen/{d.isoformat()}")
+        iso = d.isoformat()
+        loc = _xml_escape(f"{base}/resumen/{iso}")
         parts.append("  <url>")
         parts.append(f"    <loc>{loc}</loc>")
-        parts.append(f"    <lastmod>{d.isoformat()}</lastmod>")
+        parts.append(f"    <lastmod>{iso}</lastmod>")
+        parts.append("    <changefreq>daily</changefreq>")
+        parts.append("    <priority>0.7</priority>")
         parts.append("  </url>")
 
     parts.append("</urlset>")
     xml = "\n".join(parts) + "\n"
 
     resp = Response(xml, mimetype="application/xml; charset=utf-8")
-    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
     return resp
