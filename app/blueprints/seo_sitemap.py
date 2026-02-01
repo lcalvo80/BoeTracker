@@ -1,3 +1,4 @@
+# app/blueprints/seo_sitemap.py
 from __future__ import annotations
 
 import logging
@@ -30,12 +31,33 @@ _CANDIDATE_DATE_COLS = [
     "created_at",
 ]
 
+_ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 # ───────────────────────── helpers ─────────────────────────
 
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return (v.strip() if v else default).strip()
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    s = _env(name, "")
+    if not s:
+        return int(default)
+    try:
+        return int(s)
+    except Exception:
+        return int(default)
+
+
+def _max_days() -> int:
+    """
+    Límite de días (últimos N) para sitemap y resumen-dates.
+    0 = sin límite.
+    """
+    n = _env_int("SITEMAP_MAX_DAYS", 0)
+    return max(0, int(n))
 
 
 def _site_url() -> str:
@@ -49,7 +71,6 @@ def _site_url() -> str:
 
 
 def _db_url() -> str:
-    # Railway / addons: intenta varias keys comunes
     for k in (
         "DATABASE_URL",
         "DATABASE_URL_PROD",
@@ -79,18 +100,11 @@ def _sanitize_header_value(s: str, limit: int = 220) -> str:
         return ""
     x = str(s).strip().replace("\n", " ").replace("\r", " ")
     x = re.sub(r"\s+", " ", x)
-    # Redacta URLs de postgres si por error apareciesen
     x = re.sub(r"(postgres(ql)?://)[^\s]+", r"\1***", x, flags=re.IGNORECASE)
     return x[:limit]
 
 
-_ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
 def _assert_ident(x: str, label: str) -> str:
-    """
-    Valida que schema/table/column sean identificadores simples (evita inyección vía env).
-    """
     s = (x or "").strip()
     if not s or not _ident_re.match(s):
         raise RuntimeError(f"BAD_IDENT:{label}={s!r}")
@@ -113,10 +127,6 @@ def _table_exists(cur, schema: str, table: str) -> bool:
 
 
 def _detect_schema(cur, table: str) -> str:
-    """
-    - Usa SITEMAP_SCHEMA si existe
-    - Si no, busca el schema donde existe la tabla (prefiere public)
-    """
     schema_override = _env("SITEMAP_SCHEMA", "")
     if schema_override:
         return _assert_ident(schema_override, "schema")
@@ -139,10 +149,6 @@ def _detect_schema(cur, table: str) -> str:
 
 
 def _detect_date_column(cur, schema: str, table: str) -> str:
-    """
-    - Usa SITEMAP_DATE_COL si existe y está presente.
-    - Si no, intenta DEFAULT_DATE_COL y luego lista de candidatas.
-    """
     forced = _env("SITEMAP_DATE_COL", "")
     cur.execute(
         """
@@ -164,7 +170,6 @@ def _detect_date_column(cur, schema: str, table: str) -> str:
             f"Columnas: {sorted(cols)}"
         )
 
-    # preferimos tu columna real
     if _DEFAULT_DATE_COL in cols:
         return _DEFAULT_DATE_COL
 
@@ -185,7 +190,6 @@ def _build_sitemap_xml(base: str, dates: List[date]) -> str:
 
     latest = dates[0].isoformat() if dates else None
 
-    # /resumen
     for p in _STATIC_URLS:
         loc = _xml_escape(f"{base}{p}")
         parts.append("  <url>")
@@ -196,7 +200,6 @@ def _build_sitemap_xml(base: str, dates: List[date]) -> str:
         parts.append("    <priority>1.0</priority>")
         parts.append("  </url>")
 
-    # /resumen/YYYY-MM-DD
     for d in dates:
         iso = d.isoformat()
         loc = _xml_escape(f"{base}/resumen/{iso}")
@@ -234,18 +237,15 @@ def _fetch_dates() -> Tuple[List[date], str]:
     conn = psycopg2.connect(db, connect_timeout=5)
     try:
         with conn.cursor() as cur:
-            # timeouts defensivos
             try:
                 cur.execute("SET statement_timeout TO 4000")
             except Exception:
                 pass
 
-            # schema: override o autodetect
             schema = _env("SITEMAP_SCHEMA", "").strip()
             schema = _assert_ident(schema, "schema") if schema else _detect_schema(cur, table)
 
             if not _table_exists(cur, schema, table):
-                # Si el override apunta mal, intentamos autodetect para salvar
                 schema = _detect_schema(cur, table)
 
             date_col = _detect_date_column(cur, schema, table)
@@ -254,7 +254,6 @@ def _fetch_dates() -> Tuple[List[date], str]:
             table_q = f'"{table}"'
             date_col_q = f'"{date_col}"'
 
-            # DISTINCT por día (hay muchas filas por sección)
             cur.execute(
                 f"""
                 SELECT DISTINCT ({date_col_q})::date AS d
@@ -265,7 +264,12 @@ def _fetch_dates() -> Tuple[List[date], str]:
             )
             rows = cur.fetchall() or []
             dates = [r[0] for r in rows if r and r[0]]
-            debug = f"table={schema}.{table} date_col={date_col}"
+
+            n = _max_days()
+            if n > 0 and len(dates) > n:
+                dates = dates[:n]
+
+            debug = f"table={schema}.{table} date_col={date_col} max_days={n}"
             return dates, debug
     finally:
         conn.close()
