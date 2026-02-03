@@ -20,7 +20,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "0 5 * * *" # 05:00 UTC diario
+    - cron: "0 6 * * *" # 05:00 UTC diario
 
 permissions:
   contents: read
