@@ -2,7 +2,7 @@ name: daily_boe_summary
 
 on:
   schedule:
-    - cron: "10 5 * * *"   # 06:10 Madrid aprox (ajusta)
+    - cron: "10 6 * * *"   # 06:10 Madrid aprox (ajusta)
   workflow_dispatch:
 
 jobs:
