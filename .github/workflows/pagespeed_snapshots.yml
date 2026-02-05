@@ -23,10 +23,39 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Debug — show workflow files + repo root
+        run: |
+          echo "PWD=$(pwd)"
+          echo "List workflows:"
+          ls -la .github/workflows || true
+          echo "Top-level files:"
+          ls -la
+
+      - name: Debug — locate requirements.txt
+        run: |
+          echo "Searching requirements.txt..."
+          find . -maxdepth 4 -type f -name "requirements*.txt" -print
+
       - name: Install deps (backend requirements)
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f "requirements.txt" ]; then
+            echo "Using ./requirements.txt"
+            pip install -r requirements.txt
+          elif [ -f "app/requirements.txt" ]; then
+            echo "Using ./app/requirements.txt"
+            pip install -r app/requirements.txt
+          elif [ -f "backend/requirements.txt" ]; then
+            echo "Using ./backend/requirements.txt"
+            pip install -r backend/requirements.txt
+          else
+            echo "ERROR: requirements.txt not found in expected locations."
+            exit 1
+          fi
+
+      - name: Debug — confirm flask import
+        run: |
+          python -c "import flask; print('Flask OK', flask.__version__)"
 
       - name: Collect PageSpeed snapshots
         env:
