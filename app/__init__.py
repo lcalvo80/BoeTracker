@@ -116,6 +116,9 @@ def create_app() -> Flask:
     # OJO: este blueprint YA define url_prefix="/api/meta" en su archivo
     from app.blueprints.seo_sitemap import seo_bp as seo_bp
 
+    # ✅ Favoritos / Mi BOE (Fase 1)
+    from app.blueprints.favorites import bp as favorites_bp  # url_prefix="/api/favorites"
+
     # DEV only (_int: endpoints de prueba OpenAI y utilidades)
     from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
 
@@ -139,6 +142,9 @@ def create_app() -> Flask:
 
     # ✅ Resumen diario (público)
     app.register_blueprint(resumen_bp, url_prefix="/api/resumen")
+
+    # ✅ Favoritos (ya incluye url_prefix="/api/favorites" dentro del blueprint)
+    app.register_blueprint(favorites_bp)
 
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")
