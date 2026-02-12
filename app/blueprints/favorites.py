@@ -6,9 +6,14 @@ from flask import Blueprint, jsonify, request, g, current_app
 from app.auth import require_auth
 from app.services.postgres import get_db
 
+from psycopg2 import sql
+
 bp = Blueprint("favorites", __name__, url_prefix="/api/favorites")
 
 
+# -------------------------
+# JSON helpers
+# -------------------------
 def _json_ok(data=None, **extra):
     payload = {"ok": True}
     if data is not None:
@@ -31,12 +36,82 @@ def _parse_int(v, default: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(max_v, n))
 
 
+def _coalesce_ident(payload: dict) -> str:
+    """
+    Acepta varias keys para MVP:
+      - ident (canónica)
+      - item_ident (DB favorites)
+      - identificador / boe_id / id (fallbacks típicos de FE)
+    """
+    cand = (
+        payload.get("ident")
+        or payload.get("item_ident")
+        or payload.get("identificador")
+        or payload.get("boe_id")
+        or payload.get("id")
+    )
+    return (str(cand).strip() if cand is not None else "")
+
+
+# -------------------------
+# Items ident column detection
+# -------------------------
+_ITEMS_IDENT_COL_CACHE = None  # type: str | None
+
+
+def _column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1
+        """,
+        (table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def _get_items_ident_col(conn) -> str:
+    """
+    Devuelve la columna que hay que usar como "ident" en items.
+    Orden de preferencia:
+      1) ident
+      2) identificador
+      3) boe_id
+      4) id  (último recurso)
+    Cacheado en memoria (proceso) para no consultar siempre.
+    """
+    global _ITEMS_IDENT_COL_CACHE
+    if _ITEMS_IDENT_COL_CACHE:
+        return _ITEMS_IDENT_COL_CACHE
+
+    candidates = ["ident", "identificador", "boe_id", "id"]
+
+    with conn.cursor() as cur:
+        for c in candidates:
+            if _column_exists(cur, "items", c):
+                _ITEMS_IDENT_COL_CACHE = c
+                current_app.logger.info("[favorites] items ident column resolved: %s", c)
+                return c
+
+    # Si no encontramos nada, lo dejamos explícito (y fallará de forma clara)
+    _ITEMS_IDENT_COL_CACHE = "ident"
+    current_app.logger.warning("[favorites] items ident column not found; defaulting to 'ident'")
+    return _ITEMS_IDENT_COL_CACHE
+
+
 @bp.before_request
 def _allow_options():
     if request.method == "OPTIONS":
         return ("", 204)
 
 
+# -------------------------
+# GET /api/favorites/ids
+# -------------------------
 @bp.get("/ids")
 @require_auth
 def favorites_ids():
@@ -58,31 +133,47 @@ def favorites_ids():
                 )
                 rows = cur.fetchall() or []
 
-        idents = [r[0] for r in rows if r and r[0]]
-        return _json_ok({"idents": idents})
+        ids = [r[0] for r in rows if r and r[0]]
+        # ✅ contrato estable para FE
+        return _json_ok({"ids": ids})
     except Exception:
         current_app.logger.exception("[favorites] ids failed")
         return _json_err(500, "Internal server error")
 
 
+# -------------------------
+# POST /api/favorites
+# -------------------------
 @bp.post("")
 @require_auth
 def favorites_toggle():
     """
     Body:
-      { "ident": "BOE-A-2026-xxxx", "active": true/false }   (active opcional)
-    - Si active viene:
-        - true => asegura favorito
-        - false => elimina favorito
-    - Si no viene => toggle
+      { "ident": "...", "active": true/false }  (active opcional)
+    Acepta también item_ident/id/identificador por MVP.
     """
     user_id = getattr(g, "user_id", None)
     if not user_id:
         return _json_err(401, "Unauthorized")
 
-    payload = request.get_json(silent=True) or {}
-    ident = str(payload.get("ident") or "").strip()
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+
+    ident = _coalesce_ident(payload)
+
     if not ident:
+        # Debug: log de lo que llega realmente
+        try:
+            raw = request.get_data(cache=False, as_text=True) or ""
+            raw_snip = raw[:400]
+        except Exception:
+            raw_snip = ""
+        current_app.logger.warning(
+            "[favorites] Missing ident. keys=%s raw_snip=%s",
+            sorted(list(payload.keys())),
+            raw_snip,
+        )
         return _json_err(400, "Missing ident")
 
     active = payload.get("active", None)
@@ -103,11 +194,8 @@ def favorites_toggle():
                 )
                 exists = cur.fetchone() is not None
 
-                # ensure
                 if active is True:
                     if not exists:
-                        # Si NO tienes UNIQUE(user_id, item_ident), esto podría duplicar.
-                        # Te dejo abajo el SQL recomendado para añadirlo.
                         cur.execute(
                             """
                             INSERT INTO favorites (user_id, item_ident)
@@ -117,7 +205,6 @@ def favorites_toggle():
                         )
                     return _json_ok({"ident": ident, "active": True})
 
-                # remove
                 if active is False:
                     if exists:
                         cur.execute(
@@ -154,13 +241,19 @@ def favorites_toggle():
         return _json_err(500, "Internal server error")
 
 
+# -------------------------
+# GET /api/favorites/items
+# -------------------------
 @bp.get("/items")
 @require_auth
 def favorites_items():
     """
-    Query:
-      page, page_size, sort=saved|published
-      from=YYYY-MM-DD, to=YYYY-MM-DD (opcional)
+    Devuelve items favoritos (paginado).
+
+    IMPORTANT:
+      - No asumimos que items tenga columna ident.
+      - Detectamos la columna canónica (ident/identificador/boe_id/id).
+      - Devolvemos siempre "ident" en la respuesta para FE.
     """
     user_id = getattr(g, "user_id", None)
     if not user_id:
@@ -176,13 +269,16 @@ def favorites_items():
     date_from = (request.args.get("from") or "").strip()
     date_to = (request.args.get("to") or "").strip()
 
-    order_sql = "f.created_at DESC"
-    if sort == "published":
-        order_sql = "i.fecha_publicacion DESC NULLS LAST, f.created_at DESC"
+    # (Opcional) filtros ligeros
+    q = (request.args.get("q") or "").strip()
+    seccion = (request.args.get("seccion") or "").strip()
+    departamento = (request.args.get("departamento") or "").strip()
 
+    # WHERE base
     where = ["f.user_id = %s"]
     params = [user_id]
 
+    # Fechas (fecha_publicacion es tu canónica)
     if date_from:
         where.append("i.fecha_publicacion >= %s")
         params.append(date_from)
@@ -190,41 +286,76 @@ def favorites_items():
         where.append("i.fecha_publicacion <= %s")
         params.append(date_to)
 
+    # Filtros por sección/departamento si vienen
+    if seccion:
+        where.append("i.seccion_codigo = %s")
+        params.append(seccion)
+    if departamento:
+        where.append("i.departamento_codigo = %s")
+        params.append(departamento)
+
+    # Filtro por texto (simple): titulo ILIKE %q%
+    # (si tu DB tiene tsvector mejorarlo luego)
+    if q:
+        where.append("COALESCE(i.titulo,'') ILIKE %s")
+        params.append(f"%{q}%")
+
     where_sql = " AND ".join(where)
     offset = (page - 1) * page_size
 
     try:
         with get_db() as conn:
+            items_ident_col = _get_items_ident_col(conn)  # e.g. 'identificador'
+            items_ident_ident = sql.Identifier(items_ident_col)
+
+            # ORDER BY
+            if sort == "published":
+                order_sql = sql.SQL("i.fecha_publicacion DESC NULLS LAST, f.created_at DESC")
+            else:
+                order_sql = sql.SQL("f.created_at DESC")
+
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
+                # COUNT
+                count_q = sql.SQL(
+                    """
                     SELECT COUNT(*)
                     FROM favorites f
-                    JOIN items i ON i.ident = f.item_ident
+                    JOIN items i ON i.{items_ident} = f.item_ident
                     WHERE {where_sql}
-                    """,
-                    tuple(params),
+                    """
+                ).format(
+                    items_ident=items_ident_ident,
+                    where_sql=sql.SQL(where_sql),
                 )
+
+                cur.execute(count_q, tuple(params))
                 total = int(cur.fetchone()[0])
 
-                cur.execute(
-                    f"""
+                # SELECT (siempre devolvemos ident como string)
+                # ✅ NO seleccionamos i.title_short (no existe)
+                select_q = sql.SQL(
+                    """
                     SELECT
-                      i.ident,
-                      i.titulo,
-                      i.title_short,
-                      i.fecha_publicacion,
-                      i.seccion_codigo,
-                      i.departamento_codigo,
-                      f.created_at AS favorited_at
+                      i.{items_ident}      AS ident_value,
+                      i.titulo            AS titulo,
+                      i.resumen           AS resumen,
+                      i.fecha_publicacion AS fecha_publicacion,
+                      i.seccion_codigo    AS seccion_codigo,
+                      i.departamento_codigo AS departamento_codigo,
+                      f.created_at        AS favorited_at
                     FROM favorites f
-                    JOIN items i ON i.ident = f.item_ident
+                    JOIN items i ON i.{items_ident} = f.item_ident
                     WHERE {where_sql}
                     ORDER BY {order_sql}
                     LIMIT %s OFFSET %s
-                    """,
-                    tuple(params + [page_size, offset]),
+                    """
+                ).format(
+                    items_ident=items_ident_ident,
+                    where_sql=sql.SQL(where_sql),
+                    order_sql=order_sql,
                 )
+
+                cur.execute(select_q, tuple(params + [page_size, offset]))
                 rows = cur.fetchall() or []
 
         def _iso(x):
@@ -235,9 +366,10 @@ def favorites_items():
 
         items = [
             {
-                "ident": r[0],
+                # ✅ FE espera "ident"
+                "ident": (str(r[0]).strip() if r[0] is not None else None),
                 "titulo": r[1],
-                "title_short": r[2],
+                "resumen": r[2],  # para que ResultCard extraiga title_short (si está en JSON)
                 "fecha_publicacion": _iso(r[3]),
                 "seccion_codigo": r[4],
                 "departamento_codigo": r[5],
