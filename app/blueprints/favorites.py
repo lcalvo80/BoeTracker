@@ -33,7 +33,6 @@ def _parse_int(v, default: int, min_v: int, max_v: int) -> int:
 
 @bp.before_request
 def _allow_options():
-    # Para CORS preflight
     if request.method == "OPTIONS":
         return ("", 204)
 
@@ -50,7 +49,7 @@ def favorites_ids():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT ident
+                    SELECT item_ident
                     FROM favorites
                     WHERE user_id = %s
                     ORDER BY created_at DESC
@@ -94,28 +93,38 @@ def favorites_toggle():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT 1 FROM favorites WHERE user_id = %s AND ident = %s LIMIT 1",
+                    """
+                    SELECT 1
+                    FROM favorites
+                    WHERE user_id = %s AND item_ident = %s
+                    LIMIT 1
+                    """,
                     (user_id, ident),
                 )
                 exists = cur.fetchone() is not None
 
+                # ensure
                 if active is True:
                     if not exists:
+                        # Si NO tienes UNIQUE(user_id, item_ident), esto podría duplicar.
+                        # Te dejo abajo el SQL recomendado para añadirlo.
                         cur.execute(
                             """
-                            INSERT INTO favorites (user_id, ident)
+                            INSERT INTO favorites (user_id, item_ident)
                             VALUES (%s, %s)
-                            ON CONFLICT (user_id, ident) DO NOTHING
                             """,
                             (user_id, ident),
                         )
-                    # get_db() hace commit
                     return _json_ok({"ident": ident, "active": True})
 
+                # remove
                 if active is False:
                     if exists:
                         cur.execute(
-                            "DELETE FROM favorites WHERE user_id = %s AND ident = %s",
+                            """
+                            DELETE FROM favorites
+                            WHERE user_id = %s AND item_ident = %s
+                            """,
                             (user_id, ident),
                         )
                     return _json_ok({"ident": ident, "active": False})
@@ -123,20 +132,23 @@ def favorites_toggle():
                 # toggle
                 if exists:
                     cur.execute(
-                        "DELETE FROM favorites WHERE user_id = %s AND ident = %s",
+                        """
+                        DELETE FROM favorites
+                        WHERE user_id = %s AND item_ident = %s
+                        """,
                         (user_id, ident),
                     )
                     return _json_ok({"ident": ident, "active": False})
                 else:
                     cur.execute(
                         """
-                        INSERT INTO favorites (user_id, ident)
+                        INSERT INTO favorites (user_id, item_ident)
                         VALUES (%s, %s)
-                        ON CONFLICT (user_id, ident) DO NOTHING
                         """,
                         (user_id, ident),
                     )
                     return _json_ok({"ident": ident, "active": True})
+
     except Exception:
         current_app.logger.exception("[favorites] toggle failed")
         return _json_err(500, "Internal server error")
@@ -148,7 +160,7 @@ def favorites_items():
     """
     Query:
       page, page_size, sort=saved|published
-      from=YYYY-MM-DD, to=YYYY-MM-DD  (opcional)
+      from=YYYY-MM-DD, to=YYYY-MM-DD (opcional)
     """
     user_id = getattr(g, "user_id", None)
     if not user_id:
@@ -188,7 +200,7 @@ def favorites_items():
                     f"""
                     SELECT COUNT(*)
                     FROM favorites f
-                    JOIN items i ON i.ident = f.ident
+                    JOIN items i ON i.ident = f.item_ident
                     WHERE {where_sql}
                     """,
                     tuple(params),
@@ -206,7 +218,7 @@ def favorites_items():
                       i.departamento_codigo,
                       f.created_at AS favorited_at
                     FROM favorites f
-                    JOIN items i ON i.ident = f.ident
+                    JOIN items i ON i.ident = f.item_ident
                     WHERE {where_sql}
                     ORDER BY {order_sql}
                     LIMIT %s OFFSET %s
@@ -245,6 +257,7 @@ def favorites_items():
                 "to": date_to or None,
             }
         )
+
     except Exception:
         current_app.logger.exception("[favorites] items failed")
         return _json_err(500, "Internal server error")
