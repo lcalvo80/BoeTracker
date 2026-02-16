@@ -2,18 +2,14 @@
 from __future__ import annotations
 
 import os
-import time
 from contextlib import contextmanager
 from urllib.parse import urlparse
 
-import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
-
 
 _POOL: ThreadedConnectionPool | None = None
 
-# Marcador “timeouts aplicados” sin usar setattr en el objeto connection (que puede fallar).
-# Usamos id(conn) porque el pool mantiene vivas las conexiones; no se reciclan objetos constantemente.
+# Tracking de “timeouts aplicados” sin setattr sobre la conexión (objeto C)
 _TIMEOUTS_APPLIED: set[int] = set()
 
 
@@ -28,7 +24,6 @@ def _append_param(url: str, k: str, v: str) -> str:
 
 
 def _normalize_db_url(url: str) -> str:
-    # sslmode
     if "sslmode=" not in url:
         env_mode = (os.getenv("DB_SSLMODE") or "").strip()
         if env_mode:
@@ -42,15 +37,9 @@ def _normalize_db_url(url: str) -> str:
                 mode = "require"
             url = _append_param(url, "sslmode", mode)
 
-    # connect_timeout
-    ct = (os.getenv("DB_CONNECT_TIMEOUT") or "10").strip() or "10"
-    url = _append_param(url, "connect_timeout", ct)
+    url = _append_param(url, "connect_timeout", (os.getenv("DB_CONNECT_TIMEOUT") or "10"))
+    url = _append_param(url, "application_name", (os.getenv("DB_APP_NAME") or "boe-api"))
 
-    # application_name
-    app_name = (os.getenv("DB_APP_NAME") or "boe-api").strip() or "boe-api"
-    url = _append_param(url, "application_name", app_name)
-
-    # TCP keepalives
     url = _append_param(url, "keepalives", os.getenv("DB_KEEPALIVES", "1"))
     url = _append_param(url, "keepalives_idle", os.getenv("DB_KEEPALIVES_IDLE", "30"))
     url = _append_param(url, "keepalives_interval", os.getenv("DB_KEEPALIVES_INTERVAL", "10"))
@@ -90,7 +79,6 @@ def _checkout_conn(dsn: str):
     pool = _get_pool(dsn)
     conn = pool.getconn()
 
-    # Aplicar timeouts una sola vez por conexión (sin setattr)
     cid = id(conn)
     if cid not in _TIMEOUTS_APPLIED:
         _apply_session_timeouts(conn)
@@ -124,8 +112,8 @@ def get_db():
         raise RuntimeError("DATABASE_URL no configurada")
 
     dsn = _normalize_db_url(url)
-
     conn = _checkout_conn(dsn)
+
     try:
         yield conn
         conn.commit()
