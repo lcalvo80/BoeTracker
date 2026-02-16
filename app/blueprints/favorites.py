@@ -35,6 +35,24 @@ def _parse_int(v, default: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(max_v, n))
 
 
+def _user_id() -> str | None:
+    """
+    Resolver robusto de user_id para evitar 401 en entornos donde require_auth
+    pueble g con claves distintas.
+    """
+    if getattr(g, "user_id", None):
+        return str(g.user_id)
+    if getattr(g, "clerk_user_id", None):
+        return str(g.clerk_user_id)
+    u = getattr(g, "user", None)
+    if isinstance(u, dict):
+        if u.get("user_id"):
+            return str(u["user_id"])
+        if u.get("id"):
+            return str(u["id"])
+    return None
+
+
 def _coalesce_ident(payload: dict) -> str:
     """
     Acepta varias keys para MVP:
@@ -101,27 +119,44 @@ def _get_items_ident_col(conn) -> str:
                 return c
 
     _ITEMS_IDENT_COL_CACHE = "identificador"
-    current_app.logger.warning("[favorites] items ident column not found; defaulting to 'identificador'")
+    current_app.logger.warning(
+        "[favorites] items ident column not found; defaulting to 'identificador'"
+    )
     return _ITEMS_IDENT_COL_CACHE
+
+
+def _set_local_timeouts(cur, *, lock_ms: int = 1500, stmt_ms: int = 4000):
+    """
+    Reduce probabilidad de UX rota por locks durante ingesta.
+    Se aplica solo a la transacción actual.
+    """
+    try:
+        cur.execute(f"SET LOCAL lock_timeout TO '{int(lock_ms)}ms'")
+    except Exception:
+        pass
+    try:
+        cur.execute(f"SET LOCAL statement_timeout TO '{int(stmt_ms)}ms'")
+    except Exception:
+        pass
 
 
 # -------------------------
 # GET /api/favorites/ids
 # -------------------------
-@bp.get("/ids")
+@bp.get("/ids", strict_slashes=False)
 @require_auth
 def favorites_ids():
     """
-    Este endpoint NO debe tumbar el listado.
-    - Si hay excepción: devolvemos ok:true con ids:[] (best-effort)
+    Best-effort: si hay excepción devolvemos ok:true con ids:[] para no romper UX.
     """
-    user_id = getattr(g, "user_id", None)
+    user_id = _user_id()
     if not user_id:
         return _json_err(401, "Unauthorized")
 
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
+                _set_local_timeouts(cur)
                 cur.execute(
                     """
                     SELECT item_ident
@@ -137,15 +172,16 @@ def favorites_ids():
         return _json_ok({"ids": ids})
 
     except Exception:
-        # Best-effort para NO romper UX
-        current_app.logger.exception("[favorites] ids failed (best-effort returning empty)")
+        current_app.logger.exception(
+            "[favorites] ids failed (best-effort returning empty)"
+        )
         return _json_ok({"ids": []})
 
 
 # -------------------------
 # POST /api/favorites
 # -------------------------
-@bp.post("")
+@bp.post("/", strict_slashes=False)
 @require_auth
 def favorites_toggle():
     """
@@ -153,7 +189,7 @@ def favorites_toggle():
       { "ident": "...", "active": true/false }  (active opcional)
     Acepta también item_ident/id/identificador por MVP.
     """
-    user_id = getattr(g, "user_id", None)
+    user_id = _user_id()
     if not user_id:
         return _json_err(401, "Unauthorized")
 
@@ -163,13 +199,16 @@ def favorites_toggle():
 
     ident = _coalesce_ident(payload)
     if not ident:
-        # Log útil para depurar payloads raros
         try:
             raw = request.get_data(cache=False, as_text=True) or ""
             raw_snip = raw[:400]
         except Exception:
             raw_snip = ""
-        current_app.logger.warning("[favorites] Missing ident. keys=%s raw_snip=%s", sorted(payload.keys()), raw_snip)
+        current_app.logger.warning(
+            "[favorites] Missing ident. keys=%s raw_snip=%s",
+            sorted(payload.keys()),
+            raw_snip,
+        )
         return _json_err(400, "Missing ident")
 
     active = payload.get("active", None)
@@ -179,7 +218,8 @@ def favorites_toggle():
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # ¿existe?
+                _set_local_timeouts(cur)
+
                 cur.execute(
                     """
                     SELECT 1
@@ -210,7 +250,6 @@ def favorites_toggle():
                         (user_id, ident),
                     )
 
-                # modo explícito
                 if active is True:
                     if not exists:
                         _insert()
@@ -237,7 +276,7 @@ def favorites_toggle():
 # -------------------------
 # GET /api/favorites/items
 # -------------------------
-@bp.get("/items")
+@bp.get("/items", strict_slashes=False)
 @require_auth
 def favorites_items():
     """
@@ -247,7 +286,7 @@ def favorites_items():
     - q: titulo ILIKE
     - seccion/departamento: códigos
     """
-    user_id = getattr(g, "user_id", None)
+    user_id = _user_id()
     if not user_id:
         return _json_err(401, "Unauthorized")
 
@@ -293,14 +332,15 @@ def favorites_items():
             items_ident_col = _get_items_ident_col(conn)
             items_ident_ident = sql.Identifier(items_ident_col)
 
-            # Orden: saved usa created_at de favorites; published usa fecha_publicacion y luego created_at
-            if sort == "published":
-                order_sql = sql.SQL("i.fecha_publicacion DESC NULLS LAST, f.created_at DESC")
-            else:
-                order_sql = sql.SQL("f.created_at DESC")
+            order_sql = (
+                sql.SQL("i.fecha_publicacion DESC NULLS LAST, f.created_at DESC")
+                if sort == "published"
+                else sql.SQL("f.created_at DESC")
+            )
 
             with conn.cursor() as cur:
-                # COUNT
+                _set_local_timeouts(cur)
+
                 count_q = sql.SQL(
                     """
                     SELECT COUNT(*)
@@ -315,7 +355,6 @@ def favorites_items():
                 cur.execute(count_q, tuple(params))
                 total = int(cur.fetchone()[0])
 
-                # SELECT (campos mínimos)
                 select_q = sql.SQL(
                     """
                     SELECT

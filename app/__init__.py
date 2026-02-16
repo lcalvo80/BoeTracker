@@ -13,6 +13,7 @@ def _build_cors_origins(app: Flask):
         app.config.get("FRONTEND_BASE_URL"),
         os.getenv("ADDITIONAL_FRONTEND_ORIGIN", ""),
     ]
+
     # filtra vacíos y duplicados
     seen, out = set(), []
     for o in cand:
@@ -26,10 +27,6 @@ def _build_cors_origins(app: Flask):
             seen.add(v)
             out.append(v)
 
-    # ⚠️ Ojo: con supports_credentials=True, "*" no funciona en navegadores.
-    # Solo lo usamos en DEV para pruebas sin credenciales.
-    if app.config.get("DEBUG") and not out:
-        out = ["*"]
     return out
 
 
@@ -40,35 +37,28 @@ def create_app() -> Flask:
     app.config.update(
         DEBUG=os.getenv("FLASK_DEBUG", "0") == "1",
         JSON_SORT_KEYS=False,
-
         # Frontend
         FRONTEND_ORIGIN=os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"),
         FRONTEND_BASE_URL=os.getenv(
             "FRONTEND_BASE_URL",
             os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"),
         ),
-
         # Feature flags (dev)
         DEBUG_FILTERS_ENABLED=os.getenv("DEBUG_FILTERS_ENABLED", "0") == "1",
-
         # ✅ Subscriptions cache (Stripe live)
         # Recomendación: DEV 10–30, PROD 60–120
         SUB_CACHE_TTL_S=int(os.getenv("SUB_CACHE_TTL_S", "60")),
-
         # ✅ Feature flag: enforcement de suscripción
         # MVP (sin paywall): 0 (default)
         # Para reactivar el gating por suscripción en el futuro: 1
         REQUIRE_ACTIVE_SUBSCRIPTION=os.getenv("REQUIRE_ACTIVE_SUBSCRIPTION", "0") == "1",
-
         # (Opcional) exponer motivos de denegación en 403 cuando DEBUG=1
         DEBUG_SUBSCRIPTION=os.getenv("DEBUG_SUBSCRIPTION", "0") == "1",
-
         # Stripe
         STRIPE_SECRET_KEY=os.getenv("STRIPE_SECRET_KEY", ""),
         STRIPE_PRICE_PRO=os.getenv("STRIPE_PRICE_PRO", ""),
         STRIPE_PRICE_ENTERPRISE=os.getenv("STRIPE_PRICE_ENTERPRISE", ""),
         STRIPE_WEBHOOK_SECRET=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
-
         # Clerk
         CLERK_SECRET_KEY=os.getenv("CLERK_SECRET_KEY", ""),
         CLERK_JWKS_URL=os.getenv("CLERK_JWKS_URL", ""),  # https://<sub>.clerk.../jwks.json
@@ -83,6 +73,20 @@ def create_app() -> Flask:
 
     # ───────────────── CORS ─────────────────
     cors_origins = _build_cors_origins(app)
+
+    # ⚠️ Con supports_credentials=True NO uses "*" (los navegadores lo bloquean con credenciales)
+    if "*" in cors_origins:
+        if app.config.get("DEBUG"):
+            # En dev lo quitamos y dejamos un fallback seguro
+            cors_origins = [o for o in cors_origins if o != "*"]
+        else:
+            # En prod: si alguien puso "*" por error, lo eliminamos
+            cors_origins = [o for o in cors_origins if o != "*"]
+
+    # Fallback DEV seguro (sin wildcard)
+    if app.config.get("DEBUG") and not cors_origins:
+        cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
     CORS(
         app,
         resources={
@@ -93,6 +97,14 @@ def create_app() -> Flask:
             }
         },
         supports_credentials=True,
+        # Para que el FE pueda leer headers custom (sitemap/status, etc.)
+        expose_headers=[
+            "X-Sitemap-Status",
+            "X-Sitemap-Count",
+            "X-Sitemap-Fallback-Reason",
+            "X-Sitemap-Debug",
+        ],
+        max_age=86400,
     )
 
     # ───────────────── Blueprints ─────────────────
@@ -112,12 +124,11 @@ def create_app() -> Flask:
     # ✅ Resumen diario público (sin login)
     from app.blueprints.resumen import bp as resumen_bp
 
-    # ✅ SEO: sitemap dinámico (lee resumen_diario)
-    # OJO: este blueprint YA define url_prefix="/api/meta" en su archivo
+    # ✅ SEO: sitemap dinámico (/api/meta/* ya viene en el blueprint)
     from app.blueprints.seo_sitemap import seo_bp as seo_bp
 
-    # ✅ Favoritos / Mi BOE (Fase 1)
-    from app.blueprints.favorites import bp as favorites_bp  # url_prefix="/api/favorites"
+    # ✅ Favoritos / Mi BOE (Fase 1) (ya incluye url_prefix="/api/favorites" en el blueprint)
+    from app.blueprints.favorites import bp as favorites_bp
 
     # DEV only (_int: endpoints de prueba OpenAI y utilidades)
     from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
@@ -143,7 +154,7 @@ def create_app() -> Flask:
     # ✅ Resumen diario (público)
     app.register_blueprint(resumen_bp, url_prefix="/api/resumen")
 
-    # ✅ Favoritos (ya incluye url_prefix="/api/favorites" dentro del blueprint)
+    # ✅ Favoritos (el bp ya trae url_prefix="/api/favorites")
     app.register_blueprint(favorites_bp)
 
     if app.config["DEBUG"]:
@@ -155,11 +166,13 @@ def create_app() -> Flask:
             routes = []
             for r in app.url_map.iter_rules():
                 if str(r.rule).startswith("/api/"):
-                    routes.append({
-                        "rule": str(r.rule),
-                        "methods": sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"}),
-                        "endpoint": r.endpoint,
-                    })
+                    routes.append(
+                        {
+                            "rule": str(r.rule),
+                            "methods": sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"}),
+                            "endpoint": r.endpoint,
+                        }
+                    )
             routes.sort(key=lambda x: x["rule"])
             return {"ok": True, "routes": routes}
 
