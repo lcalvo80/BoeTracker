@@ -7,6 +7,8 @@ import base64
 import gzip
 import json
 import time
+import hashlib
+import os
 
 from psycopg2 import sql
 
@@ -111,6 +113,25 @@ def _ts_lang() -> str:
 _SCHEMA_CACHE: Optional[Dict[str, Any]] = None
 _SCHEMA_CACHE_TS: float = 0.0
 _SCHEMA_CACHE_TTL_S: int = 300  # 5 min (ajustable)
+
+
+# ====================== COUNT cache (por proceso) ======================
+# Objetivo: mantener contrato (total/pages) sin pagar COUNT(*) en cada request.
+# Cache corto (default 45s) por combinación de filtros (NO incluye page/limit).
+_COUNT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _count_cache_ttl_s() -> int:
+    try:
+        return max(0, int((os.getenv("ITEMS_COUNT_CACHE_TTL_S") or "45").strip() or "45"))
+    except Exception:
+        return 45
+
+
+def _count_cache_key(payload: Dict[str, Any]) -> str:
+    # Hash estable para no inflar memoria con keys enormes.
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _load_schema_cache(conn) -> Dict[str, Any]:
@@ -238,21 +259,21 @@ def get_category_filters() -> Dict[str, Any]:
                     cur.execute(
                         """
                         SELECT
-                            items.category_l1,
-                            array_agg(DISTINCT x ORDER BY x) AS l2s
+                          category_l1,
+                          x AS category_l2
                         FROM items
                         CROSS JOIN LATERAL unnest(items.category_l2) AS x
-                        WHERE items.category_l1 IS NOT NULL AND btrim(items.category_l1) <> ''
+                        WHERE category_l1 IS NOT NULL AND btrim(category_l1) <> ''
                           AND items.category_l2 IS NOT NULL
                           AND x IS NOT NULL AND btrim(x) <> ''
-                        GROUP BY items.category_l1
-                        ORDER BY items.category_l1
+                        GROUP BY 1, 2
+                        ORDER BY 1, 2
                         """
                     )
-                    for l1, l2s in cur.fetchall():
-                        categories_l2_by_l1[str(l1)] = list(l2s or [])
+                    for l1, l2 in cur.fetchall():
+                        categories_l2_by_l1.setdefault(l1, []).append(l2)
 
-    return {
+    out = {
         "categories_l1": categories_l1,
         "categories_l2": categories_l2,
         "categories_l2_by_l1": categories_l2_by_l1,
@@ -261,9 +282,10 @@ def get_category_filters() -> Dict[str, Any]:
         "categorias_n2": categories_l2,
         "categorias_n2_por_n1": categories_l2_by_l1,
     }
+    return out
 
 
-# ====================== Búsqueda / listado ======================
+# ====================== Search principal ======================
 
 def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
     t0 = time.time()
@@ -505,10 +527,21 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
         else:
             select_cols.append(sql.SQL("NULL AS seccion_nombre"))
 
+        # Reactions
+        # - Para listados: NO agregamos toda la tabla item_reactions en cada request.
+        #   Solo agregamos por los IDs de la página (CTE) salvo que el usuario ordene por likes/dislikes.
+        # - Para likes/dislikes sort: mantenemos join agregado global (caso menos frecuente).
+        use_reactions_fast = bool(use_reactions and sort_by not in {"likes", "dislikes"})
+
         if use_reactions:
-            joins.append(_reactions_agg_join_sql())
-            select_cols.append(sql.SQL("COALESCE(r.likes_calc, 0) AS likes"))
-            select_cols.append(sql.SQL("COALESCE(r.dislikes_calc, 0) AS dislikes"))
+            if use_reactions_fast:
+                # La unión real se añade más abajo (consulta con CTE `page`).
+                select_cols.append(sql.SQL("COALESCE(r.likes_calc, 0) AS likes"))
+                select_cols.append(sql.SQL("COALESCE(r.dislikes_calc, 0) AS dislikes"))
+            else:
+                joins.append(_reactions_agg_join_sql())
+                select_cols.append(sql.SQL("COALESCE(r.likes_calc, 0) AS likes"))
+                select_cols.append(sql.SQL("COALESCE(r.dislikes_calc, 0) AS dislikes"))
         else:
             select_cols.append(sql.SQL("COALESCE(i.likes, 0) AS likes") if has_likes_legacy else sql.SQL("0 AS likes"))
             select_cols.append(sql.SQL("COALESCE(i.dislikes, 0) AS dislikes") if has_dislikes_legacy else sql.SQL("0 AS dislikes"))
@@ -537,6 +570,10 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             order_clause = sort_by_sql + sql.SQL(" ") + sort_dir_sql
             order_params = []
 
+        # COUNT (no necesita joins porque where solo filtra por columnas de items)
+        count_sql = sql.SQL("SELECT COUNT(*) FROM items i ") + where_sql
+
+        # Select
         base_select_sql = sql.SQL("""
             SELECT {cols}
             FROM items i
@@ -551,19 +588,86 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
             order_clause=order_clause,
         )
 
-        # COUNT (no necesita joins porque where solo filtra por columnas de items)
-        count_sql = sql.SQL("SELECT COUNT(*) FROM items i ") + where_sql
+        # Variante rápida (reactions por página):
+        # - 1) calculamos la página solo con items (y order)
+        # - 2) traemos datos completos + lookups
+        # - 3) agregamos reactions solo para los IDs de la página
+        page_select_sql = None
+        if use_reactions_fast:
+            joins_no_reactions = [j for j in joins]  # aquí no hay join de reactions
+            page_select_sql = sql.SQL("""
+                WITH page AS (
+                    SELECT
+                      i.identificador,
+                      ROW_NUMBER() OVER (ORDER BY {order_clause}) AS ord
+                    FROM items i
+                    {where}
+                    ORDER BY {order_clause}
+                    LIMIT %s OFFSET %s
+                )
+                SELECT {cols}
+                FROM page p
+                JOIN items i ON i.identificador = p.identificador
+                {joins}
+                LEFT JOIN (
+                  SELECT
+                    item_id,
+                    COALESCE(SUM(CASE WHEN reaction = 1 THEN 1 ELSE 0 END), 0)::int  AS likes_calc,
+                    COALESCE(SUM(CASE WHEN reaction = -1 THEN 1 ELSE 0 END), 0)::int AS dislikes_calc
+                  FROM item_reactions
+                  WHERE item_id IN (SELECT identificador FROM page)
+                  GROUP BY item_id
+                ) r ON r.item_id = i.identificador
+                ORDER BY p.ord
+            """).format(
+                cols=sql.SQL(", ").join(select_cols),
+                joins=sql.SQL(" ").join(joins_no_reactions),
+                where=where_sql,
+                order_clause=order_clause,
+            )
 
         offset = (page - 1) * limit
 
         with conn.cursor() as cur:
-            t_count = time.time()
-            cur.execute(count_sql, args)
-            total = cur.fetchone()[0]
-            ms_count = int((time.time() - t_count) * 1000)
+            # COUNT cache
+            ttl_s = _count_cache_ttl_s()
+            cache_payload = {
+                "fecha": str(fecha_eq) if fecha_eq else None,
+                "fecha_desde": str(fecha_desde) if fecha_desde else None,
+                "fecha_hasta": str(fecha_hasta) if fecha_hasta else None,
+                "departamento_codigo": sorted(dep_list) if dep_list else [],
+                "seccion_codigo": sorted(sec_list) if sec_list else [],
+                "epigrafe": sorted(epi_list) if epi_list else [],
+                "category_l1": sorted(cat_l1_list) if cat_l1_list else [],
+                "category_l2": sorted(cat_l2_list) if cat_l2_list else [],
+                "q": q_adv or None,
+                "identificador": identificador or None,
+                "control": control_val or None,
+            }
+            cache_key = _count_cache_key(cache_payload)
+            now = time.time()
+            cached = _COUNT_CACHE.get(cache_key)
+            total = None
+            ms_count = 0
+            if ttl_s > 0 and cached and (now - float(cached.get("ts") or 0.0)) < ttl_s:
+                try:
+                    total = int(cached.get("total") or 0)
+                except Exception:
+                    total = None
+
+            if total is None:
+                t_count = time.time()
+                cur.execute(count_sql, args)
+                total = int(cur.fetchone()[0] or 0)
+                ms_count = int((time.time() - t_count) * 1000)
+                if ttl_s > 0:
+                    _COUNT_CACHE[cache_key] = {"ts": now, "total": total}
 
             t_sel = time.time()
-            cur.execute(base_select_sql, args + order_params + [limit, offset])
+            if page_select_sql is not None:
+                cur.execute(page_select_sql, args + order_params + [limit, offset])
+            else:
+                cur.execute(base_select_sql, args + order_params + [limit, offset])
             data = _rows(cur)
             ms_sel = int((time.time() - t_sel) * 1000)
 
