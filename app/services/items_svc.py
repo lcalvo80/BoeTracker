@@ -52,11 +52,21 @@ def _split_csv(s: Optional[str]) -> List[str]:
     return [p for p in parts if p]
 
 
-def _as_list(val: Any) -> List[str]:
+def _as_list(val: Any, *, split_csv: bool = True) -> List[str]:
+    """
+    Convierte un parámetro a lista.
+    - split_csv=True: strings se interpretan como CSV (legacy)
+    - split_csv=False: strings se tratan como un único token (útil para labels con comas)
+    """
     if val is None:
         return []
     if isinstance(val, str):
-        return _split_csv(_norm(val))
+        s = _norm(val)
+        if not s:
+            return []
+        if split_csv:
+            return _split_csv(s)
+        return [s]
     if isinstance(val, Sequence) and not isinstance(val, (bytes, bytearray)):
         out: List[str] = []
         seen = set()
@@ -69,10 +79,10 @@ def _as_list(val: Any) -> List[str]:
     return []
 
 
-def _list_param(params: Dict[str, Any], *names: str) -> List[str]:
+def _list_param(params: Dict[str, Any], *names: str, split_csv: bool = True) -> List[str]:
     for n in names:
         if n in params and params[n] is not None:
-            return _as_list(params[n])
+            return _as_list(params[n], split_csv=split_csv)
     return []
 
 
@@ -322,9 +332,14 @@ def search_items(params: Dict[str, Any], *, user_id: Optional[str] = None) -> Di
     sec_list = _list_param(params, "seccion_codigo", "seccion", "secciones")
     epi_list = _list_param(params, "epigrafe", "epigrafes")
 
-    # Fase 4: categorías (multi)
-    cat_l1_list = _list_param(params, "category_l1", "categories_l1", "categoria_n1", "categorias_n1")
-    cat_l2_list = _list_param(params, "category_l2", "categories_l2", "categoria_n2", "categorias_n2")
+    # Fase 4: categorías
+    # - split_csv=False para evitar romper labels con comas (p.ej. "Vivienda, Urbanismo y Suelo")
+    cat_l1_list = _list_param(
+        params, "category_l1", "categories_l1", "categoria_n1", "categorias_n1", split_csv=False
+    )
+    cat_l2_list = _list_param(
+        params, "category_l2", "categories_l2", "categoria_n2", "categorias_n2", split_csv=False
+    )
 
     q_adv = _norm(params.get("q")) or _norm(params.get("q_adv"))
     identificador = _norm(params.get("identificador"))

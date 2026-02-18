@@ -63,6 +63,10 @@ MULTI_KEYS_PLURALS = {
     "category_l1", "category_l2",
 }
 
+# 🔒 Keys multi en las que NO debemos hacer split por coma
+# Motivo: category_l1 puede contener comas como parte del label
+NO_CSV_SPLIT_KEYS = {"category_l1", "category_l2"}
+
 NORMALIZE_KEYS = {
     "departamento": "departamentos", "departamentos": "departamentos",
     "seccion": "secciones", "secciones": "secciones",
@@ -121,7 +125,13 @@ def _parse_query_args(args):
         norm = NORMALIZE_KEYS.get(key, key)
 
         if norm in MULTI_KEYS_PLURALS:
-            parts = [p.strip() for p in str(raw_val).split(",") if p.strip() != ""]
+            # ✅ FIX: no split por coma para categorías (pueden incluir comas en el label)
+            if norm in NO_CSV_SPLIT_KEYS:
+                v = str(raw_val).strip()
+                parts = [v] if v != "" else []
+            else:
+                parts = [p.strip() for p in str(raw_val).split(",") if p.strip() != ""]
+
             prev = data.get(norm, [])
             data[norm] = prev + parts
         else:
