@@ -130,6 +130,9 @@ def create_app() -> Flask:
     # ✅ Favoritos / Mi BOE (Fase 1) (ya incluye url_prefix="/api/favorites" en el blueprint)
     from app.blueprints.favorites import bp as favorites_bp
 
+    # ✅ Contacto (Resend): POST /api/contact
+    from app.blueprints.contact import bp as contact_bp
+
     # DEV only (_int: endpoints de prueba OpenAI y utilidades)
     from app.auth import int_bp  # expone /api/_int/* SOLO en DEBUG
 
@@ -156,6 +159,9 @@ def create_app() -> Flask:
 
     # ✅ Favoritos (el bp ya trae url_prefix="/api/favorites")
     app.register_blueprint(favorites_bp)
+
+    # ✅ Contacto (POST /api/contact)
+    app.register_blueprint(contact_bp)
 
     if app.config["DEBUG"]:
         app.register_blueprint(int_bp, url_prefix="/api/_int")

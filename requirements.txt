@@ -18,3 +18,4 @@ beautifulsoup4
 lxml
 pdfminer.six
 pymupdf>=1.24.9
+requests>=2.31.0
